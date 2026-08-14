@@ -1,0 +1,21 @@
+{% for photo in photos %}
+  <a class="tile" href="/photo/{{ photo['id'] }}">
+    <img src="/thumb/{{ photo['id'] }}" alt="{{ photo['caption'] or '' }}" loading="lazy">
+    {% if photo['dupe_count'] %}
+      <span class="tile-badge" title="{{ photo['dupe_count'] }} duplicate file(s) on disk">×{{ photo['dupe_count'] + 1 }}</span>
+    {% endif %}
+    <span class="tile-info">
+      {% if photo['caption'] %}<span class="tile-info-caption">{{ photo['caption'] }}</span>{% endif %}
+      <span class="tile-info-meta">
+        {% if photo['shot_at'] %}{{ photo['shot_at'][:10] }}{% endif %}
+        {% if photo['camera'] %} · {{ photo['camera'] }}{% endif %}
+      </span>
+      <span class="tile-info-ai">{{ 'searchable' if photo['embedding_model'] else 'not indexed' }}</span>
+    </span>
+  </a>
+{% endfor %}
+{% if photos|length == page_size %}
+  <div hx-get="/library/page?offset={{ next_offset }}{% if query %}&{{ query }}{% endif %}"
+       hx-trigger="revealed"
+       hx-swap="outerHTML"></div>
+{% endif %}

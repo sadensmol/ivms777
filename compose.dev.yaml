@@ -1,0 +1,50 @@
+# Development override: hot reload.
+#
+# Bind-mounts the source over the image's copy so edits on the host are visible
+# inside the container immediately. The app restarts via uvicorn --reload; the
+# worker is a plain loop, so watchfiles restarts it instead.
+#
+# Jinja templates and static files need no restart at all — Jinja auto-reloads
+# on mtime change and StaticFiles reads from disk per request.
+#
+# Layer it last:
+#   docker compose -f compose.yaml -f compose.mac.yaml -f compose.dev.yaml up
+#
+# WATCHFILES_FORCE_POLLING is required on macOS: Docker Desktop runs a Linux VM
+# and inotify events do not cross the bind mount, so the default event watcher
+# never fires. Polling costs a little CPU and is the only thing that works here.
+services:
+  app:
+    command: ["uv", "run", "--no-sync", "uvicorn", "web.app:app_factory",
+              "--factory", "--host", "0.0.0.0", "--port", "8000",
+              "--reload", "--reload-dir", "/app"]
+    environment:
+      WATCHFILES_FORCE_POLLING: "true"
+    volumes:
+      - ./config.py:/app/config.py
+      - ./albums:/app/albums
+      - ./db:/app/db
+      - ./embedding:/app/embedding
+      - ./inference:/app/inference
+      - ./ingest:/app/ingest
+      - ./search:/app/search
+      - ./storage:/app/storage
+      - ./web:/app/web
+      - ./scripts:/app/scripts
+
+  worker:
+    command: ["uv", "run", "--no-sync", "watchfiles",
+              "python -m ingest.cli", "/app"]
+    environment:
+      WATCHFILES_FORCE_POLLING: "true"
+    volumes:
+      - ./config.py:/app/config.py
+      - ./albums:/app/albums
+      - ./db:/app/db
+      - ./embedding:/app/embedding
+      - ./inference:/app/inference
+      - ./ingest:/app/ingest
+      - ./search:/app/search
+      - ./storage:/app/storage
+      - ./web:/app/web
+      - ./scripts:/app/scripts

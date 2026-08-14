@@ -1,0 +1,26 @@
+# Jetson profile: fully containerised, including inference.
+#
+# JetPack ships the NVIDIA container runtime, so the GPU is available inside
+# containers. 8 GB shared memory means a 4B-class caption model.
+services:
+  inference:
+    image: ollama/ollama:latest
+    runtime: nvidia
+    environment:
+      OLLAMA_HOST: 0.0.0.0
+    volumes:
+      - ollama-models:/root/.ollama
+    ports:
+      - "11434:11434"
+
+  app:
+    environment:
+      IVMS777_PROFILE: jetson
+    depends_on: [inference]
+  worker:
+    environment:
+      IVMS777_PROFILE: jetson
+    depends_on: [inference]
+
+volumes:
+  ollama-models:

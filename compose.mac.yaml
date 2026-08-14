@@ -1,0 +1,19 @@
+# Mac profile: everything containerised except Ollama.
+#
+# Docker Desktop on macOS runs a Linux VM with no Metal passthrough, so a
+# containerised model would silently fall back to CPU and run several times
+# slower. Ollama therefore runs natively on the host and the containers reach
+# it through host.docker.internal.
+services:
+  app:
+    environment:
+      IVMS777_PROFILE: mac
+      IVMS777_INFERENCE_BASE_URL: http://host.docker.internal:11434/v1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+  worker:
+    environment:
+      IVMS777_PROFILE: mac
+      IVMS777_INFERENCE_BASE_URL: http://host.docker.internal:11434/v1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

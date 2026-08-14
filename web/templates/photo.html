@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="photo-view">
+  <div class="photo-stage">
+    <a class="photo-close" href="/library" title="Back to library">✕</a>
+    <img class="photo-full" src="/thumb/{{ photo['id'] }}?size=detail" alt="">
+  </div>
+  <aside class="photo-panel">
+    {% if photo['caption'] %}<p class="photo-caption">{{ photo['caption'] }}</p>{% endif %}
+
+    <h3>AI</h3>
+    {% if embedded %}
+      <p>Embedded for semantic search ({{ photo['embedding_model'] }}).</p>
+    {% else %}
+      <p>Not yet embedded — it will appear in search once the embed stage runs.</p>
+    {% endif %}
+    {# Tags grouped by dimension land here in plan 04. #}
+
+    <h3>Files on disk{% if sources|length > 1 %} — {{ sources|length }} copies{% endif %}</h3>
+    {% if wasted_bytes %}
+      <p class="wasted">{{ '%.1f'|format(wasted_bytes / 1048576) }} MB of redundant copies</p>
+    {% endif %}
+    <ul>{% for s in sources %}<li>{{ s['rel_path'] }}</li>{% endfor %}</ul>
+
+    <h3>EXIF</h3>
+    <table class="exif">
+      {% for f in facets %}
+        <tr><td>{{ f['key'] }}</td>
+            <td>{{ f['value_text'] if f['value_text'] is not none else f['value_num'] }}</td></tr>
+      {% endfor %}
+    </table>
+  </aside>
+</div>
+{% if similar %}
+<h3>Similar photos</h3>
+<div class="similar-strip">
+  {% for sid in similar %}
+    <a href="/photo/{{ sid }}"><img src="/thumb/{{ sid }}" loading="lazy" alt=""></a>
+  {% endfor %}
+</div>
+{% endif %}
+{% endblock %}

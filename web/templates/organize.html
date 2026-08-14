@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="organize-head">
+  <h1>Organize</h1>
+  <form method="get" action="/organize" class="organize-picker">
+    <label for="by">Organize photos</label>
+    <select id="by" name="by" onchange="this.form.submit()">
+      {% for name, label in organizers %}
+        <option value="{{ name }}" {% if name == active %}selected{% endif %}>{{ label }}</option>
+      {% endfor %}
+    </select>
+    <noscript><button type="submit">Go</button></noscript>
+  </form>
+</div>
+
+{% if albums %}
+  <p class="muted">{{ albums|length }} albums · {{ total_photos }} photos</p>
+  <div class="albums">
+    {% for album in albums %}
+      <section class="album">
+        {% set covers = album.photo_ids[:4] %}
+        <div class="album-mosaic {{ 'grid-4' if covers|length >= 4 else 'grid-1' }}">
+          {% if covers|length >= 4 %}
+            {% for pid in covers %}
+              <a href="/photo/{{ pid }}"><img src="/thumb/{{ pid }}" loading="lazy" alt=""></a>
+            {% endfor %}
+          {% else %}
+            <a href="/photo/{{ album.cover_id }}"><img src="/thumb/{{ album.cover_id }}" loading="lazy" alt=""></a>
+          {% endif %}
+          <span class="album-count">{{ album.size }}</span>
+        </div>
+        <div class="album-info">
+          <h2>{{ album.title }}</h2>
+          <p class="album-desc">{{ album.description }}</p>
+        </div>
+      </section>
+    {% endfor %}
+  </div>
+{% else %}
+  <p class="muted">No albums for this organization yet — upload photos, or try another type.</p>
+{% endif %}
+{% endblock %}

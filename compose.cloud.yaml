@@ -1,0 +1,31 @@
+# Cloud profile: fully containerised on a Linux box with an NVIDIA GPU.
+#
+# vLLM earns its place here — continuous batching matters once several people
+# index libraries at once, and on CUDA it supports vision models.
+services:
+  inference:
+    image: vllm/vllm-openai:latest
+    command: ["--model", "${VLLM_MODEL:?set VLLM_MODEL}", "--port", "8000"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    ports:
+      - "8001:8000"
+
+  app:
+    environment:
+      IVMS777_PROFILE: cloud
+    depends_on: [inference]
+  worker:
+    environment:
+      IVMS777_PROFILE: cloud
+    depends_on: [inference]
+
+volumes:
+  hf-cache:

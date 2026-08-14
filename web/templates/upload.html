@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="upload-shell">
+<h1>Upload photos</h1>
+
+<p class="hint">
+  Pick a folder of photos. Pick more folders to add them to the same batch —
+  every photo format is accepted and videos are skipped. Nothing is sent until
+  each file has been hashed locally and the server has said which ones it does
+  not already have.
+</p>
+
+<input type="file" id="picker" webkitdirectory directory multiple accept="image/*">
+<button id="start" disabled>Start upload</button>
+<button id="clear" disabled>Clear</button>
+
+<p id="status">no folder selected</p>
+<progress id="bar" value="0" max="1"></progress>
+
+<ul id="upload-failures" class="failures"></ul>
+
+{% include "_progress.html" %}
+
+</div>
+<script src="/static/upload.js" defer></script>
+{% endblock %}

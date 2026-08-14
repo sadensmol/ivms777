@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}ivms777{% endblock %}</title>
+    <link rel="stylesheet" href="/static/app.css">
+    <script src="/static/htmx.min.js"></script>
+  </head>
+  <body>
+    <nav class="nav">
+      <a href="/upload">Upload</a>
+      <a href="/library">Library</a>
+      <a href="/organize">Organize</a>
+    </nav>
+    <main>{% block content %}{% endblock %}</main>
+  </body>
+</html>

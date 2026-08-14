@@ -1,0 +1,20 @@
+<div class="progress" id="progress" hx-get="/upload/progress"
+     hx-trigger="every 2s, refresh" hx-swap="outerHTML">
+  {% for stage, counts in stages %}
+    <div class="progress-row">
+      <span>{{ stage }}</span>
+      <span>
+        {{ counts['done'] }} done · {{ counts['pending'] }} pending
+        {% if counts['failed'] %}<span class="failed">· {{ counts['failed'] }} failed</span>{% endif %}
+      </span>
+    </div>
+  {% endfor %}
+  {% if failures %}
+    <h3 class="failed">Failed files</h3>
+    <ul>
+      {% for failure in failures %}
+        <li class="failed">{{ failure['path'] }} — {{ failure['stage'] }}: {{ failure['error'] }}</li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+</div>

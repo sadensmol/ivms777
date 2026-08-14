@@ -1,0 +1,27 @@
+# Photos arrive by upload from the browser — there is no host mount. Originals
+# and derived data live on the named volume under /data.
+services:
+  app:
+    build: .
+    environment:
+      IVMS777_PROFILE: ${IVMS777_PROFILE:-mac}
+      IVMS777_DATA_DIR: /data
+    volumes:
+      - ivms777-data:/data           # uploads, db, thumbnails — Docker volume only
+      - ivms777-models:/root/.cache/huggingface  # SigLIP weights, downloaded once
+    ports:
+      - "8000:8000"
+
+  worker:
+    build: .
+    command: ["uv", "run", "--no-sync", "python", "-m", "ingest.cli"]
+    environment:
+      IVMS777_PROFILE: ${IVMS777_PROFILE:-mac}
+      IVMS777_DATA_DIR: /data
+    volumes:
+      - ivms777-data:/data
+      - ivms777-models:/root/.cache/huggingface
+
+volumes:
+  ivms777-data:
+  ivms777-models:

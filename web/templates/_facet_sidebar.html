@@ -1,0 +1,37 @@
+<aside class="sidebar">
+  <form method="get" action="/library">
+    <label class="sort-row">
+      Sort
+      <select name="sort" onchange="this.form.submit()">
+        <option value="">Date taken</option>
+        <option value="year_asc" {% if active.get('sort') == 'year_asc' %}selected{% endif %}>Year, oldest first</option>
+        <option value="year_desc" {% if active.get('sort') == 'year_desc' %}selected{% endif %}>Year, newest first</option>
+        <option value="iso_desc" {% if active.get('sort') == 'iso_desc' %}selected{% endif %}>ISO, highest first</option>
+        <option value="aperture_asc" {% if active.get('sort') == 'aperture_asc' %}selected{% endif %}>Aperture, widest first</option>
+        <option value="focal_length_desc" {% if active.get('sort') == 'focal_length_desc' %}selected{% endif %}>Focal length, longest first</option>
+        <option value="megapixels_desc" {% if active.get('sort') == 'megapixels_desc' %}selected{% endif %}>Megapixels, largest first</option>
+      </select>
+    </label>
+
+    {% for group in sidebar %}
+      <h3>{{ group['title'] }}</h3>
+      {% for entry in group['entries'] %}
+        <div class="facet-key">{{ entry['key'].replace('_', ' ') }}</div>
+        {% for value, count in entry['values'] %}
+          <label class="facet-row">
+            <input type="checkbox" name="f_{{ entry['key'] }}" value="{{ value }}"
+                   {% if value in (active.get('f_' ~ entry['key'], '')).split(',') %}checked{% endif %}>
+            <span>{{ value }}</span><span class="facet-count">{{ count }}</span>
+          </label>
+        {% endfor %}
+      {% endfor %}
+    {% endfor %}
+
+    <h3>Ranges</h3>
+    <label class="facet-row">ISO <input type="text" name="n_iso" placeholder="200:6400" value="{{ active.get('n_iso', '') }}"></label>
+    <label class="facet-row">Year <input type="text" name="n_year" placeholder="2020:2025" value="{{ active.get('n_year', '') }}"></label>
+
+    <button type="submit">Apply</button>
+    <a href="/library">Clear</a>
+  </form>
+</aside>

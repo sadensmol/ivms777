@@ -1,0 +1,44 @@
+[project]
+name = "ivms777"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "jinja2>=3.1",
+    "python-multipart>=0.0.12",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "pillow>=11.0",
+    "pillow-heif>=0.20",
+    "sqlite-vec>=0.1.6",
+    "httpx>=0.27",
+    "pyyaml>=6.0",
+    "torch>=2.13.0",
+    "transformers>=5.15.0",
+    "numpy>=2.5.2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.7",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Flat layout: the source lives at the repo root (no package folder), so ship
+# each top-level package plus the config module explicitly.
+[tool.hatch.build.targets.wheel]
+only-include = ["config.py", "albums", "db", "embedding", "inference", "ingest", "search", "storage", "web"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: needs real model weights, deselected by default"]
+addopts = "-m 'not slow'"
+
+[tool.ruff]
+line-length = 100

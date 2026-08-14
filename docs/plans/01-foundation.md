@@ -1,5 +1,7 @@
 # Photo Library Organizer — Plan 01: Foundation and Ingest
 
+> **PARTLY SUPERSEDED — completed 2026-08-13.** Tasks 3, 4, 7, 8 and 12 built a host-mounted folder scanner and a folder-picker UI. `docs/design.md` §3.2b now specifies browser upload instead, and `docs/plans/02-upload-ingest.md` replaces those tasks. This document is a snapshot of what was built, kept for its reasoning; it is not a description of the current app. Everything else it built — EXIF capture, facets, thumbnails, the job queue, the library grid, facet filters and sorting — is still current.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Point the app at a folder and get a browsable thumbnail grid of every photo in it — deduplicated by content hash, filterable and sortable by 25 EXIF facets — with a resumable job pipeline ready for the model stages.
@@ -15,11 +17,11 @@
 ## Global Constraints
 
 - Python 3.12. Dependencies managed by `uv` with a committed `uv.lock`.
-- Package name is `photolens`. Source lives in `photolens/`, tests in `tests/`.
+- Package name is `ivms777`. Source lives in `ivms777/`, tests in `tests/`.
 - **Never run `git commit`, `git add`, or any staging command.** The user commits. Every task ends with a checkpoint where you report what changed and stop.
 - Every user-scoped query filters on `owner_id`. `owner_id` is the constant `settings.owner_id` in v1 — there is no auth, no login, no user table, no admin role.
 - Original photo files are never modified, moved, or renamed. The app opens them read-only.
-- All I/O paths come from `Settings`. No hardcoded paths outside `photolens/config.py`.
+- All I/O paths come from `Settings`. No hardcoded paths outside `ivms777/config.py`.
 - Deploy profiles are `mac`, `jetson`, `cloud`. Profile changes config only, never code.
 - Tests must not download model weights or make network calls. Use the fakes.
 - SQLite connections open with `journal_mode=WAL` and `busy_timeout=5000`.
@@ -30,15 +32,15 @@
 
 **Files:**
 - Create: `pyproject.toml`
-- Create: `photolens/__init__.py`
-- Create: `photolens/config.py`
+- Create: `ivms777/__init__.py`
+- Create: `ivms777/config.py`
 - Create: `tests/__init__.py`
 - Create: `tests/test_config.py`
 - Create: `.gitignore`
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `photolens.config.Settings` (pydantic-settings `BaseSettings`) with fields `profile: Literal["mac","jetson","cloud"]`, `data_dir: Path`, `library_root: Path | None`, `db_path: Path`, `thumb_dir: Path`, `inference_base_url: str`, `caption_model: str`, `planner_model: str`, `embed_device: Literal["cpu","cuda","mps"]`, `owner_id: int`, `thumb_grid_px: int`, `thumb_detail_px: int`, `page_size: int`. Also `photolens.config.get_settings() -> Settings` (cached).
+- Produces: `ivms777.config.Settings` (pydantic-settings `BaseSettings`) with fields `profile: Literal["mac","jetson","cloud"]`, `data_dir: Path`, `library_root: Path | None`, `db_path: Path`, `thumb_dir: Path`, `inference_base_url: str`, `caption_model: str`, `planner_model: str`, `embed_device: Literal["cpu","cuda","mps"]`, `owner_id: int`, `thumb_grid_px: int`, `thumb_detail_px: int`, `page_size: int`. Also `ivms777.config.get_settings() -> Settings` (cached).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -47,7 +49,7 @@ Create `tests/test_config.py`:
 ```python
 from pathlib import Path
 
-from photolens.config import Settings
+from ivms777.config import Settings
 
 
 def test_defaults_to_mac_profile():
@@ -77,13 +79,13 @@ def test_explicit_value_beats_profile_default():
 
 def test_derived_paths_hang_off_data_dir():
     s = Settings(data_dir=Path("/tmp/pl"))
-    assert s.db_path == Path("/tmp/pl/photolens.db")
+    assert s.db_path == Path("/tmp/pl/ivms777.db")
     assert s.thumb_dir == Path("/tmp/pl/thumbs")
 
 
-def test_env_prefix_is_photolens(monkeypatch):
-    monkeypatch.setenv("PHOTOLENS_PROFILE", "cloud")
-    monkeypatch.setenv("PHOTOLENS_DATA_DIR", "/tmp/other")
+def test_env_prefix_is_ivms777(monkeypatch):
+    monkeypatch.setenv("IVMS777_PROFILE", "cloud")
+    monkeypatch.setenv("IVMS777_DATA_DIR", "/tmp/other")
     s = Settings()
     assert s.profile == "cloud"
     assert s.data_dir == Path("/tmp/other")
@@ -92,7 +94,7 @@ def test_env_prefix_is_photolens(monkeypatch):
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `uv run pytest tests/test_config.py -v`
-Expected: FAIL with `ModuleNotFoundError: No module named 'photolens'`
+Expected: FAIL with `ModuleNotFoundError: No module named 'ivms777'`
 
 - [ ] **Step 3: Create the project files**
 
@@ -100,7 +102,7 @@ Create `pyproject.toml`:
 
 ```toml
 [project]
-name = "photolens"
+name = "ivms777"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
@@ -129,7 +131,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["photolens"]
+packages = ["ivms777"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -151,9 +153,9 @@ data/
 .ruff_cache/
 ```
 
-Create empty `photolens/__init__.py` and `tests/__init__.py`.
+Create empty `ivms777/__init__.py` and `tests/__init__.py`.
 
-Create `photolens/config.py`:
+Create `ivms777/config.py`:
 
 ```python
 from functools import lru_cache
@@ -188,7 +190,7 @@ PROFILE_DEFAULTS: dict[Profile, dict[str, object]] = {
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="PHOTOLENS_", extra="ignore")
+    model_config = SettingsConfigDict(env_prefix="IVMS777_", extra="ignore")
 
     profile: Profile = "mac"
     data_dir: Path = Path("/data")
@@ -213,7 +215,7 @@ class Settings(BaseSettings):
 
     @property
     def db_path(self) -> Path:
-        return self.data_dir / "photolens.db"
+        return self.data_dir / "ivms777.db"
 
     @property
     def thumb_dir(self) -> Path:
@@ -241,15 +243,15 @@ Report: files created, test output. Do not commit — the user commits.
 ### Task 2: Database schema, connection, and migrations
 
 **Files:**
-- Create: `photolens/db/__init__.py`
-- Create: `photolens/db/schema.sql`
-- Create: `photolens/db/connection.py`
+- Create: `ivms777/db/__init__.py`
+- Create: `ivms777/db/schema.sql`
+- Create: `ivms777/db/connection.py`
 - Create: `tests/conftest.py`
 - Create: `tests/test_db.py`
 
 **Interfaces:**
-- Consumes: `photolens.config.Settings`.
-- Produces: `photolens.db.connection.connect(db_path: Path) -> sqlite3.Connection` (WAL, busy_timeout, `sqlite_vec` loaded, `row_factory = sqlite3.Row`, foreign keys on) and `photolens.db.connection.migrate(conn: sqlite3.Connection) -> None` (idempotent). Tables per spec section 6.
+- Consumes: `ivms777.config.Settings`.
+- Produces: `ivms777.db.connection.connect(db_path: Path) -> sqlite3.Connection` (WAL, busy_timeout, `sqlite_vec` loaded, `row_factory = sqlite3.Row`, foreign keys on) and `ivms777.db.connection.migrate(conn: sqlite3.Connection) -> None` (idempotent). Tables per spec section 6.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -260,8 +262,8 @@ from pathlib import Path
 
 import pytest
 
-from photolens.config import Settings
-from photolens.db.connection import connect, migrate
+from ivms777.config import Settings
+from ivms777.db.connection import connect, migrate
 
 
 @pytest.fixture
@@ -285,7 +287,7 @@ import sqlite3
 
 import pytest
 
-from photolens.db.connection import connect, migrate
+from ivms777.db.connection import connect, migrate
 
 
 def test_wal_and_busy_timeout_are_set(conn):
@@ -367,13 +369,13 @@ def test_deleting_a_photo_cascades_to_jobs(conn):
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `uv run pytest tests/test_db.py -v`
-Expected: FAIL with `ModuleNotFoundError: No module named 'photolens.db'`
+Expected: FAIL with `ModuleNotFoundError: No module named 'ivms777.db'`
 
 - [ ] **Step 3: Write the schema and connection module**
 
-Create empty `photolens/db/__init__.py`.
+Create empty `ivms777/db/__init__.py`.
 
-Create `photolens/db/schema.sql`:
+Create `ivms777/db/schema.sql`:
 
 ```sql
 CREATE TABLE IF NOT EXISTS photos (
@@ -475,7 +477,7 @@ CREATE TABLE IF NOT EXISTS scans (
 CREATE VIRTUAL TABLE IF NOT EXISTS photo_fts USING fts5(caption, tags_text);
 ```
 
-Create `photolens/db/connection.py`:
+Create `ivms777/db/connection.py`:
 
 ```python
 import sqlite3
@@ -488,7 +490,11 @@ SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
 def connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path, isolation_level=None)
+    # FastAPI runs sync route handlers in a threadpool, so the connection is used
+    # from threads other than the one that created it. Python's sqlite3 serializes
+    # calls internally (default SQLITE_THREADSAFE=1), and every statement here is
+    # autocommitted, so sharing one connection is safe at this scale.
+    conn = sqlite3.connect(db_path, isolation_level=None, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.enable_load_extension(True)
     sqlite_vec.load(conn)
@@ -519,14 +525,14 @@ Report: test output, and the `vec_version()` string so the extension version is 
 ### Task 3: Storage protocol and local filesystem backend
 
 **Files:**
-- Create: `photolens/storage/__init__.py`
-- Create: `photolens/storage/base.py`
-- Create: `photolens/storage/local.py`
+- Create: `ivms777/storage/__init__.py`
+- Create: `ivms777/storage/base.py`
+- Create: `ivms777/storage/local.py`
 - Create: `tests/test_storage.py`
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `photolens.storage.base.StorageStat` (dataclass: `size: int`, `mtime: float`), `photolens.storage.base.Storage` (Protocol with `iter_keys() -> Iterator[str]`, `read(key) -> bytes`, `write(key, data) -> None`, `exists(key) -> bool`, `stat(key) -> StorageStat`, `local_path(key) -> Path | None`), and `photolens.storage.local.LocalStorage(root: Path, extensions: frozenset[str] | None = None)`.
+- Produces: `ivms777.storage.base.StorageStat` (dataclass: `size: int`, `mtime: float`), `ivms777.storage.base.Storage` (Protocol with `iter_keys() -> Iterator[str]`, `read(key) -> bytes`, `write(key, data) -> None`, `exists(key) -> bool`, `stat(key) -> StorageStat`, `local_path(key) -> Path | None`), and `ivms777.storage.local.LocalStorage(root: Path, extensions: frozenset[str] | None = None)`.
 
 Two instances are used by later tasks: one rooted at `settings.library_root` for originals, one at `settings.thumb_dir` for derived files. Keys are POSIX-style paths relative to the root.
 
@@ -537,7 +543,7 @@ Create `tests/test_storage.py`:
 ```python
 import pytest
 
-from photolens.storage.local import IMAGE_EXTENSIONS, LocalStorage
+from ivms777.storage.local import IMAGE_EXTENSIONS, LocalStorage
 
 
 @pytest.fixture
@@ -592,13 +598,13 @@ def test_escaping_the_root_is_rejected(library):
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `uv run pytest tests/test_storage.py -v`
-Expected: FAIL with `ModuleNotFoundError: No module named 'photolens.storage'`
+Expected: FAIL with `ModuleNotFoundError: No module named 'ivms777.storage'`
 
 - [ ] **Step 3: Write the storage modules**
 
-Create empty `photolens/storage/__init__.py`.
+Create empty `ivms777/storage/__init__.py`.
 
-Create `photolens/storage/base.py`:
+Create `ivms777/storage/base.py`:
 
 ```python
 from collections.abc import Iterator
@@ -622,13 +628,13 @@ class Storage(Protocol):
     def local_path(self, key: str) -> Path | None: ...
 ```
 
-Create `photolens/storage/local.py`:
+Create `ivms777/storage/local.py`:
 
 ```python
 from collections.abc import Iterator
 from pathlib import Path
 
-from photolens.storage.base import StorageStat
+from ivms777.storage.base import StorageStat
 
 IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp", ".tif", ".tiff"})
 
@@ -685,10 +691,10 @@ Report: test output. Confirm the root-escape test passes — that guard is what 
 ### Task 4: Scanner — walk, hash, EXIF, facets, upsert
 
 **Files:**
-- Create: `photolens/ingest/__init__.py`
-- Create: `photolens/ingest/exif.py`
-- Create: `photolens/ingest/facets.py`
-- Create: `photolens/ingest/scanner.py`
+- Create: `ivms777/ingest/__init__.py`
+- Create: `ivms777/ingest/exif.py`
+- Create: `ivms777/ingest/facets.py`
+- Create: `ivms777/ingest/scanner.py`
 - Create: `tests/fixtures.py`
 - Create: `tests/test_exif.py`
 - Create: `tests/test_facets.py`
@@ -696,8 +702,8 @@ Report: test output. Confirm the root-escape test passes — that guard is what 
 
 **Interfaces:**
 - Consumes: `LocalStorage`, `connect`/`migrate`, `Settings`.
-- Produces (facets): `photolens.ingest.facets.Facet` (dataclass: `key: str`, `value_text: str | None`, `value_num: float | None`), `photolens.ingest.facets.derive_facets(facts: ExifFacts, width: int | None, height: int | None) -> list[Facet]`, `photolens.ingest.facets.store_facets(conn, photo_id: int, facets: list[Facet]) -> None`, and `photolens.ingest.facets.FACET_KEYS: tuple[str, ...]`.
-- Produces: `photolens.ingest.exif.ExifFacts` (dataclass: `shot_at: str | None`, `camera: str | None`, `lens: str | None`, `gps_lat: float | None`, `gps_lon: float | None`, `width: int | None`, `height: int | None`), `photolens.ingest.exif.read_exif(path: Path) -> ExifFacts`, `photolens.ingest.scanner.sha256_file(path: Path) -> str`, `photolens.ingest.scanner.ScanResult` (dataclass: `scan_id: int`, `seen: int`, `added: int`, `moved: int`, `missing: int`, `duplicates: int`), and `photolens.ingest.scanner.scan(conn, storage, owner_id: int) -> ScanResult`.
+- Produces (facets): `ivms777.ingest.facets.Facet` (dataclass: `key: str`, `value_text: str | None`, `value_num: float | None`), `ivms777.ingest.facets.derive_facets(facts: ExifFacts, width: int | None, height: int | None) -> list[Facet]`, `ivms777.ingest.facets.store_facets(conn, photo_id: int, facets: list[Facet]) -> None`, and `ivms777.ingest.facets.FACET_KEYS: tuple[str, ...]`.
+- Produces: `ivms777.ingest.exif.ExifFacts` (dataclass: `shot_at: str | None`, `camera: str | None`, `lens: str | None`, `gps_lat: float | None`, `gps_lon: float | None`, `width: int | None`, `height: int | None`), `ivms777.ingest.exif.read_exif(path: Path) -> ExifFacts`, `ivms777.ingest.scanner.sha256_file(path: Path) -> str`, `ivms777.ingest.scanner.ScanResult` (dataclass: `scan_id: int`, `seen: int`, `added: int`, `moved: int`, `missing: int`, `duplicates: int`), and `ivms777.ingest.scanner.scan(conn, storage, owner_id: int) -> ScanResult`.
 
 Behaviour `scan` must implement:
 - new key, new hash → insert a **canonical** photo row and enqueue its `thumbnail` job
@@ -751,7 +757,7 @@ def make_jpeg_with_exif(path: Path, when: str = "2025:07:12 14:30:00", model: st
 Create `tests/test_exif.py`:
 
 ```python
-from photolens.ingest.exif import read_exif
+from ivms777.ingest.exif import read_exif
 from tests.fixtures import make_jpeg, make_jpeg_with_exif
 
 
@@ -792,8 +798,8 @@ def test_raw_is_json_serialisable(tmp_path):
 Create `tests/test_facets.py`:
 
 ```python
-from photolens.ingest.exif import ExifFacts
-from photolens.ingest.facets import derive_facets, store_facets
+from ivms777.ingest.exif import ExifFacts
+from ivms777.ingest.facets import derive_facets, store_facets
 
 
 def facet_map(facets):
@@ -899,8 +905,8 @@ def test_store_facets_replaces_previous_values(conn):
 Create `tests/test_scanner.py`:
 
 ```python
-from photolens.ingest.scanner import scan, sha256_file
-from photolens.storage.local import IMAGE_EXTENSIONS, LocalStorage
+from ivms777.ingest.scanner import scan, sha256_file
+from ivms777.storage.local import IMAGE_EXTENSIONS, LocalStorage
 from tests.fixtures import make_jpeg, make_jpeg_with_exif
 
 
@@ -1135,13 +1141,13 @@ In `test_moved_file_updates_path_instead_of_duplicating`, replace the awkward in
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `uv run pytest tests/test_exif.py tests/test_facets.py tests/test_scanner.py -v`
-Expected: FAIL with `ModuleNotFoundError: No module named 'photolens.ingest'`
+Expected: FAIL with `ModuleNotFoundError: No module named 'ivms777.ingest'`
 
 - [ ] **Step 3: Write the exif module**
 
-Create empty `photolens/ingest/__init__.py`.
+Create empty `ivms777/ingest/__init__.py`.
 
-Create `photolens/ingest/exif.py`:
+Create `ivms777/ingest/exif.py`:
 
 ```python
 from dataclasses import dataclass, field
@@ -1265,14 +1271,14 @@ table so they are never confused with model guesses. Numeric facets go in
 source data is absent is simply not emitted, so `photo_facets` never contains
 invented values.
 
-Create `photolens/ingest/facets.py`:
+Create `ivms777/ingest/facets.py`:
 
 ```python
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 
-from photolens.ingest.exif import ExifFacts
+from ivms777.ingest.exif import ExifFacts
 
 FACET_KEYS: tuple[str, ...] = (
     "camera_make", "camera_model", "lens", "software",
@@ -1422,7 +1428,7 @@ does.
 
 - [ ] **Step 5: Write the scanner module**
 
-Create `photolens/ingest/scanner.py`:
+Create `ivms777/ingest/scanner.py`:
 
 ```python
 import hashlib
@@ -1432,9 +1438,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from photolens.ingest.exif import read_exif
-from photolens.ingest.facets import derive_facets, store_facets
-from photolens.storage.base import Storage
+from ivms777.ingest.exif import read_exif
+from ivms777.ingest.facets import derive_facets, store_facets
+from ivms777.storage.base import Storage
 
 CHUNK = 1 << 20
 
@@ -1644,12 +1650,12 @@ most likely to regress.
 ### Task 5: Thumbnails
 
 **Files:**
-- Create: `photolens/ingest/thumbs.py`
+- Create: `ivms777/ingest/thumbs.py`
 - Create: `tests/test_thumbs.py`
 
 **Interfaces:**
 - Consumes: `Storage`, `Settings`.
-- Produces: `photolens.ingest.thumbs.thumb_key(content_hash: str, size: int) -> str` and `photolens.ingest.thumbs.make_thumbnails(source: Path, content_hash: str, derived: Storage, grid_px: int, detail_px: int) -> str` returning the grid thumbnail key.
+- Produces: `ivms777.ingest.thumbs.thumb_key(content_hash: str, size: int) -> str` and `ivms777.ingest.thumbs.make_thumbnails(source: Path, content_hash: str, derived: Storage, grid_px: int, detail_px: int) -> str` returning the grid thumbnail key.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1661,8 +1667,8 @@ import io
 import pytest
 from PIL import Image
 
-from photolens.ingest.thumbs import make_thumbnails, thumb_key
-from photolens.storage.local import LocalStorage
+from ivms777.ingest.thumbs import make_thumbnails, thumb_key
+from ivms777.storage.local import LocalStorage
 from tests.fixtures import make_jpeg
 
 
@@ -1712,11 +1718,11 @@ def test_unreadable_source_raises(tmp_path):
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `uv run pytest tests/test_thumbs.py -v`
-Expected: FAIL with `ModuleNotFoundError: No module named 'photolens.ingest.thumbs'`
+Expected: FAIL with `ModuleNotFoundError: No module named 'ivms777.ingest.thumbs'`
 
 - [ ] **Step 3: Write the implementation**
 
-Create `photolens/ingest/thumbs.py`:
+Create `ivms777/ingest/thumbs.py`:
 
 ```python
 import io
@@ -1725,7 +1731,7 @@ from pathlib import Path
 import pillow_heif
 from PIL import Image, ImageOps
 
-from photolens.storage.base import Storage
+from ivms777.storage.base import Storage
 
 pillow_heif.register_heif_opener()
 
@@ -1775,24 +1781,24 @@ Report: test output.
 ### Task 6: Job queue and worker driver
 
 **Files:**
-- Create: `photolens/ingest/jobs.py`
-- Create: `photolens/ingest/worker.py`
+- Create: `ivms777/ingest/jobs.py`
+- Create: `ivms777/ingest/worker.py`
 - Create: `tests/test_jobs.py`
 - Create: `tests/test_worker.py`
 
 **Interfaces:**
 - Consumes: `connect`/`migrate`, `Storage`, `Settings`.
 - Produces:
-  - `photolens.ingest.jobs.STAGES: tuple[str, ...] = ("thumbnail", "embed", "taxonomy", "caption")`
-  - `photolens.ingest.jobs.MAX_ATTEMPTS: int = 3`
-  - `photolens.ingest.jobs.enqueue(conn, photo_id: int, stage: str) -> None`
-  - `photolens.ingest.jobs.claim_next(conn, stage: str) -> int | None`
-  - `photolens.ingest.jobs.complete(conn, photo_id: int, stage: str) -> None`
-  - `photolens.ingest.jobs.fail(conn, photo_id: int, stage: str, error: str) -> None`
-  - `photolens.ingest.jobs.stage_counts(conn, stage: str) -> dict[str, int]`
-  - `photolens.ingest.worker.StageHandler` (Protocol: `__call__(conn, photo_id: int) -> None`)
-  - `photolens.ingest.worker.drain(conn, handlers: dict[str, StageHandler], stages=STAGES) -> dict[str, int]` returning completed counts per stage
-  - `photolens.ingest.worker.thumbnail_handler(originals: Storage, derived: Storage, grid_px: int, detail_px: int) -> StageHandler`
+  - `ivms777.ingest.jobs.STAGES: tuple[str, ...] = ("thumbnail", "embed", "taxonomy", "caption")`
+  - `ivms777.ingest.jobs.MAX_ATTEMPTS: int = 3`
+  - `ivms777.ingest.jobs.enqueue(conn, photo_id: int, stage: str) -> None`
+  - `ivms777.ingest.jobs.claim_next(conn, stage: str) -> int | None`
+  - `ivms777.ingest.jobs.complete(conn, photo_id: int, stage: str) -> None`
+  - `ivms777.ingest.jobs.fail(conn, photo_id: int, stage: str, error: str) -> None`
+  - `ivms777.ingest.jobs.stage_counts(conn, stage: str) -> dict[str, int]`
+  - `ivms777.ingest.worker.StageHandler` (Protocol: `__call__(conn, photo_id: int) -> None`)
+  - `ivms777.ingest.worker.drain(conn, handlers: dict[str, StageHandler], stages=STAGES) -> dict[str, int]` returning completed counts per stage
+  - `ivms777.ingest.worker.thumbnail_handler(originals: Storage, derived: Storage, grid_px: int, detail_px: int) -> StageHandler`
 
 `drain` processes stages in order, exhausting each stage across the whole library before starting the next. This is what keeps SigLIP and the captioner from being resident together on an 8 GB Jetson (spec section 8).
 
@@ -1801,7 +1807,7 @@ Report: test output.
 Create `tests/test_jobs.py`:
 
 ```python
-from photolens.ingest.jobs import (
+from ivms777.ingest.jobs import (
     MAX_ATTEMPTS,
     claim_next,
     complete,
@@ -1883,11 +1889,11 @@ def test_stage_counts_reports_every_status_key(conn):
 Create `tests/test_worker.py`:
 
 ```python
-from photolens.ingest.jobs import claim_next, enqueue, stage_counts
-from photolens.ingest.scanner import scan
-from photolens.ingest.thumbs import thumb_key
-from photolens.ingest.worker import drain, thumbnail_handler
-from photolens.storage.local import IMAGE_EXTENSIONS, LocalStorage
+from ivms777.ingest.jobs import claim_next, enqueue, stage_counts
+from ivms777.ingest.scanner import scan
+from ivms777.ingest.thumbs import thumb_key
+from ivms777.ingest.worker import drain, thumbnail_handler
+from ivms777.storage.local import IMAGE_EXTENSIONS, LocalStorage
 from tests.fixtures import make_jpeg
 
 
@@ -1966,11 +1972,11 @@ def test_thumbnail_handler_writes_files_and_sets_thumb_key(conn, tmp_path):
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `uv run pytest tests/test_jobs.py tests/test_worker.py -v`
-Expected: FAIL with `ModuleNotFoundError: No module named 'photolens.ingest.jobs'`
+Expected: FAIL with `ModuleNotFoundError: No module named 'ivms777.ingest.jobs'`
 
 - [ ] **Step 3: Write the jobs module**
 
-Create `photolens/ingest/jobs.py`:
+Create `ivms777/ingest/jobs.py`:
 
 ```python
 import sqlite3
@@ -1993,12 +1999,28 @@ def enqueue(conn: sqlite3.Connection, photo_id: int, stage: str) -> None:
     )
 
 
-def claim_next(conn: sqlite3.Connection, stage: str) -> int | None:
-    row = conn.execute(
-        "SELECT photo_id FROM jobs WHERE stage = ? AND status = 'pending'"
-        " ORDER BY photo_id LIMIT 1",
-        (stage,),
-    ).fetchone()
+def claim_next(
+    conn: sqlite3.Connection, stage: str, exclude: set[int] | None = None
+) -> int | None:
+    """Claim the lowest-id pending photo for `stage`.
+
+    `exclude` skips photos already attempted in this pass. A failed job returns to
+    'pending' while attempts remain, so without it a single failing photo would be
+    re-claimed forever and starve the rest of the queue.
+    """
+    if exclude:
+        placeholders = ", ".join("?" for _ in exclude)
+        row = conn.execute(
+            "SELECT photo_id FROM jobs WHERE stage = ? AND status = 'pending'"
+            f" AND photo_id NOT IN ({placeholders}) ORDER BY photo_id LIMIT 1",
+            (stage, *exclude),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT photo_id FROM jobs WHERE stage = ? AND status = 'pending'"
+            " ORDER BY photo_id LIMIT 1",
+            (stage,),
+        ).fetchone()
     if row is None:
         return None
     conn.execute(
@@ -2036,16 +2058,16 @@ def stage_counts(conn: sqlite3.Connection, stage: str) -> dict[str, int]:
 
 - [ ] **Step 4: Write the worker module**
 
-Create `photolens/ingest/worker.py`:
+Create `ivms777/ingest/worker.py`:
 
 ```python
 import sqlite3
 from pathlib import Path
 from typing import Protocol
 
-from photolens.ingest.jobs import STAGES, claim_next, complete, fail
-from photolens.ingest.thumbs import make_thumbnails
-from photolens.storage.base import Storage
+from ivms777.ingest.jobs import STAGES, claim_next, complete, fail
+from ivms777.ingest.thumbs import make_thumbnails
+from ivms777.storage.base import Storage
 
 
 class StageHandler(Protocol):
@@ -2063,7 +2085,9 @@ def drain(
         if handler is None:
             continue
         done = 0
-        while (photo_id := claim_next(conn, stage)) is not None:
+        attempted: set[int] = set()
+        while (photo_id := claim_next(conn, stage, exclude=attempted)) is not None:
+            attempted.add(photo_id)
             try:
                 handler(conn, photo_id)
             except Exception as error:  # one bad file must never stall the queue
@@ -2094,35 +2118,18 @@ def thumbnail_handler(
     return handle
 ```
 
-Note on `test_drain_records_failure_without_stopping_the_queue`: `fail` returns the job to `pending` while attempts remain, and `drain`'s `while` loop would immediately re-claim it and loop forever. It does not, because `claim_next` orders by `photo_id` and the failing photo is re-claimed only after the loop revisits it — which it does. **Guard against this:** track claimed ids within a single `drain` call and skip ones already attempted this pass.
-
-Apply that guard now — replace the `while` loop body in `drain` with:
-
-```python
-        done = 0
-        attempted: set[int] = set()
-        while (photo_id := claim_next(conn, stage)) is not None:
-            if photo_id in attempted:
-                conn.execute(
-                    "UPDATE jobs SET status = 'pending' WHERE photo_id = ? AND stage = ?",
-                    (photo_id, stage),
-                )
-                break
-            attempted.add(photo_id)
-            try:
-                handler(conn, photo_id)
-            except Exception as error:
-                fail(conn, photo_id, stage, str(error))
-            else:
-                complete(conn, photo_id, stage)
-                done += 1
-        completed[stage] = done
-```
+The `exclude` parameter on `claim_next` is what makes
+`test_drain_records_failure_without_stopping_the_queue` pass. `fail` puts the job
+back to `pending` while attempts remain, and since `claim_next` orders by
+`photo_id`, a failing low-id photo would otherwise be re-claimed on every
+iteration and the rest of the queue would never run. Skipping it *within this
+pass* — rather than breaking out of the loop — lets the remaining photos proceed
+while the failed one stays `pending` for the next pass.
 
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_jobs.py tests/test_worker.py -v`
-Expected: 11 passed. If `test_drain_records_failure_without_stopping_the_queue` hangs, the re-claim guard above was not applied.
+Expected: 11 passed.
 
 - [ ] **Step 6: Checkpoint**
 
@@ -2133,18 +2140,18 @@ Report: test output, and confirm no test hangs.
 ### Task 7: FastAPI app, library grid, and thumbnail serving
 
 **Files:**
-- Create: `photolens/web/__init__.py`
-- Create: `photolens/web/deps.py`
-- Create: `photolens/web/app.py`
-- Create: `photolens/web/templates/base.html`
-- Create: `photolens/web/templates/library.html`
-- Create: `photolens/web/templates/_grid_page.html`
-- Create: `photolens/web/static/app.css`
+- Create: `ivms777/web/__init__.py`
+- Create: `ivms777/web/deps.py`
+- Create: `ivms777/web/app.py`
+- Create: `ivms777/web/templates/base.html`
+- Create: `ivms777/web/templates/library.html`
+- Create: `ivms777/web/templates/_grid_page.html`
+- Create: `ivms777/web/static/app.css`
 - Create: `tests/test_web_library.py`
 
 **Interfaces:**
 - Consumes: everything above.
-- Produces: `photolens.web.app.create_app(settings: Settings) -> FastAPI` with routes `GET /` (redirect to `/library`), `GET /library`, `GET /library/page?offset=`, `GET /thumb/{photo_id}`. Also `photolens.web.deps.AppContext` (dataclass: `settings`, `conn`, `originals`, `derived`).
+- Produces: `ivms777.web.app.create_app(settings: Settings) -> FastAPI` with routes `GET /` (redirect to `/library`), `GET /library`, `GET /library/page?offset=`, `GET /thumb/{photo_id}`. Also `ivms777.web.deps.AppContext` (dataclass: `settings`, `conn`, `originals`, `derived`).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2154,10 +2161,10 @@ Create `tests/test_web_library.py`:
 import pytest
 from fastapi.testclient import TestClient
 
-from photolens.ingest.worker import drain, thumbnail_handler
-from photolens.ingest.scanner import scan
-from photolens.storage.local import IMAGE_EXTENSIONS, LocalStorage
-from photolens.web.app import create_app
+from ivms777.ingest.worker import drain, thumbnail_handler
+from ivms777.ingest.scanner import scan
+from ivms777.storage.local import IMAGE_EXTENSIONS, LocalStorage
+from ivms777.web.app import create_app
 from tests.fixtures import make_jpeg
 
 
@@ -2236,20 +2243,20 @@ def test_duplicates_are_hidden_and_shown_as_a_badge(client):
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `uv run pytest tests/test_web_library.py -v`
-Expected: FAIL with `ModuleNotFoundError: No module named 'photolens.web'`
+Expected: FAIL with `ModuleNotFoundError: No module named 'ivms777.web'`
 
 - [ ] **Step 3: Write the app context and application**
 
-Create empty `photolens/web/__init__.py`.
+Create empty `ivms777/web/__init__.py`.
 
-Create `photolens/web/deps.py`:
+Create `ivms777/web/deps.py`:
 
 ```python
 import sqlite3
 from dataclasses import dataclass
 
-from photolens.config import Settings
-from photolens.storage.local import IMAGE_EXTENSIONS, LocalStorage
+from ivms777.config import Settings
+from ivms777.storage.local import IMAGE_EXTENSIONS, LocalStorage
 
 
 @dataclass
@@ -2261,7 +2268,7 @@ class AppContext:
 
 
 def build_context(settings: Settings) -> AppContext:
-    from photolens.db.connection import connect, migrate
+    from ivms777.db.connection import connect, migrate
 
     conn = connect(settings.db_path)
     migrate(conn)
@@ -2275,7 +2282,7 @@ def build_context(settings: Settings) -> AppContext:
     )
 ```
 
-Create `photolens/web/app.py`:
+Create `ivms777/web/app.py`:
 
 ```python
 from pathlib import Path
@@ -2285,8 +2292,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from photolens.config import Settings
-from photolens.web.deps import AppContext, build_context
+from ivms777.config import Settings
+from ivms777.web.deps import AppContext, build_context
 
 TEMPLATE_DIR = Path(__file__).parent / "templates"
 STATIC_DIR = Path(__file__).parent / "static"
@@ -2302,7 +2309,7 @@ LIST_SQL = (
 
 
 def create_app(settings: Settings) -> FastAPI:
-    app = FastAPI(title="photolens")
+    app = FastAPI(title="ivms777")
     app.state.context = build_context(settings)
     templates = Jinja2Templates(directory=str(TEMPLATE_DIR))
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -2358,7 +2365,7 @@ def create_app(settings: Settings) -> FastAPI:
 
 - [ ] **Step 4: Write the templates and stylesheet**
 
-Create `photolens/web/templates/base.html`:
+Create `ivms777/web/templates/base.html`:
 
 ```html
 <!doctype html>
@@ -2366,7 +2373,7 @@ Create `photolens/web/templates/base.html`:
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>{% block title %}photolens{% endblock %}</title>
+    <title>{% block title %}ivms777{% endblock %}</title>
     <link rel="stylesheet" href="/static/app.css">
     <script src="/static/htmx.min.js"></script>
   </head>
@@ -2385,10 +2392,10 @@ and a CDN script tag without Subresource Integrity is a supply-chain risk.
 Download it now:
 
 ```bash
-curl -fsSL https://unpkg.com/htmx.org@2.0.3/dist/htmx.min.js -o photolens/web/static/htmx.min.js
+curl -fsSL https://unpkg.com/htmx.org@2.0.3/dist/htmx.min.js -o ivms777/web/static/htmx.min.js
 ```
 
-Create `photolens/web/templates/_grid_page.html`:
+Create `ivms777/web/templates/_grid_page.html`:
 
 ```html
 {% for photo in photos %}
@@ -2409,7 +2416,7 @@ Create `photolens/web/templates/_grid_page.html`:
 {% endif %}
 ```
 
-Create `photolens/web/templates/library.html`:
+Create `ivms777/web/templates/library.html`:
 
 ```html
 {% extends "base.html" %}
@@ -2420,7 +2427,7 @@ Create `photolens/web/templates/library.html`:
 {% endblock %}
 ```
 
-Create `photolens/web/static/app.css`:
+Create `ivms777/web/static/app.css`:
 
 ```css
 * { box-sizing: border-box; }
@@ -2464,14 +2471,14 @@ Report: test output. Note that `/photo/{id}` is linked but not yet implemented �
 ### Task 8: Index screen — start a scan and watch progress
 
 **Files:**
-- Modify: `photolens/web/app.py` (add routes; keep existing ones unchanged)
-- Create: `photolens/web/templates/index.html`
-- Create: `photolens/web/templates/_progress.html`
+- Modify: `ivms777/web/app.py` (add routes; keep existing ones unchanged)
+- Create: `ivms777/web/templates/index.html`
+- Create: `ivms777/web/templates/_progress.html`
 - Create: `tests/test_web_index.py`
 
 **Interfaces:**
 - Consumes: `scan`, `drain`, `thumbnail_handler`, `stage_counts`, `AppContext`.
-- Produces: routes `GET /index`, `POST /index/scan`, `GET /index/progress`. Also `photolens.web.app.run_ingest(context: AppContext) -> None`, which runs a scan then drains the thumbnail stage — synchronous and directly callable from tests.
+- Produces: routes `GET /index`, `POST /index/scan`, `GET /index/progress`. Also `ivms777.web.app.run_ingest(context: AppContext) -> None`, which runs a scan then drains the thumbnail stage — synchronous and directly callable from tests.
 
 `POST /index/scan` schedules `run_ingest` on a FastAPI `BackgroundTasks` so the request returns immediately.
 
@@ -2483,7 +2490,7 @@ Create `tests/test_web_index.py`:
 import pytest
 from fastapi.testclient import TestClient
 
-from photolens.web.app import create_app, run_ingest
+from ivms777.web.app import create_app, run_ingest
 from tests.fixtures import make_jpeg
 
 
@@ -2544,14 +2551,14 @@ Expected: FAIL with `ImportError: cannot import name 'run_ingest'`
 
 - [ ] **Step 3: Add the ingest routes**
 
-In `photolens/web/app.py`, add these imports at the top:
+In `ivms777/web/app.py`, add these imports at the top:
 
 ```python
 from fastapi import BackgroundTasks
 
-from photolens.ingest.jobs import STAGES, stage_counts
-from photolens.ingest.scanner import scan
-from photolens.ingest.worker import drain, thumbnail_handler
+from ivms777.ingest.jobs import STAGES, stage_counts
+from ivms777.ingest.scanner import scan
+from ivms777.ingest.worker import drain, thumbnail_handler
 ```
 
 Add this module-level function above `create_app`:
@@ -2606,7 +2613,7 @@ Inside `create_app`, before `return app`, add:
 
 - [ ] **Step 4: Write the templates**
 
-Create `photolens/web/templates/_progress.html`:
+Create `ivms777/web/templates/_progress.html`:
 
 ```html
 <div class="progress" hx-get="/index/progress" hx-trigger="every 2s" hx-swap="outerHTML">
@@ -2630,7 +2637,7 @@ Create `photolens/web/templates/_progress.html`:
 </div>
 ```
 
-Create `photolens/web/templates/index.html`:
+Create `ivms777/web/templates/index.html`:
 
 ```html
 {% extends "base.html" %}
@@ -2663,19 +2670,19 @@ Report: full suite output.
 ### Task 9: Inference client and fake
 
 **Files:**
-- Create: `photolens/inference/__init__.py`
-- Create: `photolens/inference/client.py`
-- Create: `photolens/inference/fakes.py`
+- Create: `ivms777/inference/__init__.py`
+- Create: `ivms777/inference/client.py`
+- Create: `ivms777/inference/fakes.py`
 - Create: `tests/test_inference_client.py`
 
 **Interfaces:**
 - Consumes: `Settings`.
 - Produces:
-  - `photolens.inference.client.ChatMessage` (TypedDict: `role: str`, `content: object`)
-  - `photolens.inference.client.InferenceClient` (Protocol: `complete(model: str, messages: list[ChatMessage], *, json_schema: dict | None = None, timeout: float = 120.0) -> str`)
-  - `photolens.inference.client.OpenAICompatClient(base_url: str, api_key: str = "unused")` implementing it
-  - `photolens.inference.client.encode_image(data: bytes, mime: str = "image/jpeg") -> str` returning a `data:` URI
-  - `photolens.inference.fakes.FakeInferenceClient(responses: list[str])` recording `calls: list[tuple[str, list[ChatMessage]]]` and returning queued responses in order
+  - `ivms777.inference.client.ChatMessage` (TypedDict: `role: str`, `content: object`)
+  - `ivms777.inference.client.InferenceClient` (Protocol: `complete(model: str, messages: list[ChatMessage], *, json_schema: dict | None = None, timeout: float = 120.0) -> str`)
+  - `ivms777.inference.client.OpenAICompatClient(base_url: str, api_key: str = "unused")` implementing it
+  - `ivms777.inference.client.encode_image(data: bytes, mime: str = "image/jpeg") -> str` returning a `data:` URI
+  - `ivms777.inference.fakes.FakeInferenceClient(responses: list[str])` recording `calls: list[tuple[str, list[ChatMessage]]]` and returning queued responses in order
 
 Both Ollama and vLLM speak the OpenAI chat-completions API, so one client covers every profile.
 
@@ -2687,8 +2694,8 @@ Create `tests/test_inference_client.py`:
 import httpx
 import pytest
 
-from photolens.inference.client import OpenAICompatClient, encode_image
-from photolens.inference.fakes import FakeInferenceClient
+from ivms777.inference.client import OpenAICompatClient, encode_image
+from ivms777.inference.fakes import FakeInferenceClient
 
 
 def test_encode_image_produces_a_data_uri():
@@ -2753,13 +2760,13 @@ def test_client_raises_on_http_error():
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `uv run pytest tests/test_inference_client.py -v`
-Expected: FAIL with `ModuleNotFoundError: No module named 'photolens.inference'`
+Expected: FAIL with `ModuleNotFoundError: No module named 'ivms777.inference'`
 
 - [ ] **Step 3: Write the client and fake**
 
-Create empty `photolens/inference/__init__.py`.
+Create empty `ivms777/inference/__init__.py`.
 
-Create `photolens/inference/client.py`:
+Create `ivms777/inference/client.py`:
 
 ```python
 import base64
@@ -2822,10 +2829,10 @@ class OpenAICompatClient:
 
 `base_url` already ends in `/v1`, and the request path is `/chat/completions`, so the test's assertion on `/v1/chat/completions` holds.
 
-Create `photolens/inference/fakes.py`:
+Create `ivms777/inference/fakes.py`:
 
 ```python
-from photolens.inference.client import ChatMessage
+from ivms777.inference.client import ChatMessage
 
 
 class FakeInferenceClient:
@@ -2869,7 +2876,7 @@ Report: test output.
 - Create: `README.md`
 
 **Interfaces:**
-- Consumes: the `photolens` package and `Settings` env var names (`PHOTOLENS_*`).
+- Consumes: the `ivms777` package and `Settings` env var names (`IVMS777_*`).
 - Produces: `app` and `worker` services in the base file; `inference` added by the `jetson` and `cloud` overrides. No new Python interfaces.
 
 This task has no unit tests — it is verified by actually starting the stack.
@@ -2902,25 +2909,25 @@ WORKDIR /app
 COPY pyproject.toml uv.lock* ./
 RUN uv sync --no-dev --frozen || uv sync --no-dev
 
-COPY photolens ./photolens
+COPY ivms777 ./ivms777
 
-ENV PYTHONUNBUFFERED=1 PHOTOLENS_DATA_DIR=/data
+ENV PYTHONUNBUFFERED=1 IVMS777_DATA_DIR=/data
 EXPOSE 8000
 
-CMD ["uv", "run", "uvicorn", "photolens.web.app:create_app", \
+CMD ["uv", "run", "uvicorn", "ivms777.web.app:create_app", \
      "--factory", "--host", "0.0.0.0", "--port", "8000"]
 ```
 
-`create_app` takes a `Settings` argument, and `--factory` calls it with none. Fix this now by adding a zero-argument factory to `photolens/web/app.py`:
+`create_app` takes a `Settings` argument, and `--factory` calls it with none. Fix this now by adding a zero-argument factory to `ivms777/web/app.py`:
 
 ```python
 def app_factory() -> FastAPI:
-    from photolens.config import get_settings
+    from ivms777.config import get_settings
 
     return create_app(get_settings())
 ```
 
-and change the Dockerfile `CMD` target to `photolens.web.app:app_factory`.
+and change the Dockerfile `CMD` target to `ivms777.web.app:app_factory`.
 
 - [ ] **Step 2: Write the compose files**
 
@@ -2931,28 +2938,28 @@ services:
   app:
     build: .
     environment:
-      PHOTOLENS_PROFILE: ${PHOTOLENS_PROFILE:-mac}
-      PHOTOLENS_DATA_DIR: /data
-      PHOTOLENS_LIBRARY_ROOT: /library
+      IVMS777_PROFILE: ${IVMS777_PROFILE:-mac}
+      IVMS777_DATA_DIR: /data
+      IVMS777_LIBRARY_ROOT: /library
     volumes:
-      - photolens-data:/data
+      - ivms777-data:/data
       - ${PHOTO_LIBRARY:?set PHOTO_LIBRARY to your photo folder}:/library:ro
     ports:
       - "8000:8000"
 
   worker:
     build: .
-    command: ["uv", "run", "python", "-m", "photolens.ingest.cli"]
+    command: ["uv", "run", "python", "-m", "ivms777.ingest.cli"]
     environment:
-      PHOTOLENS_PROFILE: ${PHOTOLENS_PROFILE:-mac}
-      PHOTOLENS_DATA_DIR: /data
-      PHOTOLENS_LIBRARY_ROOT: /library
+      IVMS777_PROFILE: ${IVMS777_PROFILE:-mac}
+      IVMS777_DATA_DIR: /data
+      IVMS777_LIBRARY_ROOT: /library
     volumes:
-      - photolens-data:/data
+      - ivms777-data:/data
       - ${PHOTO_LIBRARY:?set PHOTO_LIBRARY to your photo folder}:/library:ro
 
 volumes:
-  photolens-data:
+  ivms777-data:
 ```
 
 Create `compose.mac.yaml`:
@@ -2961,14 +2968,14 @@ Create `compose.mac.yaml`:
 services:
   app:
     environment:
-      PHOTOLENS_PROFILE: mac
-      PHOTOLENS_INFERENCE_BASE_URL: http://host.docker.internal:11434/v1
+      IVMS777_PROFILE: mac
+      IVMS777_INFERENCE_BASE_URL: http://host.docker.internal:11434/v1
     extra_hosts:
       - "host.docker.internal:host-gateway"
   worker:
     environment:
-      PHOTOLENS_PROFILE: mac
-      PHOTOLENS_INFERENCE_BASE_URL: http://host.docker.internal:11434/v1
+      IVMS777_PROFILE: mac
+      IVMS777_INFERENCE_BASE_URL: http://host.docker.internal:11434/v1
     extra_hosts:
       - "host.docker.internal:host-gateway"
 ```
@@ -2989,11 +2996,11 @@ services:
 
   app:
     environment:
-      PHOTOLENS_PROFILE: jetson
+      IVMS777_PROFILE: jetson
     depends_on: [inference]
   worker:
     environment:
-      PHOTOLENS_PROFILE: jetson
+      IVMS777_PROFILE: jetson
     depends_on: [inference]
 
 volumes:
@@ -3021,11 +3028,11 @@ services:
 
   app:
     environment:
-      PHOTOLENS_PROFILE: cloud
+      IVMS777_PROFILE: cloud
     depends_on: [inference]
   worker:
     environment:
-      PHOTOLENS_PROFILE: cloud
+      IVMS777_PROFILE: cloud
     depends_on: [inference]
 
 volumes:
@@ -3034,14 +3041,14 @@ volumes:
 
 - [ ] **Step 3: Write the worker entrypoint**
 
-The `worker` service needs the module its `command` references. Create `photolens/ingest/cli.py`:
+The `worker` service needs the module its `command` references. Create `ivms777/ingest/cli.py`:
 
 ```python
 import time
 
-from photolens.config import get_settings
-from photolens.web.app import run_ingest
-from photolens.web.deps import build_context
+from ivms777.config import get_settings
+from ivms777.web.app import run_ingest
+from ivms777.web.deps import build_context
 
 POLL_SECONDS = 10
 
@@ -3062,7 +3069,7 @@ if __name__ == "__main__":
 Create `README.md`:
 
 ````markdown
-# photolens
+# ivms777
 
 Local photo library organizer. Classifies, searches, and groups a photo folder
 using local models. See `docs/design.md` for the design and `docs/plans/` for
@@ -3149,7 +3156,7 @@ Create `tests/test_bakeoff.py`:
 
 ```python
 from scripts.bakeoff import format_table, run_bakeoff
-from photolens.inference.fakes import FakeInferenceClient
+from ivms777.inference.fakes import FakeInferenceClient
 
 
 def fake_clock(values):
@@ -3212,9 +3219,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from photolens.config import get_settings
-from photolens.inference.client import InferenceClient, OpenAICompatClient, encode_image
-from photolens.storage.local import IMAGE_EXTENSIONS, LocalStorage
+from ivms777.config import get_settings
+from ivms777.inference.client import InferenceClient, OpenAICompatClient, encode_image
+from ivms777.storage.local import IMAGE_EXTENSIONS, LocalStorage
 
 PROMPT = (
     "Describe this photo in one sentence, then list its mood and setting. "
@@ -3327,21 +3334,21 @@ Report: full suite output. The bake-off is now runnable for real against your li
 uv run python -m scripts.bakeoff --models gemma4:26b-a4b gemma4:12b --library /path/to/photos --count 50
 ```
 
-Record the result — it sets `PHOTOLENS_CAPTION_MODEL` for the `mac` profile, and the equivalent run on Jetson (`qwen3-vl:4b` vs `gemma4:e4b`) sets it there.
+Record the result — it sets `IVMS777_CAPTION_MODEL` for the `mac` profile, and the equivalent run on Jetson (`qwen3-vl:4b` vs `gemma4:e4b`) sets it there.
 
 ---
 
 ### Task 12: Duplicates page
 
 **Files:**
-- Modify: `photolens/web/app.py` (add the `/duplicates` route and its query)
-- Modify: `photolens/web/templates/base.html` (add a nav link)
-- Create: `photolens/web/templates/duplicates.html`
+- Modify: `ivms777/web/app.py` (add the `/duplicates` route and its query)
+- Modify: `ivms777/web/templates/base.html` (add a nav link)
+- Create: `ivms777/web/templates/duplicates.html`
 - Create: `tests/test_web_duplicates.py`
 
 **Interfaces:**
 - Consumes: `AppContext`, the `photos.duplicate_of` column.
-- Produces: route `GET /duplicates`, and `photolens.web.app.duplicate_sets(context: AppContext) -> list[dict]` where each dict is `{"photo_id": int, "canonical_path": str, "paths": list[str], "wasted_bytes": int}`.
+- Produces: route `GET /duplicates`, and `ivms777.web.app.duplicate_sets(context: AppContext) -> list[dict]` where each dict is `{"photo_id": int, "canonical_path": str, "paths": list[str], "wasted_bytes": int}`.
 
 `wasted_bytes` is the disk space the redundant copies occupy — `bytes` times the
 number of duplicates — so the page says something actionable rather than just
@@ -3355,10 +3362,10 @@ Create `tests/test_web_duplicates.py`:
 import pytest
 from fastapi.testclient import TestClient
 
-from photolens.ingest.scanner import scan
-from photolens.ingest.worker import drain, thumbnail_handler
-from photolens.storage.local import IMAGE_EXTENSIONS, LocalStorage
-from photolens.web.app import create_app, duplicate_sets
+from ivms777.ingest.scanner import scan
+from ivms777.ingest.worker import drain, thumbnail_handler
+from ivms777.storage.local import IMAGE_EXTENSIONS, LocalStorage
+from ivms777.web.app import create_app, duplicate_sets
 from tests.fixtures import make_jpeg
 
 
@@ -3414,7 +3421,7 @@ Expected: FAIL with `ImportError: cannot import name 'duplicate_sets'`
 
 - [ ] **Step 3: Add the query and route**
 
-In `photolens/web/app.py`, add this module-level function next to `run_ingest`:
+In `ivms777/web/app.py`, add this module-level function next to `run_ingest`:
 
 ```python
 DUPLICATE_SQL = (
@@ -3453,7 +3460,7 @@ Inside `create_app`, before `return app`, add:
 
 - [ ] **Step 4: Add the template and nav link**
 
-Create `photolens/web/templates/duplicates.html`:
+Create `ivms777/web/templates/duplicates.html`:
 
 ```html
 {% extends "base.html" %}
@@ -3480,7 +3487,7 @@ Create `photolens/web/templates/duplicates.html`:
 {% endblock %}
 ```
 
-In `photolens/web/templates/base.html`, replace the nav block with:
+In `ivms777/web/templates/base.html`, replace the nav block with:
 
 ```html
     <nav class="nav">
@@ -3510,22 +3517,22 @@ Report: full suite output and the reported wasted-bytes figure from the test run
 ### Task 13: EXIF facet filtering and sorting
 
 **Files:**
-- Create: `photolens/search/__init__.py`
-- Create: `photolens/search/facets.py`
-- Modify: `photolens/web/app.py` (library routes accept filters and sort)
-- Modify: `photolens/web/templates/library.html` (add the sidebar)
-- Create: `photolens/web/templates/_facet_sidebar.html`
+- Create: `ivms777/search/__init__.py`
+- Create: `ivms777/search/facets.py`
+- Modify: `ivms777/web/app.py` (library routes accept filters and sort)
+- Modify: `ivms777/web/templates/library.html` (add the sidebar)
+- Create: `ivms777/web/templates/_facet_sidebar.html`
 - Create: `tests/test_search_facets.py`
 - Create: `tests/test_web_facet_filters.py`
 
 **Interfaces:**
 - Consumes: `photo_facets`, `AppContext`, `FACET_KEYS`.
 - Produces:
-  - `photolens.search.facets.FacetFilter` (dataclass: `key: str`, `values: list[str] | None = None`, `gte: float | None = None`, `lte: float | None = None`)
-  - `photolens.search.facets.parse_filters(params: dict[str, str]) -> list[FacetFilter]` — reads `f_<key>=a,b` for categorical and `n_<key>=min:max` for numeric
-  - `photolens.search.facets.build_where(filters: list[FacetFilter]) -> tuple[str, list]` returning an SQL fragment of `EXISTS` clauses plus bound parameters
-  - `photolens.search.facets.facet_counts(conn, owner_id: int, key: str, limit: int = 12) -> list[tuple[str, int]]`
-  - `photolens.search.facets.SORTABLE: dict[str, str]` mapping a sort name to its facet key
+  - `ivms777.search.facets.FacetFilter` (dataclass: `key: str`, `values: list[str] | None = None`, `gte: float | None = None`, `lte: float | None = None`)
+  - `ivms777.search.facets.parse_filters(params: dict[str, str]) -> list[FacetFilter]` — reads `f_<key>=a,b` for categorical and `n_<key>=min:max` for numeric
+  - `ivms777.search.facets.build_where(filters: list[FacetFilter]) -> tuple[str, list]` returning an SQL fragment of `EXISTS` clauses plus bound parameters
+  - `ivms777.search.facets.facet_counts(conn, owner_id: int, key: str, limit: int = 12) -> list[tuple[str, int]]`
+  - `ivms777.search.facets.SORTABLE: dict[str, str]` mapping a sort name to its facet key
 
 Categorical filters OR within a key and AND across keys, matching the tag facet
 behaviour in the spec. Numeric filters are inclusive ranges.
@@ -3537,7 +3544,7 @@ Create `tests/test_search_facets.py`:
 ```python
 import pytest
 
-from photolens.search.facets import (
+from ivms777.search.facets import (
     FacetFilter,
     build_where,
     facet_counts,
@@ -3626,10 +3633,10 @@ Create `tests/test_web_facet_filters.py`:
 import pytest
 from fastapi.testclient import TestClient
 
-from photolens.ingest.scanner import scan
-from photolens.ingest.worker import drain, thumbnail_handler
-from photolens.storage.local import IMAGE_EXTENSIONS, LocalStorage
-from photolens.web.app import create_app
+from ivms777.ingest.scanner import scan
+from ivms777.ingest.worker import drain, thumbnail_handler
+from ivms777.storage.local import IMAGE_EXTENSIONS, LocalStorage
+from ivms777.web.app import create_app
 from tests.fixtures import make_jpeg_with_exif
 
 
@@ -3688,19 +3695,19 @@ def test_filters_survive_into_the_infinite_scroll_link(client):
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `uv run pytest tests/test_search_facets.py -v`
-Expected: FAIL with `ModuleNotFoundError: No module named 'photolens.search'`
+Expected: FAIL with `ModuleNotFoundError: No module named 'ivms777.search'`
 
 - [ ] **Step 3: Write the facet query module**
 
-Create empty `photolens/search/__init__.py`.
+Create empty `ivms777/search/__init__.py`.
 
-Create `photolens/search/facets.py`:
+Create `ivms777/search/facets.py`:
 
 ```python
 import sqlite3
 from dataclasses import dataclass
 
-from photolens.ingest.facets import FACET_KEYS
+from ivms777.ingest.facets import FACET_KEYS
 
 SORTABLE: dict[str, str] = {
     "year_desc": "year", "year_asc": "year",
@@ -3789,12 +3796,12 @@ def facet_counts(
 
 - [ ] **Step 4: Wire filters and sorting into the library routes**
 
-In `photolens/web/app.py`, add the imports:
+In `ivms777/web/app.py`, add the imports:
 
 ```python
 from urllib.parse import urlencode
 
-from photolens.search.facets import (
+from ivms777.search.facets import (
     SIDEBAR_GROUPS,
     SORTABLE,
     build_where,
@@ -3897,7 +3904,7 @@ Replace the `library` and `library_page` routes with:
         )
 ```
 
-In `photolens/web/templates/_grid_page.html`, change the infinite-scroll trigger
+In `ivms777/web/templates/_grid_page.html`, change the infinite-scroll trigger
 so filters survive paging:
 
 ```html
@@ -3908,7 +3915,7 @@ so filters survive paging:
 
 - [ ] **Step 5: Add the sidebar template**
 
-Create `photolens/web/templates/_facet_sidebar.html`:
+Create `ivms777/web/templates/_facet_sidebar.html`:
 
 ```html
 <aside class="sidebar">
@@ -3964,7 +3971,7 @@ build `params` as:
 
 Use that in place of `dict(request.query_params)` in both routes.
 
-Replace `photolens/web/templates/library.html` with:
+Replace `ivms777/web/templates/library.html` with:
 
 ```html
 {% extends "base.html" %}
@@ -3978,7 +3985,7 @@ Replace `photolens/web/templates/library.html` with:
 {% endblock %}
 ```
 
-Append to `photolens/web/static/app.css`:
+Append to `ivms777/web/static/app.css`:
 
 ```css
 .library-layout { display: grid; grid-template-columns: 240px 1fr; gap: 16px; align-items: start; }

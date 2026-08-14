@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block content %}
+<form class="search" method="get" action="/library">
+  <input type="search" name="q" value="{{ active.get('q', '') }}"
+         placeholder="Search by meaning — “dogs in snow”, “birthday cake”…">
+  <button type="submit">Search</button>
+  {% if active.get('q') %}<a class="clear-search" href="/library">clear</a>{% endif %}
+</form>
+
+<div class="library-toolbar">
+  {% if active.get('dupes') %}
+    <a class="toggle on" href="/library">Showing duplicates only — show all</a>
+  {% else %}
+    <a class="toggle" href="/library?dupes=1">Show duplicates only</a>
+  {% endif %}
+</div>
+
+<div class="library-layout">
+  {% include "_facet_sidebar.html" %}
+  <div class="grid">
+    {% include "_grid_page.html" %}
+  </div>
+</div>
+{% endblock %}

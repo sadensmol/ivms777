@@ -1,8 +1,17 @@
 __pycache__/
 *.pyc
 .venv/
-data/
-testdata/
 .pytest_cache/
 .ruff_cache/
 .DS_Store
+
+# Data NEVER belongs in git — it lives in Docker volumes only.
+data/
+testdata/
+originals/
+thumbs/
+*.db
+*.db-wal
+*.db-shm
+.ivms777/
+.photolens/
