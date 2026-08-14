@@ -22,9 +22,18 @@
 {% include "_progress.html" %}
 
 <form method="post" action="/reprocess" class="reprocess">
-  <p class="hint">Reprocess the photos already uploaded — no re-upload needed. Re-runs
-    the whole pipeline: thumbnails, embeddings, tags, and captions.</p>
+  <p class="hint">Reprocess the photos already uploaded — no re-upload needed. Rebuilds
+    thumbnails, embeddings, and tags. Existing captions are kept — images are static,
+    so there is no reason to re-caption them.</p>
+  <input type="hidden" name="to_stage" value="taxonomy">
   <button type="submit" name="from_stage" value="thumbnail">Reprocess all photos</button>
+</form>
+
+<form method="post" action="/reprocess" class="reprocess"
+      onsubmit="return confirm('This re-runs the vision model on EVERY photo and can take hours. Re-caption the whole library?');">
+  <p class="hint">Only needed after switching the caption model — it re-runs the slow
+    vision model on every photo and can take hours.</p>
+  <button type="submit" name="from_stage" value="caption" class="danger">Re-caption all photos</button>
 </form>
 
 </div>

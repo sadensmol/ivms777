@@ -4,7 +4,8 @@
   <h1>Organize</h1>
   <form method="get" action="/organize" class="organize-picker">
     <label for="by">Organize photos</label>
-    <select id="by" name="by" onchange="this.form.submit()">
+    <select id="by" name="by"
+            onchange="location.href='/organize?by=' + encodeURIComponent(this.value)">
       {% for name, label in organizers %}
         <option value="{{ name }}" {% if name == active %}selected{% endif %}>{{ label }}</option>
       {% endfor %}
@@ -21,19 +22,36 @@
   </form>
 </div>
 
+{% if active == "memories" %}
+  <div class="memories-bar">
+    {% if memories_building %}
+      <span class="muted" hx-get="/organize/memories/progress"
+            hx-trigger="load, every 1500ms" hx-swap="outerHTML">Building memories…</span>
+    {% else %}
+      <form method="post" action="/organize/memories/rebuild">
+        <button type="submit">Rebuild memories</button>
+      </form>
+      {% if memories_stale %}
+        <span class="muted">library changed since the last build</span>
+      {% endif %}
+    {% endif %}
+  </div>
+{% endif %}
+
 {% if albums %}
   <p class="muted">{{ albums|length }} albums · {{ total_photos }} photos</p>
   <div class="albums">
     {% for album in albums %}
       <section class="album">
         {% set covers = album.photo_ids[:4] %}
+        {% set actx = 'ctx=album:' + active + ':' + (active_grain or '') + ':' + album.key %}
         <div class="album-mosaic {{ 'grid-4' if covers|length >= 4 else 'grid-1' }}">
           {% if covers|length >= 4 %}
             {% for pid in covers %}
-              <a href="/photo/{{ pid }}"><img src="/thumb/{{ pid }}" loading="lazy" alt=""></a>
+              <a href="/photo/{{ pid }}?{{ actx }}"><img src="/thumb/{{ pid }}" loading="lazy" alt=""></a>
             {% endfor %}
           {% else %}
-            <a href="/photo/{{ album.cover_id }}"><img src="/thumb/{{ album.cover_id }}" loading="lazy" alt=""></a>
+            <a href="/photo/{{ album.cover_id }}?{{ actx }}"><img src="/thumb/{{ album.cover_id }}" loading="lazy" alt=""></a>
           {% endif %}
           <span class="album-count">{{ album.size }}</span>
         </div>

@@ -1,0 +1,7 @@
+{% if chips %}
+<div class="chips">
+  {% for chip in chips %}
+    <span class="chip">{{ chip.label }}<a class="chip-x" href="{{ chip.remove }}">×</a></span>
+  {% endfor %}
+</div>
+{% endif %}

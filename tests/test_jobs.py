@@ -20,6 +20,17 @@ def test_reprocess_resets_the_stage_and_everything_downstream(conn):
     assert stage_counts(conn, "taxonomy")["pending"] == 1  # downstream reset too
 
 
+def test_reprocess_range_stops_at_to_stage(conn):
+    add_photo(conn, photo_id=1, content_hash="a", thumb_key="1.jpg")
+    for stage in ("thumbnail", "embed", "taxonomy", "caption"):
+        enqueue(conn, 1, stage)
+        complete(conn, 1, stage)
+    reprocess(conn, owner_id=1, from_stage="thumbnail", to_stage="taxonomy")
+    for stage in ("thumbnail", "embed", "taxonomy"):
+        assert stage_counts(conn, stage)["pending"] == 1
+    assert stage_counts(conn, "caption")["done"] == 1   # caption left alone
+
+
 def test_reprocess_taxonomy_leaves_embed_alone(conn):
     add_photo(conn, photo_id=1, content_hash="a", thumb_key="1.jpg")
     enqueue(conn, 1, "embed")

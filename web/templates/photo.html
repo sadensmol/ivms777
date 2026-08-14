@@ -1,20 +1,32 @@
 {% extends "base.html" %}
 {% block content %}
 <div class="photo-view">
+  {% set q = ('?' + ctx_query) if ctx_query else '' %}
   <div class="photo-stage">
-    {# Back returns to the EXACT library view (filters + scroll) via history when
-       we came from it; /library is only a deep-link fallback. #}
-    <a class="photo-close" href="/library" title="Back"
+    {# Close returns to the collection's top-level grid (memory/album/library),
+       never a prior photo: every in-photo nav uses replace(), so history is just
+       [grid, photo] and back() lands on the grid with scroll intact; origin_url
+       is the deep-link fallback. #}
+    <a class="photo-close" href="{{ origin_url }}" title="Back"
        onclick="if(history.length>1){history.back();return false;}">✕</a>
-    {# Paging replaces the history entry so it never buries the library — "close"
-       still lands back on the list. #}
-    {% if prev_id %}<a class="photo-nav prev" href="/photo/{{ prev_id }}" title="Newer (←)"
+    {# Paging replaces the history entry so it never buries the grid, and stays
+       within this collection by carrying the ctx query forward. #}
+    {% if prev_id %}<a class="photo-nav prev" href="/photo/{{ prev_id }}{{ q }}" title="Previous (←)"
        onclick="location.replace(this.href);return false;">‹</a>{% endif %}
     <img class="photo-full" src="/thumb/{{ photo['id'] }}?size=detail" alt="">
-    {% if next_id %}<a class="photo-nav next" href="/photo/{{ next_id }}" title="Older (→)"
+    {% if next_id %}<a class="photo-nav next" href="/photo/{{ next_id }}{{ q }}" title="Next (→)"
        onclick="location.replace(this.href);return false;">›</a>{% endif %}
   </div>
   <aside class="photo-panel">
+    {% if collection and collection.title %}
+      <div class="photo-collection">
+        <span class="muted">In</span> <strong>{{ collection.title }}</strong>
+        {% if position and total %}<span class="muted"> · {{ position }} / {{ total }}</span>{% endif %}
+        {% if collection.description %}
+          <p class="photo-collection-desc">{{ collection.description }}</p>
+        {% endif %}
+      </div>
+    {% endif %}
     {% if photo['ai_title'] %}<h2 class="photo-title">{{ photo['ai_title'] }}</h2>{% endif %}
     {% if photo['ai_description'] %}<p class="photo-desc">{{ photo['ai_description'] }}</p>{% endif %}
     {% if photo['caption'] %}
@@ -63,7 +75,7 @@
 <h3>Similar photos</h3>
 <div class="similar-strip">
   {% for sid in similar %}
-    <a href="/photo/{{ sid }}"><img src="/thumb/{{ sid }}" loading="lazy" alt=""></a>
+    <a href="/photo/{{ sid }}" onclick="location.replace(this.href);return false;"><img src="/thumb/{{ sid }}" loading="lazy" alt=""></a>
   {% endfor %}
 </div>
 {% endif %}
@@ -71,11 +83,12 @@
   // Desktop keyboard paging: ← newer, → older. Mirrors the ‹/› buttons.
   (function () {
     var prev = {{ prev_id or 'null' }}, next = {{ next_id or 'null' }};
+    var q = "{{ ('?' + ctx_query) if ctx_query else '' }}";
     document.addEventListener("keydown", function (e) {
-      // replace (not push) so "close" always returns to the library, not the
-      // chain of photos paged through.
-      if (e.key === "ArrowLeft" && prev) { location.replace("/photo/" + prev); }
-      else if (e.key === "ArrowRight" && next) { location.replace("/photo/" + next); }
+      // replace (not push) so "close" always returns to the grid, not the chain
+      // of photos paged through; q keeps paging inside the same collection.
+      if (e.key === "ArrowLeft" && prev) { location.replace("/photo/" + prev + q); }
+      else if (e.key === "ArrowRight" && next) { location.replace("/photo/" + next + q); }
       else if (e.key === "Escape" && history.length > 1) { history.back(); }
     });
   })();

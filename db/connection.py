@@ -4,7 +4,7 @@ from pathlib import Path
 import sqlite_vec
 
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 
 
 class SchemaTooOldError(RuntimeError):
@@ -13,10 +13,13 @@ class SchemaTooOldError(RuntimeError):
 
 def connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    # FastAPI runs sync route handlers in a threadpool, so the connection is used
-    # from threads other than the one that created it. Python's sqlite3 serializes
-    # calls internally (default SQLITE_THREADSAFE=1), and every statement here is
-    # autocommitted, so sharing one connection is safe at this scale.
+    # One connection PER THREAD (see AppContext): sharing a single sqlite3
+    # connection across FastAPI's threadpool corrupts it, because the Python
+    # connection/cursor objects are not safe for concurrent use even though the C
+    # library is. `check_same_thread=False` only silences the guard — the worker
+    # loop and each request thread each own their connection. Statements are
+    # autocommitted (isolation_level=None); WAL + the busy timeout serialise
+    # writers across the several connections that open the same file.
     conn = sqlite3.connect(db_path, isolation_level=None, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.enable_load_extension(True)
@@ -35,25 +38,42 @@ def _has_photos_table(conn: sqlite3.Connection) -> bool:
     return row is not None
 
 
+# Columns added to a table after its first shipped version. Ensured on every
+# migrate (not gated on user_version), so a DB that reached the current version
+# WITHOUT a column — e.g. a schema edit that landed during an app --reload,
+# between the version bump and the column's ALTER — still self-heals instead of
+# getting stuck. `CREATE TABLE IF NOT EXISTS` never adds a column to an existing
+# table, so column drift has to be repaired explicitly.
+_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("photos", "ai_title", "TEXT"),
+    ("photos", "ai_description", "TEXT"),
+    ("groups", "description", "TEXT"),
+)
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     version = conn.execute("PRAGMA user_version").fetchone()[0]
-    if version == SCHEMA_VERSION:
-        return
     if version == 0 and _has_photos_table(conn):
         raise SchemaTooOldError(
             "This database was built by the folder-scan ingest and has no upgrade "
             "path — photos are now keyed by content hash. Delete the database file "
             "and re-upload."
         )
-    if version <= 2:
-        # v3 adds the AI title/description columns; ALTER an existing photos table
-        # in place (executescript below only CREATEs missing tables).
-        cols = {row["name"] for row in conn.execute("PRAGMA table_info(photos)")}
-        for column in ("ai_title", "ai_description"):
-            if "photos" in _table_names(conn) and column not in cols:
-                conn.execute(f"ALTER TABLE photos ADD COLUMN {column} TEXT")
+    # Both steps are idempotent, so migrate always converges the schema regardless
+    # of the stamped version: create any missing tables, add any missing columns.
     conn.executescript(SCHEMA_PATH.read_text())
+    _ensure_columns(conn)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+
+def _ensure_columns(conn: sqlite3.Connection) -> None:
+    tables = _table_names(conn)
+    for table, column, coltype in _ADDED_COLUMNS:
+        if table not in tables:
+            continue
+        cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
 
 
 def _table_names(conn: sqlite3.Connection) -> set[str]:

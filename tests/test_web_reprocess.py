@@ -17,19 +17,33 @@ def client(settings):
         yield test_client
 
 
-def test_reprocess_control_is_a_single_full_pipeline_button(client):
+def test_upload_offers_reprocess_and_a_separate_recaption_button(client):
     body = client.get("/upload").text
-    assert "/reprocess" in body
-    assert 'value="thumbnail"' in body          # one button, from the first stage
-    assert body.count('type="submit" name="from_stage"') == 1
+    assert 'value="thumbnail"' in body            # the everyday reprocess
+    assert 'value="caption"' in body              # the separate re-caption button
+    assert "Re-caption all photos" in body
+    assert 'name="to_stage" value="taxonomy"' in body  # everyday reprocess stops before captions
 
 
-def test_reprocess_all_requeues_every_stage_for_every_photo(client):
-    response = client.post("/reprocess", data={"from_stage": "thumbnail"}, follow_redirects=False)
+def test_reprocess_all_rebuilds_up_to_taxonomy_but_not_captions(client):
+    response = client.post(
+        "/reprocess", data={"from_stage": "thumbnail", "to_stage": "taxonomy"},
+        follow_redirects=False,
+    )
     assert response.status_code == 303
     conn = client.app.state.context.conn
-    for stage in ("thumbnail", "embed", "taxonomy", "caption"):
-        assert stage_counts(conn, stage)["pending"] == 2   # whole pipeline, both photos
+    for stage in ("thumbnail", "embed", "taxonomy"):
+        assert stage_counts(conn, stage)["pending"] == 2
+    assert stage_counts(conn, "caption")["pending"] == 0   # captions untouched
+
+
+def test_recaption_requeues_only_the_caption_stage(client):
+    response = client.post("/reprocess", data={"from_stage": "caption"}, follow_redirects=False)
+    assert response.status_code == 303
+    conn = client.app.state.context.conn
+    assert stage_counts(conn, "caption")["pending"] == 2
+    for stage in ("thumbnail", "embed", "taxonomy"):
+        assert stage_counts(conn, stage)["pending"] == 0
 
 
 def test_reprocess_unknown_stage_is_clamped_not_an_error(client):

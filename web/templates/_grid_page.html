@@ -1,5 +1,5 @@
 {% for photo in photos %}
-  <a class="tile" href="/photo/{{ photo['id'] }}">
+  <a class="tile" href="/photo/{{ photo['id'] }}?ctx=library{% if query %}&{{ query }}{% endif %}">
     <img src="/thumb/{{ photo['id'] }}" alt="{{ photo['caption'] or '' }}" loading="lazy">
     {% if photo['dupe_count'] %}
       <span class="tile-badge" title="{{ photo['dupe_count'] }} duplicate file(s) on disk">×{{ photo['dupe_count'] + 1 }}</span>

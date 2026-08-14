@@ -89,7 +89,7 @@ def test_place_organizer_groups_by_real_place_name(conn):
 
 
 def test_registry_exposes_the_live_organizers_and_defaults_to_date(conn):
-    assert set(ORGANIZERS) == {"date", "camera", "place"}
+    assert set(ORGANIZERS) == {"date", "memories", "camera", "place"}
     assert get_organizer(None).name == "date"
     assert get_organizer("place").name == "place"
     assert get_organizer("nonsense").name == "date"

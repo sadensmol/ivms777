@@ -35,7 +35,7 @@ build-backend = "hatchling.build"
 # Flat layout: the source lives at the repo root (no package folder), so ship
 # each top-level package plus the config module explicitly.
 [tool.hatch.build.targets.wheel]
-only-include = ["config.py", "albums", "db", "embedding", "inference", "ingest", "search", "storage", "web"]
+only-include = ["config.py", "albums", "chat", "db", "embedding", "inference", "ingest", "search", "storage", "web"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

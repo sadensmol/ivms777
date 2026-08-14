@@ -87,13 +87,14 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE INDEX IF NOT EXISTS jobs_pending ON jobs(stage, status);
 
 CREATE TABLE IF NOT EXISTS groups (
-  id         INTEGER PRIMARY KEY,
-  owner_id   INTEGER NOT NULL,
-  kind       TEXT NOT NULL,
-  name       TEXT NOT NULL,
-  params     TEXT,
-  status     TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  id          INTEGER PRIMARY KEY,
+  owner_id    INTEGER NOT NULL,
+  kind        TEXT NOT NULL,
+  name        TEXT NOT NULL,
+  description TEXT,                    -- AI-written story for a memory (§6, §11)
+  params      TEXT,
+  status      TEXT NOT NULL,
+  created_at  TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS group_photos (
@@ -104,3 +105,20 @@ CREATE TABLE IF NOT EXISTS group_photos (
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS photo_fts USING fts5(caption, tags_text);
+
+CREATE TABLE IF NOT EXISTS chat_sessions (
+  id         INTEGER PRIMARY KEY,
+  owner_id   INTEGER NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS chat_sessions_owner ON chat_sessions(owner_id, id);
+
+CREATE TABLE IF NOT EXISTS chat_messages (
+  id         INTEGER PRIMARY KEY,
+  session_id INTEGER NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+  question   TEXT NOT NULL,
+  answer     TEXT NOT NULL,
+  sources    TEXT,                     -- JSON array of cited photo ids
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS chat_messages_session ON chat_messages(session_id, id);

@@ -360,6 +360,23 @@ uploads (
   files_sent    INTEGER DEFAULT 0,     -- bytes actually transferred
   files_failed  INTEGER DEFAULT 0
 );
+
+-- Persisted chat transcript (§10). A session groups a conversation; "New
+-- session" starts a fresh one. The current session is the owner's latest.
+chat_sessions (
+  id         INTEGER PRIMARY KEY,
+  owner_id   INTEGER NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+chat_messages (
+  id         INTEGER PRIMARY KEY,
+  session_id INTEGER NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+  question   TEXT NOT NULL,
+  answer     TEXT NOT NULL,
+  sources    TEXT,                     -- JSON array of cited photo ids
+  created_at TEXT NOT NULL
+);
 ```
 
 Plus an FTS5 virtual table `photo_fts(caption, tags_text)`, its rows keyed by
@@ -521,12 +538,20 @@ transfer is visible rather than silently missing.
 
 **Reprocessing.** Originals are kept (§3.2b), so the derived state — thumbnails,
 embeddings, tags, captions — can be rebuilt without re-uploading. `POST
-/reprocess` resets a chosen stage and every stage after it to `pending` for the
-owner's photos; the `worker` re-runs them in `STAGES` order on its next poll. The
-`/upload` UI exposes this as a single **Reprocess all photos** button
-(`from=thumbnail` — the whole pipeline: thumbnails, embeddings, tags, captions).
-The endpoint itself accepts any stage, so a narrower re-run — `from=taxonomy`
-after a `vocab.yaml` change, `from=embed` for a new model — is one POST away.
+/reprocess` resets a **range** of stages (`from_stage` through an optional
+`to_stage`, inclusive) to `pending` for the owner's photos; the `worker` re-runs
+them in `STAGES` order on its next poll. The `/upload` UI exposes **two** buttons:
+
+- **Reprocess all photos** — `from=thumbnail` bounded `to=taxonomy`: rebuilds
+  thumbnails, embeddings, and tags but **not captions**. Captioning is the slow
+  stage (hours), and an already-captioned image never needs re-captioning because
+  the bytes are static — so the everyday reprocess deliberately stops before it.
+- **Re-caption all photos** — `from=caption`, styled as a destructive action and
+  guarded by a confirm ("can take hours"). Only needed after switching the caption
+  model. This is the one path that re-runs the vision model over the whole library.
+
+The endpoint accepts any range, so a narrower re-run — `from=taxonomy` after a
+`vocab.yaml` change, `from=embed` for a new embedding model — is one POST away.
 Every stage handler is idempotent — it
 overwrites its own output — so a reprocess is safe to trigger at any time.
 Self-healing backfills run automatically each drain: they queue `thumbnail` for a
@@ -581,6 +606,12 @@ list of accepted values, numeric keys take `gte`/`lte` bounds. Because these are
 exact, a wrong facet guess is visible and removable as a chip rather than
 silently skewing the ranking.
 
+Concretely, a free-text query is planned once and its predicates are
+materialized into the same filter params the sidebar uses (`f_`/`n_`/`t_`, plus
+`date_from`/`date_to` over `shot_at`); the chips are those params, so removing a
+chip simply drops a predicate and re-runs the ordinary filtered search — the
+planner does not run again until a new query is typed.
+
 A single structured-output call, not an agent loop. A multi-step tool-calling
 agent would cost seconds per step to query one SQLite table, which is a bad
 trade. This applies to *interactive* retrieval only. The Memories organizer
@@ -594,7 +625,10 @@ visible and correctable.
 
 ## 10. Ask-your-library chat
 
-1. Question goes through the same planner to get a `QuerySpec`.
+1. The question drives retrieval directly through semantic + keyword fusion
+   (§9) — the same path interactive search uses. The query planner (§9.1) is a
+   future enhancement; when it lands the question will pass through it first to
+   get a `QuerySpec`. Until then the raw question is retrieved as-is.
 2. Retrieval returns the top 30 photos.
 3. Context assembly builds a compact block per photo: id, date, caption, top
    tags, and its EXIF facts — camera, lens, ISO, aperture, shutter, focal
@@ -605,13 +639,33 @@ visible and correctable.
 5. The UI streams tokens over SSE and renders each citation inline as a
    clickable thumbnail.
 
+**Off-topic guard.** Before retrieving anything, a one-word classifier decides
+whether the question is actually about the photo collection. A question that is
+not — general advice, trivia, "should I walk or drive?" — skips retrieval
+entirely and gets a short "I can only answer questions about your photos" reply,
+so unrelated questions never dump the library as false evidence. Only questions
+that pass the gate reach retrieval.
+
 The answer is grounded only in retrieved captions and tags. When retrieval
 returns nothing above a relevance floor, the model is instructed to say so
 rather than invent an answer. Captions are model-generated and imperfect, so the
 chat view always shows its sources — the thumbnails are the evidence.
 
-Chat and indexing share one inference service. Interactive requests use the
-planner model, which is small and stays loaded, so a question during indexing
+The view reads like a normal chat: each question and its grounded answer are kept
+on the page as a running conversation, a processing indicator shows while the
+model works, and the input stays pinned at the bottom.
+
+**History is persisted.** Each answered turn (question, full answer, cited photo
+ids) is written to `chat_messages` under the owner's current `chat_sessions` row
+(§6). On load, `/chat` renders the current session's turns server-side as static
+history, so switching away and back — or restarting the app — keeps the
+conversation. A **New session** button opens a fresh, empty session; older
+sessions stay in the database. Persistence is the visible transcript only: each
+question is still answered independently against freshly retrieved photos, not
+against prior turns — there is no multi-turn model memory.
+
+Chat and indexing share one inference service. The chat route calls the planner
+model directly, which is small and stays loaded, so a question during indexing
 does not evict the captioner.
 
 ## 11. Organize — albums by principle
@@ -836,9 +890,11 @@ The tool moves other people's photographs, so its defaults are paranoid.
 - `/upload` — pick a folder or drop files, watch client-side hashing, then the
   transfer, then live processing progress per stage with counts, throughput,
   ETA, and a list of failed files. Hashing and upload progress come from the
-  Web Worker; processing progress is HTMX polling. A single **Reprocess all photos**
-  button re-runs the whole pipeline (thumbnails, embeddings, tags, captions) over
-  the already-uploaded library without re-uploading; the worker drains the reset jobs.
+  Web Worker; processing progress is HTMX polling. Two reprocess buttons re-run
+  work over the already-uploaded library without re-uploading: **Reprocess all
+  photos** (thumbnails, embeddings, tags — captions kept, since images are static)
+  and a separate, confirm-guarded **Re-caption all photos** for when the caption
+  model changes; the worker drains the reset jobs.
 - `/export` — choose a layout, preview the folder tree it would produce, and
   download the manifest. Shows whether the collection is fully processed, and
   the exact `ivms777-sync` command line to run next.
@@ -850,12 +906,19 @@ The tool moves other people's photographs, so its defaults are paranoid.
   **apply on change** — no Apply button — swapping only the grid via HTMX so the
   sidebar and its scroll position stay put; a single **Clear all filters** button
   at the top resets them. Top bar has the search box and parsed-filter chips.
-- `/photo/{id}` — a full-screen view of one photo. The image fills the viewport;
-  `‹`/`›` buttons and the ← / → arrow keys page to the newer/older photo in the
-  library's default capture-date order (owner-scoped; the arrows are absent at the
-  ends). Closing returns to the **exact** library view it was opened from —
-  filters, search, and scroll intact — via the browser's history; paging replaces
-  the history entry so close always lands back on the list, never on a prior photo. A panel carries everything known about it: an **AI-written title and
+- `/photo/{id}` — a full-screen view of one photo, always shown **inside the
+  collection it was opened from** (the library with its filters/search/sort, an
+  Organize album, or a memory). `‹`/`›` buttons and the ← / → arrow keys page to
+  the previous/next photo **within that collection**, in its order (owner-scoped;
+  the arrows are absent at the ends) — never leaking into another album or the
+  wider library. The collection travels in a `ctx` URL parameter, which the route
+  resolves to the ordered id list. The panel leads with the **collection's
+  identity** — its title, description, and `N / M` position — shown on every photo
+  of it, and only then the photo's own data. Closing returns to the collection's
+  top-level grid (the album/memory/filtered library) with state and scroll intact
+  via the browser's history; every in-photo nav (paging, similar) uses replace, so
+  close always lands on the grid, never on a prior photo. The per-photo panel
+  carries everything known about it: an **AI-written title and
   description**, the caption, tags grouped by dimension with scores and source
   badges (the "AI data"), the full EXIF panel — including GPS **coordinates**,
   which live here as a technical detail and nowhere else — every local path the
@@ -868,11 +931,23 @@ The tool moves other people's photographs, so its defaults are paranoid.
   place) over a list of album cards, each with a cover, title, description, and a
   strip of its photos. `date` shows a grain sub-selector (day / month / year,
   default month). Live principles recompute on selection; `memories` reads stored rows and
-  offers a "Rebuild memories" control that queues the background build.
-- `/chat` — question box, streamed answer, inline thumbnail citations.
+  offers a "Rebuild memories" control that queues the background build, showing a
+  live `done/total (%)` indicator (HTMX polling) while it runs and reloading to the
+  finished albums when it completes.
+- `/chat` — a normal chat view: a running **conversation history** of questions
+  and their grounded answers, a text **input** at the bottom, a **processing
+  indicator** while the model works, streamed answer tokens, and inline thumbnail
+  citations. History is **persisted** (`chat_sessions`/`chat_messages`, §6) and
+  re-rendered server-side on load, so it survives navigation and restarts; a **New
+  session** button starts a fresh conversation. Each question is grounded
+  independently — retrieval runs per question, and the persisted history is the
+  transcript, not multi-turn model memory.
 
-The nav order is **Upload → Library → Organize**: bring photos in, browse and
-search them, then group them.
+The nav order is **Upload → Library → Chat → Organize**: bring photos in, browse
+and search them, ask about them to understand the collection, then — last, once
+you know what you have — group and reorganize them. Organize is the final stage
+of the process (it feeds stage 2, the on-disk reorg); chat is a
+review-and-understand tool, so it sits before it.
 
 ## 14. Code layout
 
@@ -928,7 +1003,10 @@ albums/                # Organize tab — grouping into described albums
   memories.py          # organizer: reads stored memory groups        (plan 07)
   memories_build.py    # agentic RAG builder + owner-level worker job  (plan 07)
   registry.py
-chat/                  #                                     (plan 08)
+chat/                  #                                     (plan 06)
+  retrieve.py          # off-topic gate + question -> top photo ids via fusion
+  context.py           # photo ids -> compact grounding block
+  history.py           # persisted chat sessions/messages + answer HTML render
 web/
   app.py
   deps.py              # AppContext
@@ -998,7 +1076,7 @@ executes the paths it is given.
 | 2 | SigLIP embeddings, taxonomy scoring, semantic + facet + keyword + fusion search, similar photos, `/photo` detail |
 | 3 | Captioning stage against the inference service, captions in the UI; the caption stage also emits a per-photo **AI title + description**, and `/photo` renders the full AI panel (title, description, caption, tags) |
 | 4 | Query planner, parsed-filter chips, caption vocabulary mining with tag suggestions |
-| 5 | Memories organizer — agentic RAG builder, persisted `groups(kind='memory')`, `/organize?by=memories` with rebuild |
+| 5 | Memories organizer — agentic RAG builder, persisted `groups(kind='memory')`, `/organize?by=memories` with rebuild (plan 07, done) |
 | 6 | Ask-your-library chat with streaming and citations |
 | 7 | Stage 2 — layouts, `/api/manifest`, `/export` preview, and the `ivms777-sync` CLI with plan, apply, undo, and verify |
 
@@ -1037,6 +1115,12 @@ reorganizing the disk matters more than chat does.
 - Offline reverse geocoding place names — the "By place" organizer names albums
   by city and a `place_city`/`place_country` sidebar facet filters the library by
   place (plan 08, done). Future: sub-city neighbourhoods and user-editable labels.
+- Agentic RAG + reranking for chat retrieval (plan 10). Chat is one-shot fusion
+  today and dumps loosely-related photos with a sometimes-confabulated answer; the
+  future phase reranks candidates against the question, applies a relevance floor
+  (honest "nothing found" instead of 30 neighbours), reuses the query planner, and
+  adds a bounded verify-before-answer agent loop — the documented interactive
+  exception to §9.1's "one call" rule.
 - Postgres and pgvector if concurrent writes become a real constraint.
 - Video support.
 - A watch mode for `ivms777-sync` that uploads new files as they appear.

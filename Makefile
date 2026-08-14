@@ -1,29 +1,30 @@
 # ivms777 — local dev on macOS.
 #
-# `make up` does everything: it makes sure host Ollama is running with the
-# caption/planner models, then builds and starts the containerised stack (app +
-# worker + data volume). SigLIP runs on CPU inside the container; Ollama runs on
+# `make up` runs everything NATIVELY — no containers. It makes sure host Ollama
+# is running with the caption/planner models, then launches the app and the
+# worker as plain host processes against $HOME/.ivms777. SigLIP runs on the host
+# (CPU by default; set IVMS777_EMBED_DEVICE=mps for Metal); Ollama is already on
 # the host because Docker Desktop on macOS has no GPU passthrough.
 #
-# First `make up` pulls the vision model (~6 GB) once — later runs are fast.
+# There is no `make down`: native `up` runs in the foreground and Ctrl-C stops
+# both processes. The compose.*.yaml files still describe the deployed stack for
+# jetson/cloud — just run `docker compose` directly there.
+#
+# First run pulls the vision model (~6 GB) once — later runs are fast.
 
-COMPOSE       := docker compose -f compose.yaml -f compose.mac.yaml
-COMPOSE_DEV   := $(COMPOSE) -f compose.dev.yaml
 OLLAMA_MODELS := qwen2.5vl:7b qwen2.5:3b
 
 .DEFAULT_GOAL := help
-.PHONY: up down restart logs worker-logs ps dev test lint ollama clean help
+.PHONY: up test lint ollama clean help
 
-up: ollama ## Ensure Ollama + models, then build & start the stack → http://localhost:8000
-	$(COMPOSE) up --build -d
-	@echo ""
-	@echo "  ivms777 is up → http://localhost:8000"
-	@echo "  the worker is indexing + captioning in the background; watch: make worker-logs"
-
-down: ## Stop the stack (the host Ollama service is left running)
-	$(COMPOSE) down
-
-restart: down up ## Rebuild and restart everything (Ollama + stack)
+up: ollama ## Ensure Ollama + models, then run app + worker NATIVELY → http://localhost:8000
+	@mkdir -p "$$HOME/.ivms777"
+	@echo "  data $$HOME/.ivms777 · inference localhost:11434 · app http://localhost:8000 (Ctrl-C stops both)"
+	@IVMS777_PROFILE="$${IVMS777_PROFILE:-mac}" \
+	 IVMS777_DATA_DIR="$${IVMS777_DATA_DIR:-$$HOME/.ivms777}" \
+	 IVMS777_INFERENCE_BASE_URL="$${IVMS777_INFERENCE_BASE_URL:-http://localhost:11434/v1}" \
+	 bash -c 'uv run python -m ingest.cli & W=$$!; trap "kill $$W 2>/dev/null" EXIT INT TERM; \
+	   uv run uvicorn web.app:app_factory --factory --host 0.0.0.0 --port 8000 --reload'
 
 ollama: ## Ensure host Ollama is running and the caption/planner models are pulled
 	@command -v ollama >/dev/null || { echo "  Ollama not installed — run: brew install ollama"; exit 1; }
@@ -38,27 +39,14 @@ ollama: ## Ensure host Ollama is running and the caption/planner models are pull
 	done
 	@echo "  Ollama ready: $(OLLAMA_MODELS)"
 
-logs: ## Follow app + worker logs
-	$(COMPOSE) logs -f app worker
-
-worker-logs: ## Follow the worker only (indexing / tagging / captioning progress)
-	$(COMPOSE) logs -f worker
-
-ps: ## Show container status
-	$(COMPOSE) ps
-
-dev: ollama ## Start with hot reload (bind-mounts source, restarts on edit)
-	$(COMPOSE_DEV) up --build -d
-	@echo "  dev (hot reload) → http://localhost:8000"
-
 test: ## Run the test suite natively
 	uv run pytest -q
 
 lint: ## Run ruff
 	uv run ruff check .
 
-clean: ## DANGER: stop and DELETE the data volume (removes uploaded photos + index)
-	$(COMPOSE) down -v
+clean: ## DANGER: DELETE $HOME/.ivms777 (removes uploaded photos + index)
+	rm -rf "$$HOME/.ivms777"
 
 help: ## List targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \

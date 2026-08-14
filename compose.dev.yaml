@@ -23,6 +23,7 @@ services:
     volumes:
       - ./config.py:/app/config.py
       - ./albums:/app/albums
+      - ./chat:/app/chat
       - ./db:/app/db
       - ./embedding:/app/embedding
       - ./inference:/app/inference
@@ -40,6 +41,7 @@ services:
     volumes:
       - ./config.py:/app/config.py
       - ./albums:/app/albums
+      - ./chat:/app/chat
       - ./db:/app/db
       - ./embedding:/app/embedding
       - ./inference:/app/inference

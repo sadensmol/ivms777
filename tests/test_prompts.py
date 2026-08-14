@@ -1,4 +1,4 @@
-from inference.prompts import CAPTION_SCHEMA, caption_messages
+from inference.prompts import CAPTION_SCHEMA, caption_messages, chat_messages
 
 
 def test_caption_schema_requires_the_four_fields():
@@ -21,3 +21,18 @@ def test_caption_messages_carry_the_image_and_ask_for_json():
 def test_unknown_model_falls_back_to_a_default_template():
     messages = caption_messages("some-unknown-model", "data:image/jpeg;base64,AAA", ["subject"])
     assert messages and messages[0]["role"] == "system"
+
+
+def test_chat_messages_ground_and_require_citation():
+    msgs = chat_messages("what lens did I use?", "[photo:7]\ncaption: a cat")
+    system = msgs[0]["content"]
+    assert "[photo:" in system  # instructs the citation format
+    assert "only" in system.lower()  # grounded only in the provided photos
+    user = msgs[1]["content"]
+    assert "[photo:7]" in user
+    assert "what lens did I use?" in user
+
+
+def test_chat_messages_handle_no_matches():
+    msgs = chat_messages("anything", "No photos matched.")
+    assert "No photos matched." in msgs[1]["content"]

@@ -1,4 +1,6 @@
 import base64
+import json
+from collections.abc import Iterator
 from typing import Protocol, TypedDict
 
 import httpx
@@ -22,6 +24,14 @@ class InferenceClient(Protocol):
         json_schema: dict | None = None,
         timeout: float = 120.0,
     ) -> str: ...
+
+    def stream(
+        self,
+        model: str,
+        messages: list[ChatMessage],
+        *,
+        timeout: float = 120.0,
+    ) -> Iterator[str]: ...
 
 
 class OpenAICompatClient:
@@ -60,3 +70,25 @@ class OpenAICompatClient:
         response = self._client.post("/chat/completions", json=payload, timeout=timeout)
         response.raise_for_status()
         return response.json()["choices"][0]["message"]["content"]
+
+    def stream(
+        self,
+        model: str,
+        messages: list[ChatMessage],
+        *,
+        timeout: float = 120.0,
+    ) -> Iterator[str]:
+        payload = {"model": model, "messages": messages, "stream": True}
+        with self._client.stream(
+            "POST", "/chat/completions", json=payload, timeout=timeout
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data = line[len("data:"):].strip()
+                if data == "[DONE]":
+                    break
+                delta = json.loads(data)["choices"][0].get("delta", {}).get("content")
+                if delta:
+                    yield delta

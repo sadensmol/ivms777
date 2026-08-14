@@ -58,3 +58,42 @@ def caption_messages(
             ],
         },
     ]
+
+
+_CHAT_SYSTEM = (
+    "You answer questions about a personal photo library. Use ONLY the photos "
+    "provided below — their captions, tags, and EXIF facts. Never invent photos, "
+    "people, places, or dates. Cite every photo you rely on inline as [photo:ID], "
+    "using the exact ID from the context. If no photos are provided, or none are "
+    "relevant, say you have no photos matching that and stop."
+)
+
+
+_INTENT_SYSTEM = (
+    "The user is using an app that searches and answers questions about their own "
+    "photo library. Almost every message is about their photos — finding or "
+    "showing them (\"find a photo with a dog\", \"photos of cars\", \"show beach "
+    "shots\") or asking what / when / where / who / how about them. Answer 'yes' "
+    "for any such request. Answer 'no' ONLY when the message is clearly unrelated "
+    "to the photo library — general life advice, math, coding, trivia, or "
+    "chit-chat. When unsure, answer 'yes'. Reply with a single word: yes or no."
+)
+
+
+def intent_messages(question: str) -> list[ChatMessage]:
+    """A yes/no gate: is this question about the photo library at all? (§10)"""
+    return [
+        {"role": "system", "content": _INTENT_SYSTEM},
+        {"role": "user", "content": question},
+    ]
+
+
+def chat_messages(question: str, context_block: str) -> list[ChatMessage]:
+    """Grounded ask-your-library prompt (§10): answer only from `context_block`,
+    cite photos as [photo:ID], say so when nothing relevant was retrieved.
+    """
+    user = f"Photos:\n{context_block}\n\nQuestion: {question}"
+    return [
+        {"role": "system", "content": _CHAT_SYSTEM},
+        {"role": "user", "content": user},
+    ]

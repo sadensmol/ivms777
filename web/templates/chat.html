@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Chat — ivms777{% endblock %}
+{% block content %}
+<div class="chat">
+  <div class="chat-head">
+    <h1>Ask your library</h1>
+    <form method="post" action="/chat/new">
+      <button type="submit" class="new-session">New session</button>
+    </form>
+  </div>
+  <div id="chat-log" class="chat-log">
+    {% for m in messages %}
+      <div class="msg user"><div class="bubble">{{ m.question }}</div></div>
+      <div class="msg assistant">
+        {% if m.sources %}
+          <div class="sources">
+            {% for id in m.sources %}
+              <a href="/photo/{{ id }}"><img class="cite" src="/thumb/{{ id }}" alt="photo {{ id }}"></a>
+            {% endfor %}
+          </div>
+        {% endif %}
+        <div class="bubble">{{ m.answer_html|safe }}</div>
+      </div>
+    {% endfor %}
+  </div>
+  <form id="chat-form" class="chat-input" onsubmit="return askLibrary(event)">
+    <input id="chat-q" name="q" type="text" autocomplete="off"
+           placeholder="Ask about your photos — “what lens did I use most in Italy?”">
+    <button id="chat-send" type="submit">Ask</button>
+  </form>
+</div>
+<script src="/static/chat.js"></script>
+{% endblock %}

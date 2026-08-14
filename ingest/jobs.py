@@ -66,17 +66,23 @@ def fail(conn: sqlite3.Connection, photo_id: int, stage: str, error: str) -> Non
     )
 
 
-def reprocess(conn: sqlite3.Connection, owner_id: int, from_stage: str) -> int:
-    """Reset `from_stage` and every later stage to 'pending' for the owner's photos.
+def reprocess(
+    conn: sqlite3.Connection, owner_id: int, from_stage: str, to_stage: str | None = None
+) -> int:
+    """Reset a range of stages to 'pending' for the owner's photos.
 
-    Downstream stages are reset too because their output depends on the one being
-    rerun (re-embedding changes the vectors the taxonomy reads). Handlers are
-    idempotent, so the worker simply re-runs them on its next drain. Returns the
-    number of photos queued.
+    Resets `from_stage` through `to_stage` inclusive (default: through the last
+    stage). Downstream stages in the range are reset too because their output
+    depends on the one being rerun (re-embedding changes the vectors the taxonomy
+    reads). Bounding with `to_stage` lets the UI re-run the cheap stages
+    (thumbnails → tags) without re-running the slow, unnecessary captioning of
+    already-captioned photos (images are static). Handlers are idempotent, so the
+    worker re-runs them on its next drain. Returns the number of photos queued.
     """
     if from_stage not in STAGES:
         raise ValueError(f"unknown stage: {from_stage}")
-    stages = STAGES[STAGES.index(from_stage):]
+    end = STAGES.index(to_stage) + 1 if to_stage in STAGES else len(STAGES)
+    stages = STAGES[STAGES.index(from_stage):end]
     photo_ids = [
         row["id"] for row in conn.execute(
             "SELECT id FROM photos WHERE owner_id = ?", (owner_id,)

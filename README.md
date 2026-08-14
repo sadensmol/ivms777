@@ -39,14 +39,22 @@ Search blends three signals: SigLIP semantic similarity, FTS5 keyword match over
 captions and tag text, and reciprocal-rank fusion of the two — so "dogs in snow"
 finds the look while a proper noun finds the word. `/photo` shows every tag with
 its score and source; `‹`/`›` and the arrow keys page through the library.
-`/organize` groups the library by date (day/month/year), camera, or place.
+`/organize` groups the library by date (day/month/year), **Memories**, camera, or
+place.
 
 **Captions** add a sentence, an AI-written title/description, and model-chosen tags
 per photo — filling the `/photo` AI panel and feeding search. The vision model they
 need is pulled and started by `make up` automatically; the `caption` stage runs
 after tagging. Override the model with `IVMS777_CAPTION_MODEL`.
 
-The query planner, chat, and Memories are later phases — see `docs/plans/`.
+**Search** is planner-backed: a free-text query is turned into date/facet/tag
+filters (shown as removable chips) before ranking. **Chat** (`/chat`) answers
+questions grounded in your photos, with persisted history and a New-session
+button. **Memories** (`/organize?by=memories`) is built on demand — hit *Rebuild
+memories* and a background agent groups the library into named, described albums
+("Family night in Ontario"); it needs captions (the caption stage) and the planner
+model present first, and re-opening the tab is instant. Agentic RAG + reranking for
+chat retrieval is the next planned phase — see `docs/plans/10-chat-agentic-rerank.md`.
 
 ## Run on a Jetson Orin Nano
 
