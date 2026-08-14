@@ -20,12 +20,34 @@
   <aside class="photo-panel">
     {% if collection and collection.title %}
       <div class="photo-collection">
-        <span class="muted">In</span> <strong>{{ collection.title }}</strong>
-        {% if position and total %}<span class="muted"> · {{ position }} / {{ total }}</span>{% endif %}
+        <div class="photo-collection-head">
+          {% if collection.origin_id %}
+            {# The photo this "similar" layer branched from — clickable to jump
+               back to it. REPLACE so history stays [grid, photo] (§13). #}
+            <a class="collection-origin" href="/photo/{{ collection.origin_id }}"
+               title="Back to this photo" onclick="location.replace(this.href);return false;">
+              <img src="/thumb/{{ collection.origin_id }}" alt="">
+            </a>
+          {% endif %}
+          <div>
+            <span class="muted">In</span> <strong>{{ collection.title }}</strong>
+            {% if position and total %}<span class="muted"> · {{ position }} / {{ total }}</span>{% endif %}
+          </div>
+        </div>
         {% if collection.description %}
           <p class="photo-collection-desc">{{ collection.description }}</p>
         {% endif %}
       </div>
+    {% endif %}
+    {% if similarity %}
+      <h3>Why similar — base vs this</h3>
+      <table class="similarity">
+        <tr><th>Attribute</th><th>Base</th><th>This</th><th>Match</th></tr>
+        {% for r in similarity %}
+          <tr><td>{{ r.param }}</td><td>{{ r.origin }}</td><td>{{ r.current }}</td>
+              <td class="why-pct">{{ r.match }}%</td></tr>
+        {% endfor %}
+      </table>
     {% endif %}
     {% if photo['ai_title'] %}<h2 class="photo-title">{{ photo['ai_title'] }}</h2>{% endif %}
     {% if photo['ai_description'] %}<p class="photo-desc">{{ photo['ai_description'] }}</p>{% endif %}
@@ -56,6 +78,16 @@
       {% endfor %}
     {% endif %}
 
+    <h3>Reprocess this photo</h3>
+    <form method="post" action="/photo/{{ photo['id'] }}/reprocess" class="reprocess-one">
+      <input type="hidden" name="back" value="{{ ctx_query }}">
+      <button type="submit" name="stage" value="taxonomy" class="reprocess-btn">Re-tag</button>
+      <button type="submit" name="stage" value="caption" class="reprocess-btn danger"
+              onclick="return confirm('Re-caption this photo with the vision model?');">Re-caption</button>
+    </form>
+    <p class="hint">Re-runs the AI tags / caption for this one photo. Thumbnails and
+      embeddings are static (the bytes never change), so they are not re-run.</p>
+
     <h3>Files on disk{% if sources|length > 1 %} — {{ sources|length }} copies{% endif %}</h3>
     {% if wasted_bytes %}
       <p class="wasted">{{ '%.1f'|format(wasted_bytes / 1048576) }} MB of redundant copies</p>
@@ -71,13 +103,26 @@
     </table>
   </aside>
 </div>
-{% if similar %}
 <h3>Similar photos</h3>
+{% if similar %}
 <div class="similar-strip">
-  {% for sid in similar %}
-    <a href="/photo/{{ sid }}" onclick="location.replace(this.href);return false;"><img src="/thumb/{{ sid }}" loading="lazy" alt=""></a>
+  {% for s in similar %}
+    {# Open a similar photo IN its similar-to-<this> layer. REPLACE (not push) so
+       history stays [grid, photo] and close always goes up to the grid, never
+       replaying the chain of photos visited (§13, CLAUDE.md navigation rules). #}
+    <a class="similar-item" href="/photo/{{ s.id }}?ctx=similar:{{ photo['id'] }}"
+       onclick="location.replace(this.href);return false;">
+      <img src="/thumb/{{ s.id }}?size=detail" loading="lazy" alt="">
+      <div class="similar-why">
+        {% for r in s.reasons %}
+          <div class="why-line"><span class="why-label">{{ r.text }}</span><span class="why-pct">{{ r.pct }}%</span></div>
+        {% endfor %}
+      </div>
+    </a>
   {% endfor %}
 </div>
+{% else %}
+<p class="hint">No similar photos — nothing in the library shares this one's tags, caption words, or looks close enough.</p>
 {% endif %}
 <script>
   // Desktop keyboard paging: ← newer, → older. Mirrors the ‹/› buttons.

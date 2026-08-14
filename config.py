@@ -40,6 +40,9 @@ class Settings(BaseSettings):
 
     caption_model: str | None = None
     planner_model: str | None = None
+    # Text-embedding model for caption semantics (§9); defaults to the planner
+    # model, which is already loaded — no extra model to pull.
+    text_embed_model: str | None = None
     embed_device: Literal["cpu", "cuda", "mps"] | None = None
     inference_base_url: str | None = None
 
@@ -49,6 +52,15 @@ class Settings(BaseSettings):
     page_size: int = Field(default=100, ge=1, le=500)
     # Minimum tag score for a model tag to count in the sidebar and filters.
     tag_score_min: float = Field(default=0.2, ge=0.0, le=1.0)
+    # "Similar photos": min image-vector cosine to count as a visual look-alike
+    # (§9). SigLIP image cosines have a HIGH baseline — any two real photos sit
+    # ~0.5–0.65 just for being photos, and genuinely-alike ones are 0.85–0.98 — so
+    # the floor is 0.8, well above the noise. Tag/caption matches always qualify;
+    # this only admits true look-alikes.
+    similar_min_cosine: float = Field(default=0.8, ge=0.0, le=1.0)
+    # "Similar photos": min caption-embedding cosine to count two captions as
+    # semantically matching (§9). Tune per embedding model.
+    similar_caption_min: float = Field(default=0.6, ge=0.0, le=1.0)
 
     embed_model_name: str = "siglip2-so400m-patch14-384"
     use_fake_embedder: bool = False
@@ -84,9 +96,18 @@ class Settings(BaseSettings):
             from embedding.fakes import FakeEmbedder
 
             return FakeEmbedder(), "fake"
-        from embedding.siglip import SiglipEmbedder
+        from embedding.siglip import get_siglip_embedder
 
-        return SiglipEmbedder(self.embed_model_name, self.embed_device), self.embed_model_name
+        # Cached: the model loads once and is reused, so a search or a /photo click
+        # never reloads ~400M of weights (config.build_embedder was doing exactly
+        # that on every request).
+        return get_siglip_embedder(self.embed_model_name, self.embed_device), self.embed_model_name
+
+    @property
+    def caption_embed_model(self) -> str:
+        """Model used to embed caption text (§9) — the planner model by default,
+        already resident, so no extra pull."""
+        return self.text_embed_model or self.planner_model or "fake"
 
     def build_inference_client(self):
         """Return (client, caption_model).

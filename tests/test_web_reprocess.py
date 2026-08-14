@@ -17,12 +17,15 @@ def client(settings):
         yield test_client
 
 
-def test_upload_offers_reprocess_and_a_separate_recaption_button(client):
+def test_upload_offers_a_reprocess_button_per_stage(client):
     body = client.get("/upload").text
-    assert 'value="thumbnail"' in body            # the everyday reprocess
-    assert 'value="caption"' in body              # the separate re-caption button
-    assert "Re-caption all photos" in body
-    assert 'name="to_stage" value="taxonomy"' in body  # everyday reprocess stops before captions
+    # Every stage gets its own single-stage reprocess (from == to), so re-tagging
+    # never rebuilds thumbnails and re-embedding never re-captions.
+    for stage in ("thumbnail", "embed", "taxonomy", "caption"):
+        assert f'name="from_stage" value="{stage}"' in body
+        assert f'name="to_stage" value="{stage}"' in body
+    # The caption button confirms first — it alone re-runs the slow vision model.
+    assert "can take hours" in body
 
 
 def test_reprocess_all_rebuilds_up_to_taxonomy_but_not_captions(client):
@@ -49,3 +52,42 @@ def test_recaption_requeues_only_the_caption_stage(client):
 def test_reprocess_unknown_stage_is_clamped_not_an_error(client):
     response = client.post("/reprocess", data={"from_stage": "bogus"}, follow_redirects=False)
     assert response.status_code == 303
+
+
+def test_photo_reprocess_requeues_only_that_photos_stage(client):
+    from ingest.jobs import complete, enqueue
+
+    conn = client.app.state.context.conn
+    for pid in (1, 2):
+        enqueue(conn, pid, "taxonomy")
+        complete(conn, pid, "taxonomy")  # both done
+    response = client.post(
+        "/photo/1/reprocess", data={"stage": "taxonomy", "back": "ctx=library"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/photo/1?ctx=library"  # returns to the photo in place
+    status = lambda pid: conn.execute(  # noqa: E731
+        "SELECT status FROM jobs WHERE photo_id = ? AND stage = 'taxonomy'", (pid,)
+    ).fetchone()["status"]
+    assert status(1) == "pending"   # only this photo requeued
+    assert status(2) == "done"
+
+
+def test_photo_reprocess_ignores_static_stages(client):
+    # thumbnails/embeddings are static — the endpoint must not requeue them.
+    response = client.post(
+        "/photo/1/reprocess", data={"stage": "thumbnail"}, follow_redirects=False
+    )
+    assert response.status_code == 303
+    conn = client.app.state.context.conn
+    assert conn.execute(
+        "SELECT 1 FROM jobs WHERE photo_id = 1 AND stage = 'thumbnail'"
+    ).fetchone() is None
+
+
+def test_photo_reprocess_unknown_photo_is_404(client):
+    response = client.post(
+        "/photo/999/reprocess", data={"stage": "taxonomy"}, follow_redirects=False
+    )
+    assert response.status_code == 404

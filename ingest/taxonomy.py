@@ -1,10 +1,11 @@
 import sqlite3
+from math import exp
 
 from PIL import Image
 
 from embedding.base import Embedder
 from embedding.store import read_vector
-from embedding.vectors import l2_normalize, siglip_probability
+from embedding.vectors import l2_normalize
 from ingest.jobs import enqueue
 from ingest.pixels import pixel_tags
 from ingest.vocab import Vocab, tag_id_map
@@ -42,6 +43,34 @@ def label_prompt(dimension: str, label: str) -> str:
     return _TEMPLATES.get(dimension, _DEFAULT_TEMPLATE).format(label=label)
 
 
+def select_dimension_tags(
+    scored: list[tuple[str, float]],
+    *,
+    max_per_dim: int,
+    select_ratio: float,
+) -> list[tuple[str, float]]:
+    """Pick a dimension's tags by softmax over its own labels' logits (§7).
+
+    SigLIP zero-shot is a per-dimension classifier: raw sigmoid probabilities are
+    tiny and near-uniform, so an absolute floor keeps nothing. Softmax over the
+    dimension's logits (``cosine·scale + bias``) turns them into a real
+    distribution; the argmax always wins, and a runner-up is kept only when its
+    probability is within ``select_ratio`` of the top's — capped at
+    ``max_per_dim``. ``scored`` is ``[(label, logit)]``; returns
+    ``[(label, softmax_probability)]``, highest first.
+    """
+    if not scored:
+        return []
+    top_logit = max(logit for _, logit in scored)
+    exps = [(label, exp(logit - top_logit)) for label, logit in scored]
+    total = sum(weight for _, weight in exps)
+    ranked = sorted(
+        ((label, weight / total) for label, weight in exps), key=lambda x: -x[1]
+    )
+    floor = select_ratio * ranked[0][1]
+    return [(label, prob) for label, prob in ranked if prob >= floor][:max_per_dim]
+
+
 def reindex_fts(conn: sqlite3.Connection, photo_id: int) -> None:
     """Rebuild the photo's photo_fts row from its caption and tag labels."""
     caption = conn.execute(
@@ -62,10 +91,12 @@ def reindex_fts(conn: sqlite3.Connection, photo_id: int) -> None:
 
 
 def taxonomy_handler(derived: Storage, embedder: Embedder, vocab: Vocab) -> StageHandler:
-    # Embed each label prompt once for the whole drain, not once per photo.
-    prompts = [(d, lbl) for d, labels in vocab.dimensions.items() for lbl in labels]
-    vectors = embedder.embed_texts([label_prompt(d, lbl) for d, lbl in prompts])
-    entries = [(d, lbl, l2_normalize(vec)) for (d, lbl), vec in zip(prompts, vectors)]
+    # Embed each label prompt once for the whole drain, not once per photo, and
+    # group the normalized vectors by dimension so each is scored on its own.
+    by_dim: dict[str, list[tuple[str, list[float]]]] = {}
+    for dimension, labels in vocab.dimensions.items():
+        vectors = embedder.embed_texts([label_prompt(dimension, lbl) for lbl in labels])
+        by_dim[dimension] = [(lbl, l2_normalize(v)) for lbl, v in zip(labels, vectors)]
 
     def handle(conn: sqlite3.Connection, photo_id: int) -> None:
         ids = tag_id_map(conn)
@@ -73,10 +104,19 @@ def taxonomy_handler(derived: Storage, embedder: Embedder, vocab: Vocab) -> Stag
         image_vec = read_vector(conn, photo_id)
         if image_vec is not None:
             image_vec = l2_normalize(image_vec)
-            for dimension, label, label_vec in entries:
-                cosine = sum(a * b for a, b in zip(image_vec, label_vec))
-                prob = siglip_probability(cosine, embedder.logit_scale, embedder.logit_bias)
-                if prob >= vocab.threshold(dimension):
+            for dimension, entries in by_dim.items():
+                logits = [
+                    (
+                        label,
+                        sum(a * b for a, b in zip(image_vec, label_vec))
+                        * embedder.logit_scale
+                        + embedder.logit_bias,
+                    )
+                    for label, label_vec in entries
+                ]
+                for label, prob in select_dimension_tags(
+                    logits, max_per_dim=vocab.max_per_dim, select_ratio=vocab.select_ratio
+                ):
                     scored.append((dimension, label, prob, "siglip"))
         thumb = conn.execute(
             "SELECT thumb_key FROM photos WHERE id = ?", (photo_id,)

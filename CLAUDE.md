@@ -57,32 +57,57 @@ Organize ─▶ album | memory | group ─▶ photo
 Chat ─▶ (a cited photo) ─▶ back to the conversation
 ```
 
-Whenever you build a drill-down, these all apply:
+The full, authoritative rules live in **`docs/design.md` §13.1** — read them
+before touching any navigation. The non-negotiable core:
 
-1. **Carry the context down.** The thing you open knows which parent it came from.
-   That context travels explicitly (a `ctx`/query parameter in the URL), never
-   guessed — the same content can be reached from several parents, so the parent
-   has to be recorded, not inferred.
+1. **A leaf is exactly ONE level below a grid.** A grid is a browsable list
+   (library with filters/search/sort, an Organize album, a memory); a leaf is a
+   detail view. There is **no leaf-inside-a-leaf nesting** — a "similar" photo is
+   still a leaf one level under a grid (its grid is the library), not nested under
+   the photo it is similar to.
 
-2. **Show every layer, top to bottom.** The detail view leads with the identity of
-   *each* enclosing layer — album/memory title + description + `N / M` position —
-   and only *then* the item's own data (caption, AI, EXIF). Opening the 3rd photo
-   of a memory shows that memory just as fully as the 1st. Never show a leaf in a
-   vacuum; a breadcrumb of its ancestry comes first.
+2. **Carry the grid down in a `ctx` URL parameter**, never guessed —
+   `ctx=library`(+filters), `ctx=album:…`, `ctx=similar:<id>` (grid = library; the
+   origin photo is shown as clickable *context*, not the parent).
 
-3. **Move *within* a layer, never across.** Prev/next (and arrow keys) page within
-   the current layer, in that layer's order — never leaking into a sibling
-   memory/album or the wider library.
+3. **Show the enclosing grid's identity first** — its title/description/`N / M`
+   position — then the leaf's own data. Never show a leaf in a vacuum.
 
-4. **Close/back goes *up one layer*, to the exact parent view — never sideways to
-   a prior sibling.** Every in-layer navigation uses `replace`, so history stays
-   `[parent, current]` and `history.back()` lands on the parent with its state and
-   scroll intact; the close control's `href` is the computed parent URL as the
-   deep-link fallback.
+4. **HISTORY IS ALWAYS `[grid, leaf]` — depth two.** Grid→leaf is the ONE `push`.
+   **Every** leaf-level move — prev/next, opening a similar photo, clicking the
+   origin thumbnail — uses `location.replace`, NEVER a push. If you ever `push` on
+   a leaf→leaf move you break this and close starts replaying visited photos.
+
+5. **Close/Esc goes UP to the grid, once** — `history.back()` (restores the grid's
+   scroll + state via bfcache), with the computed grid URL as the `href` deep-link
+   fallback. It must never walk back through visited photos (rule 4 guarantees
+   none are in history).
+
+6. **Prev/next move only *within* the current layer's order**, carrying `ctx`
+   forward — never leaking into a sibling memory/album or the wider library.
 
 This layering *is* the "never lose the user's place" rule applied to structure:
-the user always knows where they are (ancestry shown) and one action up always
-returns them there.
+one action up always returns to the grid with its state and scroll intact.
+
+## Source folders are sacred — the app NEVER touches them
+
+The folders on the user's disk are **sources**. The cloud app only ever holds an
+uploaded *copy* (content-addressed) plus derived metadata. Nothing in the app —
+upload, reprocess, and above all **"delete folder"** — may read, move, rename, or
+delete anything on the user's filesystem. The only component that ever writes to
+disk is `ivms777-sync` (stage 2), and only on an explicitly confirmed plan.
+
+**"Delete a folder" means delete from the LIBRARY, never from disk.** It removes:
+the folder's entry from the upload list, every photo uploaded from that folder
+(matched by its internal folder name / `root_label`), and *all* of each deleted
+photo's metadata — embeddings, caption vector, tags, facets, FTS, jobs, group
+memberships, thumbnails, and the stored original. A photo whose identical bytes
+still belong to another folder is kept (only that folder's source path is
+dropped). The source folder on disk is untouched, always.
+
+**Deletion runs through an outbox + worker**, never inline in the request: the
+endpoint records the deletion intent and returns; a worker drains it and does the
+cascade. So a delete is reliable across restarts and never blocks the UI.
 
 ## Code
 

@@ -23,6 +23,33 @@ def test_upload_page_shows_stage_progress(client):
     assert "thumbnail" in client.get("/upload").text
 
 
+def test_upload_page_remembers_the_current_folder_across_restarts(client):
+    conn = client.app.state.context.conn
+    # A completed upload from a folder — the persisted `uploads` row is what a
+    # restart still has (the browser file picker cannot remember a selection).
+    conn.execute(
+        "INSERT INTO uploads(owner_id, root_label, started_at, files_sent)"
+        " VALUES (1, 'Summer 2024', '2026-01-01T00:00:00', 3)"
+    )
+    body = client.get("/upload").text
+    assert "Summer 2024" in body and "Delete from library" in body  # listed, deletable
+
+
+def test_delete_folder_endpoint_enqueues_an_outbox_deletion(client):
+    conn = client.app.state.context.conn
+    conn.execute(
+        "INSERT INTO uploads(owner_id, root_label, started_at, files_sent)"
+        " VALUES (1, 'Old trip', '2026-01-01T00:00:00', 5)"
+    )
+    response = client.post(
+        "/upload/folder/delete", data={"root_label": "Old trip"}, follow_redirects=False
+    )
+    assert response.status_code == 303
+    assert conn.execute(
+        "SELECT 1 FROM folder_deletions WHERE root_label = 'Old trip'"
+    ).fetchone() is not None
+
+
 def test_progress_fragment_lists_failed_files_by_path(client):
     conn = client.app.state.context.conn
     photo_id = add_photo(conn, content_hash="ab" * 32, sources=("Pictures/bad.jpg",))

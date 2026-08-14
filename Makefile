@@ -23,7 +23,7 @@ up: ollama ## Ensure Ollama + models, then run app + worker NATIVELY → http://
 	@IVMS777_PROFILE="$${IVMS777_PROFILE:-mac}" \
 	 IVMS777_DATA_DIR="$${IVMS777_DATA_DIR:-$$HOME/.ivms777}" \
 	 IVMS777_INFERENCE_BASE_URL="$${IVMS777_INFERENCE_BASE_URL:-http://localhost:11434/v1}" \
-	 bash -c 'uv run python -m ingest.cli & W=$$!; trap "kill $$W 2>/dev/null" EXIT INT TERM; \
+	 bash -c 'uv run watchfiles "python -m ingest.cli" ingest embedding search inference albums storage db config.py vocab.yaml & W=$$!; trap "kill $$W 2>/dev/null" EXIT INT TERM; \
 	   uv run uvicorn web.app:app_factory --factory --host 0.0.0.0 --port 8000 --reload'
 
 ollama: ## Ensure host Ollama is running and the caption/planner models are pulled

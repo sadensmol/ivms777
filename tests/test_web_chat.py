@@ -35,13 +35,24 @@ def test_chat_page_has_input_log_and_nav_order(chat_client):
     assert body.index('href="/chat"') < body.index('href="/organize"')
 
 
-def test_stream_emits_sources_then_tokens_then_done(chat_client):
+def test_stream_emits_tokens_then_done_no_candidate_strip(chat_client):
     body = chat_client.get("/chat/stream?q=beach").text
-    assert "event: sources" in body
-    assert '"ids"' in body and "1" in body
     assert "A beach " in body
-    assert "[photo:1]" in body  # citation passes through untouched
+    assert "[photo:1]" in body       # citation passes through untouched, rendered inline
     assert "event: done" in body
+    # No raw-candidate strip: the loosely-related retrieved set is never pushed to
+    # the client — only what the answer cites (design §6, §10).
+    assert "event: sources" not in body
+
+
+def test_only_cited_photos_are_persisted_not_the_candidate_set(chat_client):
+    # photo 2 (keyboard) is retrieved as a candidate but never cited; only the
+    # cited photo 1 must be stored/shown, so the "30 thumbnails, 1 dog" mismatch
+    # can't happen.
+    chat_client.get("/chat/stream?q=beach")
+    body = chat_client.get("/chat").text
+    assert "/thumb/1" in body
+    assert "/thumb/2" not in body
 
 
 def test_stream_says_so_when_nothing_retrieved(chat_client, monkeypatch):
@@ -49,7 +60,6 @@ def test_stream_says_so_when_nothing_retrieved(chat_client, monkeypatch):
     fake_inf = FakeInferenceClient(streams=[["I have no photos matching that."]])
     monkeypatch.setattr(Settings, "build_inference_client", lambda self: (fake_inf, "fake"))
     body = chat_client.get("/chat/stream?q=%20").text
-    assert "event: sources" in body
     assert "no photos matching" in body.lower()
 
 
@@ -76,6 +86,6 @@ def test_off_topic_question_is_refused_without_retrieval(settings, monkeypatch):
     with TestClient(app) as tc:
         body = tc.get("/chat/stream?q=should+I+walk+or+drive").text
         assert "only answer questions about your photos" in body
-        assert '"ids": []' in body                    # nothing retrieved
+        assert "event: sources" not in body           # nothing retrieved, no strip
         history = tc.get("/chat").text
         assert "should I walk or drive" in history     # the refused turn is saved

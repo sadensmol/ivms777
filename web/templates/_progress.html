@@ -3,10 +3,16 @@
   {% for stage, counts in stages %}
     <div class="progress-row">
       <span>{{ stage }}</span>
-      <span>
+      <span class="progress-counts">
         {{ counts['done'] }} done · {{ counts['pending'] }} pending
         {% if counts['failed'] %}<span class="failed">· {{ counts['failed'] }} failed</span>{% endif %}
       </span>
+      <form method="post" action="/reprocess" class="reprocess-one"
+            {% if stage == 'caption' %}onsubmit="return confirm('Re-caption EVERY photo with the vision model? This can take hours.');"{% endif %}>
+        <input type="hidden" name="from_stage" value="{{ stage }}">
+        <input type="hidden" name="to_stage" value="{{ stage }}">
+        <button type="submit" class="reprocess-btn{% if stage == 'caption' %} danger{% endif %}">Reprocess</button>
+      </form>
     </div>
   {% endfor %}
   {% if failures %}

@@ -96,7 +96,7 @@ def _run_tool(conn: sqlite3.Connection, owner_id: int, turn: dict) -> str:
     tool = turn.get("tool")
     photo_id = turn.get("photo_id")
     if tool == "similar" and isinstance(photo_id, int):
-        ids = similar_photos(conn, owner_id, photo_id, k=5)
+        ids = [r["id"] for r in similar_photos(conn, owner_id, photo_id, k=5)]
         return "Similar photos: " + (_summarise(conn, owner_id, ids) if ids else "(none)")
     if tool == "facets" and isinstance(photo_id, int):
         facts = [

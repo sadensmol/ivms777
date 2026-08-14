@@ -11,6 +11,19 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def cited_ids(answer: str) -> list[int]:
+    """Photo ids the answer actually cites as [photo:ID], first-appearance order.
+
+    These are the evidence the model stood behind — not the loosely-related
+    candidates retrieval handed it. They are what the UI shows and what §6 stores
+    in `chat_messages.sources`.
+    """
+    seen: dict[int, None] = {}
+    for match in _CITE.finditer(answer):
+        seen.setdefault(int(match.group(1)), None)
+    return list(seen)
+
+
 def new_session(conn: sqlite3.Connection, owner_id: int) -> int:
     cursor = conn.execute(
         "INSERT INTO chat_sessions(owner_id, created_at) VALUES (?, ?)",

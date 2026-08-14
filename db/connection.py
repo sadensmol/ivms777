@@ -4,7 +4,7 @@ from pathlib import Path
 import sqlite_vec
 
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
 
 
 class SchemaTooOldError(RuntimeError):
@@ -47,6 +47,7 @@ def _has_photos_table(conn: sqlite3.Connection) -> bool:
 _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("photos", "ai_title", "TEXT"),
     ("photos", "ai_description", "TEXT"),
+    ("photos", "caption_vec", "BLOB"),
     ("groups", "description", "TEXT"),
 )
 

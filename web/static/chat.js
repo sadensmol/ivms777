@@ -31,8 +31,9 @@ function scrollToBottom() {
 // Open server-rendered history scrolled to the latest turn.
 window.addEventListener("DOMContentLoaded", scrollToBottom);
 
-// One assistant turn: a sources strip, plus a bubble that starts as a processing
-// indicator and is replaced by the streamed answer. Returns handles to update.
+// One assistant turn: a bubble that starts as a processing indicator and is
+// replaced by the streamed answer. Cited photos render inline in the answer as
+// thumbnails — there is no separate candidate strip. Returns handles to update.
 function addTurn(question) {
   const log = document.getElementById("chat-log");
 
@@ -41,14 +42,12 @@ function addTurn(question) {
   log.appendChild(user);
 
   const assistant = el("msg assistant");
-  const sources = el("sources");
   const bubble = el("bubble");
   bubble.appendChild(el("typing", "<span></span><span></span><span></span>"));
-  assistant.appendChild(sources);
   assistant.appendChild(bubble);
   log.appendChild(assistant);
   scrollToBottom();
-  return { sources, bubble };
+  return { bubble };
 }
 
 function setBusy(busy) {
@@ -70,11 +69,6 @@ function askLibrary(event) {
   let started = false;
 
   source = new EventSource("/chat/stream?q=" + encodeURIComponent(question));
-
-  source.addEventListener("sources", (e) => {
-    turn.sources.innerHTML = JSON.parse(e.data).ids.map(citeHtml).join("");
-    scrollToBottom();
-  });
 
   source.onmessage = (e) => {
     if (!started) {

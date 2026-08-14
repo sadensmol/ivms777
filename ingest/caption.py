@@ -1,6 +1,8 @@
 import json
 import sqlite3
 
+from embedding.store import write_caption_vector
+from embedding.vectors import l2_normalize
 from inference.client import InferenceClient, encode_image
 from inference.prompts import CAPTION_SCHEMA, caption_messages
 from ingest.jobs import enqueue
@@ -11,16 +13,32 @@ from ingest.worker import StageHandler
 from storage.base import Storage
 
 
+def _embed_caption(
+    conn: sqlite3.Connection, client: InferenceClient, embed_model: str, photo_id: int, caption: str
+) -> None:
+    """Embed the caption text and store it (§9). Best-effort: an embeddings backend
+    that is down must not fail the caption itself — the vector backfills later."""
+    if not caption:
+        return
+    try:
+        vector = client.embed(embed_model, [caption])[0]
+    except Exception:  # noqa: BLE001 - embeddings are an enhancement, not required
+        return
+    write_caption_vector(conn, photo_id, l2_normalize(vector))
+
+
 def caption_handler(
     derived: Storage,
     client: InferenceClient,
     model: str,
+    embed_model: str,
     dimensions: list[str],
     detail_px: int,
 ) -> StageHandler:
     """The caption stage: one VLM call per photo -> caption, AI title/description,
-    and vlm tags. Drains last (§8). Invalid JSON raises so the queue retries the
-    job rather than writing half a row.
+    and vlm tags — and the caption's own text embedding for semantic similarity
+    (§9), computed here while the caption is fresh. Drains last (§8). Invalid JSON
+    raises so the queue retries the job rather than writing half a row.
     """
 
     def handle(conn: sqlite3.Connection, photo_id: int) -> None:
@@ -42,9 +60,26 @@ def caption_handler(
             (obj["caption"], model, obj["title"], obj["description"], photo_id),
         )
         _write_vlm_tags(conn, photo_id, obj.get("tags") or {})
+        _embed_caption(conn, client, embed_model, photo_id, obj["caption"])
         reindex_fts(conn, photo_id)
 
     return handle
+
+
+def backfill_caption_vectors(
+    conn: sqlite3.Connection, client: InferenceClient, embed_model: str, limit: int = 50
+) -> int:
+    """Embed captions that predate the caption-vector column (§9), a few per drain
+    so an already-captioned library gains semantic similarity without a full
+    re-caption. Returns how many were embedded."""
+    rows = conn.execute(
+        "SELECT id, caption FROM photos WHERE caption IS NOT NULL AND caption_vec IS NULL"
+        " LIMIT ?",
+        (limit,),
+    ).fetchall()
+    for row in rows:
+        _embed_caption(conn, client, embed_model, row["id"], row["caption"])
+    return len(rows)
 
 
 def _write_vlm_tags(conn: sqlite3.Connection, photo_id: int, tags: dict) -> None:

@@ -150,6 +150,29 @@ API can write to a user-picked directory, but only on Chromium desktop — Firef
 has no directory picker, Safari is read-only, and mobile has neither. Stage 2 is
 a CLI instead, which works on every OS and has no browser to disagree with.
 
+### 3.2c The upload folder list, and deleting a folder
+
+The library is organised as a **list of folders** — one per distinct
+`uploads.root_label` — persisted in the database, so it survives restarts (the
+browser file picker cannot remember a selection). `/upload` shows every folder
+with its live photo count; a directory-only picker adds a new one and uploads its
+photos into the library.
+
+**Deleting a folder removes it from the LIBRARY, never from disk.** The source
+folder on the user's machine is a *source* and is never read, moved, or deleted by
+the app (§3.2b) — deletion only removes the library's uploaded copies and their
+derived state. It removes: the folder's `uploads` rows, every photo sourced only
+from that folder, and *all* of each deleted photo's metadata — `photo_vec`,
+`caption_vec`, tags, facets, FTS row, jobs, group memberships, thumbnails, and the
+stored original. A photo whose identical bytes still belong to another folder is
+kept; only that folder's `photo_sources` path is dropped.
+
+**Deletion runs through an outbox + worker**, never inline. `POST
+/upload/folder/delete` records the intent in `folder_deletions` and returns
+immediately; the folder shows "deleting…". The worker drains the outbox each pass
+(`process_folder_deletions`) and does the cascade, so a delete is reliable across
+restarts and never blocks the UI. This is the Outbox pattern.
+
 ### 3.3 Scale
 
 - Collection: 1,000-5,000 photos for the first user.
@@ -167,6 +190,13 @@ a CLI instead, which works on every OS and has no browser to disagree with.
 | Image and text embeddings, zero-shot tags | SigLIP 2 `so400m-patch14-384` | in-process in the worker (`transformers`) |
 | Captions and structured tags | Gemma 4, size per profile | inference service over HTTP |
 | Query planning, chat answers | Gemma 4 E4B | inference service over HTTP |
+| Caption text embeddings (§9 similar) | the planner model, reused via `/v1/embeddings` (`text_embed_model` override) | inference service over HTTP |
+
+The caption embedding reuses the **already-resident planner model** through the
+inference service's `/embeddings` endpoint — no extra model to pull — because a
+purpose-built embedder isn't required to tell whether two captions mean the same
+thing, and a bigger generative LLM would be slower without being better at it.
+Override with `IVMS777_TEXT_EMBED_MODEL` to use a dedicated embedder.
 
 Gemma 4 is the default family on `mac` and `cloud`; the Jetson profile runs a
 4B-class model that may be Qwen3-VL. Caption and planner prompts therefore live
@@ -268,6 +298,7 @@ photos (
   thumb_key       TEXT,
   caption         TEXT,
   caption_model   TEXT,
+  caption_vec     BLOB,               -- caption text embedding, for §9 similarity
   embedding_model TEXT,
   exif_json       TEXT,               -- full EXIF as captured, for reference
   created_at      TEXT NOT NULL,
@@ -479,13 +510,22 @@ Sources per dimension:
 - `palette` and `quality` come from cheap pixel statistics first (mean
   saturation, Laplacian variance, histogram clipping). SigLIP refines them.
 - All ten get SigLIP zero-shot scores against prompt templates
-  (`"a photo with a {label} mood"`), sigmoid-scored, thresholded per dimension.
+  (`"a photo with a {label} mood"`). SigLIP is a **per-dimension classifier**,
+  not an absolute detector: its raw sigmoid probabilities are tiny (~1e-4) and
+  the same across every label, so an absolute floor tags nothing. Instead each
+  dimension is scored by a **softmax over its own labels**, and the winning
+  label (plus any runner-up within `select_ratio` of it, capped at
+  `max_per_dim`) is kept with that softmax probability as its score. Every
+  dimension therefore contributes its best guess, and the stored score is a real
+  0..1 confidence comparable within the dimension.
 - Gemma 4 returns a JSON object with a caption plus its own picks from the same
   vocabulary, stored with `source='vlm'`.
 - `shot_at`, `camera`, and GPS come from EXIF with `source='exif'`.
 
-Thresholds start at sensible defaults and are tuned against a small hand-labeled
-dev set of ~100 photos built during phase 2.
+`max_per_dim` and `select_ratio` live in `vocab.yaml`. They start at permissive
+defaults (top label always, runners-up within half the top's probability, three
+labels max) and are tuned against a small hand-labeled dev set of ~100 photos
+built during phase 2.
 
 ### 7.1 Vocabulary mining
 
@@ -519,7 +559,12 @@ stopped.
 4. **taxonomy** — SigLIP zero-shot scoring against `vocab.yaml`, plus pixel
    statistics. Fast, runs immediately after embed.
 5. **caption** — Gemma 4 produces a caption sentence and a JSON tag object over
-   HTTP. Slowest stage by two orders of magnitude, runs last.
+   HTTP, and the caption text is **embedded in the same stage** (via the planner
+   model's `/embeddings`) into `photos.caption_vec` for §9 caption-meaning
+   similarity — computed while the caption is fresh. Slowest stage by two orders
+   of magnitude, runs last. A library captioned before this column existed
+   backfills its caption vectors a few per drain (`backfill_caption_vectors`), no
+   re-caption needed.
 
 **Stages are drained in order across the whole library, not per photo.** Every
 photo is embedded and scored before any photo is captioned. This is what keeps
@@ -540,18 +585,24 @@ transfer is visible rather than silently missing.
 embeddings, tags, captions — can be rebuilt without re-uploading. `POST
 /reprocess` resets a **range** of stages (`from_stage` through an optional
 `to_stage`, inclusive) to `pending` for the owner's photos; the `worker` re-runs
-them in `STAGES` order on its next poll. The `/upload` UI exposes **two** buttons:
+them in `STAGES` order on its next poll. The `/upload` UI puts a **Reprocess**
+button on **every stage row** — `thumbnail`, `embed`, `taxonomy`, `caption` —
+and each re-runs **only that one stage** (`from=to=stage`). So re-tagging after a
+`vocab.yaml` change never rebuilds thumbnails, and re-embedding never
+re-captions; each stage is re-run in isolation, exactly when it is the one that
+changed. The `caption` button is styled as a destructive action and confirms
+first ("can take hours"), since it alone re-runs the slow vision model.
 
-- **Reprocess all photos** — `from=thumbnail` bounded `to=taxonomy`: rebuilds
-  thumbnails, embeddings, and tags but **not captions**. Captioning is the slow
-  stage (hours), and an already-captioned image never needs re-captioning because
-  the bytes are static — so the everyday reprocess deliberately stops before it.
-- **Re-caption all photos** — `from=caption`, styled as a destructive action and
-  guarded by a confirm ("can take hours"). Only needed after switching the caption
-  model. This is the one path that re-runs the vision model over the whole library.
+The endpoint still accepts any range, so a multi-stage re-run — `from=embed`
+`to=taxonomy` for a new embedding model — is one POST away.
 
-The endpoint accepts any range, so a narrower re-run — `from=taxonomy` after a
-`vocab.yaml` change, `from=embed` for a new embedding model — is one POST away.
+**Per-photo reprocess.** `POST /photo/{id}/reprocess` re-runs a single model
+stage for one photo — `taxonomy` (re-tag) or `caption` (re-caption) — resetting
+just that photo's job to `pending`. It is exposed on the `/photo` page (§13) so a
+single bad tagging or caption can be redone without touching the rest of the
+library. Only the model-derived stages are offered; `thumbnail` and `embed` are
+static (the bytes never change) and are not re-runnable per photo. It redirects
+back to the photo with its collection query intact.
 Every stage handler is idempotent — it
 overwrites its own output — so a reprocess is safe to trigger at any time.
 Self-healing backfills run automatically each drain: they queue `thumbnail` for a
@@ -585,9 +636,64 @@ Four mechanisms, composed:
   (`score = sum 1/(60 + rank)`). Facet filters apply first, narrowing the
   candidate set, then fusion ranks what survives.
 
-**Similar photos** — KNN against the clicked photo's embedding, with
-near-duplicates (cosine > 0.98) collapsed behind a "show N near-duplicates"
-toggle so the strip is not ten copies of one frame.
+**Similar photos** — a photo's whole character, from three signals fused, and it
+**degrades gracefully with the pipeline** so it is useful the moment a photo is
+embedded and richer once it is tagged and captioned:
+
+| A photo has… | Similar is computed from… |
+|---|---|
+| no embedding yet | nothing — it can't be compared |
+| embedding only | image-vector KNN (cosine ≥ `similar_min_cosine`, default 0.8) |
+| + taxonomy | ⊕ shared **tags across every dimension**, each weighted by that dimension's importance |
+| + captions | ⊕ **caption meaning** (caption text-embedding cosine) |
+
+Every matching facet is a scored **contribution**:
+
+1. **Shared tags — all dimensions, per-dimension weighted.** A photo is more than
+   its subject, so `vibe`/`emotion`/`setting` all count — but not equally. Each
+   shared tag contributes `dimension_weight × agreement × idf`, where the
+   **per-dimension weight** lives in `vocab.yaml` (`similar_dimension_weights`:
+   `subject` 3.0, `setting`/`occasion` 1.5, mood/light ~1.0, `palette` 0.5,
+   `quality` **0 — ignored**). `agreement` is the weaker of the two confidences and
+   `idf` (0–1) damps common tags. This is what stops a rare `palette=earthy` from
+   outweighing the actual subject.
+2. **Caption meaning.** SigLIP tagging is single-label and picks the *dominant*
+   subject, so a dog riding in a car is tagged `vehicle` and never shares
+   `subject=dog` with a dog on a rooftop. So each caption is embedded with a text
+   model (§4) when it is written, and similarity is the **cosine between caption
+   embeddings** — the *whole sentence's* meaning: "a dog on a rooftop" ≈ "a dog in
+   a car", while "a small teddy bear" ≠ "a small domino tile". This replaced a
+   crude single-shared-word match that let a generic word like "small" fake a
+   match. Contributes above `similar_caption_min` (default 0.6) at a high weight.
+3. **Image-vector cosine.** Contributes a mild look-alike signal (cosine ≥
+   `similar_min_cosine`, default **0.8**) — how alike the two photos *look*
+   (scene/colour/framing), not what they are — and is the sole signal before
+   taxonomy exists. The floor is high because SigLIP image cosines have a high
+   baseline: any two photos sit ~0.5–0.65, so a lower floor admits noise (a teddy
+   bear "looks alike" a selfie at 0.63 — both warm, indoor, close-up), while
+   genuinely-alike photos are 0.85–0.98.
+
+**Content gate.** A candidate is "similar" ONLY if it shares a **content** signal:
+a `subject` tag, a caption that means the same, or a genuine visual near-dup.
+Style/scene facets (composition, vibe, palette, light, season, occasion, setting,
+emotion, quality) **only rerank** content matches — they never make two photos
+similar on their own. Two photos both shot top-down in cool overcast light are not
+"the same thing".
+
+A candidate's score is its contributions **sorted high-to-low and summed with a
+decay** (each further facet counts less), so **one strong match — a shared
+`subject` — beats a pile of weak ones**. This replaced an earlier flat sum that
+let quantity of weak facets win, and a `caption × 3` hack that papered over it.
+Each result carries the **reasons** it was chosen, each with a match percentage
+(the *weaker* of the two photos' confidences — a 0.71 close-up matching a 1.00
+close-up agree at 71%, never the candidate's raw score). The UI shows the **top 3**
+reasons **sorted by relevance** (contribution = importance × rarity × match, so a
+generic `composition: top-down` sinks below a subject/caption match even at a
+higher raw %), overlaid on each enlarged thumbnail (§13). Pure image-vector KNN as
+the *primary* signal was rejected: it matches overall scene/composition, so a dog
+on a rooftop returned other rooftops rather than the other dog. An LLM reranker
+was also rejected for this interactive path — it reintroduces per-click latency
+that §9.1 forbids.
 
 ### 9.1 Query planner
 
@@ -706,37 +812,70 @@ GPS into `place_city`/`place_country` facets (§6.2), shown as a "Place" group i
 the `/library` sidebar.
 
 **Memories.** The interesting one, and the reason the Organize tab needs the LLM.
-It composes the library into named, described *memories* — "Family night in
-Ontario", "A family having fun, 22 Nov 1999" — not sets of look-alike photos. It
-replaces the earlier "By similarity (visual clusters)" organizer, which grouped by
-raw SigLIP cosine and produced palette-alike blobs with no meaning. It runs as a
-background job in three steps:
+It composes the library into named, described *memories* — "A day at Borjomi",
+"Family night in Ontario" — not sets of look-alike photos.
 
-1. **Seed** — form candidate clusters cheaply, no model. Start from capture-time
-   gaps (a gap > 6 h starts a new run), then split or merge by GPS bucket (~1 km)
-   and SigLIP similarity. A candidate is a time-and-place-contiguous run of related
-   photos — the natural boundary of a memory.
-2. **Curate with an agent** — for each candidate, the planner model (Gemma 4 E4B,
-   which stays loaded) reads the photos' captions, tags, and EXIF facts (date,
-   place, camera). It may pull bounded extra context through a small tool set —
-   similar photos, facet lookups, photos near in time — then judges whether the
-   candidate is one coherent memory, may split or merge it, and writes a **title
-   and a story description grounded in that data**. Retrieval-augmented and
-   agentic, but capped at a few tool calls per candidate so cost stays bounded.
-   This is the batch agent loop section 9.1 permits.
-3. **Persist** — accepted memories are written to `groups` (`kind='memory'`, with
-   `name` and `description`) and `group_photos` (cover is the lowest-`rank` row).
-   `/organize?by=memories` then reads stored rows and renders instantly, with no
-   LLM on the page load.
+**The governing principle: the LLM decides every membership; heuristics only make
+the problem tractable.** How photos combine into a memory is a judgement call — it
+needs a model that has read what is *in* the photos, not a distance formula. So no
+heuristic ever decides a memory's contents. Time/place/retrieval are used *only*
+to hand the agent a small, relevant working set (897 photos will never fit one
+context); within and across those sets the **agent alone** decides what is one
+memory, what splits, what merges, and which photos belong — including the **same
+photo in several memories**.
 
-Memories need captions (phase 3) and the planner (phase 4), so the organizer lands
-in phase 5. It depends on nothing interactive; it is pure offline enrichment.
+**Two kinds of memory, and why overlap is the point.**
 
-**Rebuilding.** The build job records the library signature it built from — the
-owner's photo count and newest `updated_at` — in each memory's `params`. A rebuild
-is triggered manually ("Rebuild memories") or when the library changes, and is
-skipped when the current signature already matches, so opening the tab never
-silently re-runs the agent. The other organizers, being live, need no such guard.
+- **Event** — a time-and-place-bounded happening: "A day at Borjomi, 1 Dec 2023."
+- **Theme** — a thread across time: "Waterfalls", "With grandma", "Autumn 2023".
+
+A single photo naturally belongs to **one event and several themes** — the
+waterfall shot is in "A day at Borjomi" *and* "Waterfalls" *and* "2023 in
+Georgia". Memories are therefore **overlapping sets, not a partition**. The data
+model already supports this for free: `group_photos` is a many-to-many junction, so
+a photo id may appear in any number of `groups(kind='memory')` — **no schema
+change**. Overlap is a feature to embrace, not a conflict to resolve.
+
+**The composition pipeline (all decisions are the agent's):**
+
+1. **Pool (cheap, no decisions).** Group the owner's **processed** photos (caption
+   + embedding present) into coarse *sessions* by time and ~50 km region purely to
+   bound context size — this is not the memory boundary, just a tractable batch the
+   agent can read at once. Only processed photos participate, so composition is run
+   **after** captioning/embedding.
+2. **Compose events (agent, per session).** For each session the agent reads
+   compact per-photo summaries (date, place, caption, tags) and **decides the
+   carve** — one memory, or several chapters, or skip — pulling extra context on
+   demand via bounded tools (similar photos, facet lookups, photos nearby in time,
+   same-subject retrieval) so it can reach *across* sessions when an event spans a
+   pool boundary. It returns each memory as `{title, description, photo_ids[]}`,
+   grounded only in the data.
+3. **Discover themes (agent + RAG).** Separately, an agent proposes recurring
+   threads — a subject that appears often (the dog), a place, an occasion, a season
+   — and for each **retrieves** candidate photos (semantic + tag + facet) then
+   curates the set. This is retrieval-augmented: the theme is the query, the agent
+   judges membership. Themes deliberately pull photos already in events → overlap.
+4. **Reconcile (agent).** A final pass dedupes near-identical memories, merges
+   fragments the pooling split, and writes final titles/covers. It merges
+   *memories*, never collapses the overlap between an event and a theme.
+5. **Persist.** Each memory → `groups(kind='memory')` + `group_photos`; a photo may
+   land in many. `params` records how it was built (kind, seed, model).
+
+**Cost is bounded, per §9.1** (this is the batch, offline exception to the
+one-call rule): per-session and per-theme agent loops are capped at a few rounds
+and tool calls; the whole build is signature-guarded and run only on demand.
+
+**Rebuilding.** Manual only ("Rebuild memories"), on a **background thread**, one
+build at a time per process, signature-guarded (owner photo count + newest
+`updated_at`, stored in each memory's `params`) so opening the tab never silently
+re-runs the agent; the tab flags **stale** when the signature moves. Because only
+processed photos participate, **rebuild after captioning/embedding completes**.
+
+> The earlier heuristic seed→curate (one time/place run → one memory, minus
+> outliers) is superseded by the above: it let a distance rule, not the model,
+> decide contents, could not produce overlapping or thematic memories, and
+> fragmented one outing across nearby spots. The coarse time/region seeder is kept
+> **only** as the step-1 pooling that bounds context — never as the decider.
 
 The `groups`/`group_photos` tables — reserved and unused in the earlier design —
 now back Memories. They remain available for a future "save this album" action on
@@ -887,14 +1026,16 @@ The tool moves other people's photographs, so its defaults are paranoid.
 
 ## 13. UI
 
-- `/upload` — pick a folder or drop files, watch client-side hashing, then the
-  transfer, then live processing progress per stage with counts, throughput,
-  ETA, and a list of failed files. Hashing and upload progress come from the
-  Web Worker; processing progress is HTMX polling. Two reprocess buttons re-run
-  work over the already-uploaded library without re-uploading: **Reprocess all
-  photos** (thumbnails, embeddings, tags — captions kept, since images are static)
-  and a separate, confirm-guarded **Re-caption all photos** for when the caption
-  model changes; the worker drains the reset jobs.
+- `/upload` — leads with the **folder list**: every folder in the library
+  (§3.2c) with its photo count and a confirm-guarded **Delete from library**
+  button (a folder mid-deletion shows "deleting…"). Below it, a **directory-only**
+  picker adds a new folder; watch client-side hashing, the transfer, then live
+  processing progress per stage with counts, throughput, ETA, and failed files
+  (Web Worker for hashing/upload, HTMX polling for processing). Every stage row
+  carries its own **Reprocess** button that re-runs just that stage over the
+  already-uploaded library without re-uploading — `thumbnail`, `embed`, `taxonomy`
+  (re-tag), and a confirm-guarded `caption` (re-caption, the slow one); the worker
+  drains the reset jobs.
 - `/export` — choose a layout, preview the folder tree it would produce, and
   download the manifest. Shows whether the collection is fully processed, and
   the exact `ivms777-sync` command line to run next.
@@ -923,10 +1064,26 @@ The tool moves other people's photographs, so its defaults are paranoid.
   badges (the "AI data"), the full EXIF panel — including GPS **coordinates**,
   which live here as a technical detail and nowhere else — every local path the
   file arrived from with the wasted-space total when there is more than one, and a
-  "similar photos" strip. The AI title/description and tags fill in with the caption and
-  planner phases (3–4); until then the panel shows EXIF, sources, and embedding
-  status. This is where duplicate paths are seen, since there is no separate
-  duplicates screen.
+  "similar photos" strip. Each similar thumbnail is **enlarged and labelled with
+  why it matched** — its top-3 reasons (shared tags / caption words / "looks
+  alike") with confidence percentages, one per line, sorted highest-confidence
+  first, overlaid on the image — so similarity is never a black box (§9). Opening a
+  similar photo opens in a **"Similar to <this photo>"** layer (`ctx=similar:<id>`)
+  that shows the base photo's thumbnail (clickable, to jump back to it) and pages
+  within this photo's similar set. **A photo is always exactly one level below a
+  grid** (CLAUDE.md navigation rules): every photo→photo move — prev/next, opening
+  a similar, the origin thumbnail — **replaces** history, so it stays `[grid,
+  photo]` and **close always goes up to the grid** (the library for `library`/`q`/
+  `similar:*`, the album for `album:*`), never replaying the chain of photos
+  visited. The layer panel leads with a **"Why similar — base vs this"** table:
+  every shared facet (tag, caption meaning, visual), both photos' values side by
+  side and their match %, sorted high-to-low — so a weak match is visibly weak
+  (mostly "visual" with faint generic tags) rather than a mystery. The panel also offers **per-photo reprocess** — *Re-tag* and a
+  confirm-guarded *Re-caption* — that re-run just this photo's model stages (§8);
+  thumbnails and embeddings are static and are not offered. The AI title/description and tags fill
+  in with the caption and planner phases (3–4); until then the panel shows EXIF,
+  sources, and embedding status. This is where duplicate paths are seen, since
+  there is no separate duplicates screen.
 - `/organize` — a dropdown of organization principles (date, memories, camera,
   place) over a list of album cards, each with a cover, title, description, and a
   strip of its photos. `date` shows a grain sub-selector (day / month / year,
@@ -948,6 +1105,47 @@ and search them, ask about them to understand the collection, then — last, onc
 you know what you have — group and reorganize them. Organize is the final stage
 of the process (it feeds stage 2, the on-disk reorg); chat is a
 review-and-understand tool, so it sits before it.
+
+### 13.1 Navigation model (STRICT — every drill-down obeys this)
+
+The UI is **grids** and **leaves**. A *grid* is a browsable list — the library
+(with its filters/search/sort), an Organize album, a memory. A *leaf* is a detail
+view (`/photo/{id}`). The rules below are absolute; every current and future
+drill-down follows them exactly.
+
+1. **A leaf is always exactly ONE level below a grid.** There is no photo-inside-a-
+   photo nesting. A "similar" photo is still just a leaf one level under a grid.
+
+2. **The leaf records its grid in a `ctx` URL parameter** — never guessed:
+   - `ctx=library` (plus `q`/`f_`/`n_`/`t_`/`sort`/`date_*`) → the library grid.
+   - `ctx=album:<by>:<grain>:<key>` → an Organize album grid.
+   - `ctx=similar:<id>` → the library grid; the origin photo `<id>` is shown as
+     clickable **context** (a thumbnail in the header), but it is **not** the
+     parent — close still goes up to the library.
+
+3. **History invariant: `[grid, leaf]` — depth two, always.** Grid→leaf (clicking
+   a photo in a grid) is the ONE `push`. Every move at the leaf level —
+   **prev/next paging, opening a similar photo, clicking the origin thumbnail** —
+   uses `location.replace`, never a push. History therefore never accumulates a
+   chain of visited photos.
+
+4. **Close / Esc goes UP to the grid, once.** It is `history.back()` (so the grid's
+   scroll and filter state restore via bfcache), with the computed grid URL
+   (`origin_url`) as the deep-link fallback. Because history is `[grid, leaf]`, back
+   always lands on the grid — it can never "replay" photos, because none are in
+   history.
+
+5. **Prev/next move only *within* the current layer's order** (owner-scoped),
+   carrying `ctx` forward — never leaking into a sibling album/memory or the wider
+   library.
+
+6. **The grid keeps the user's place.** Filters, search, sort, and scroll survive
+   the round trip (the "never lose the user's place" rule).
+
+The recurring bug this prevents: pushing on a photo→photo move makes
+`history.back()` walk backwards through every photo visited instead of returning
+to the grid. If a drill-down ever "replays" photos on close, it pushed where it
+must replace.
 
 ## 14. Code layout
 

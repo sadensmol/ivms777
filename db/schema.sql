@@ -9,6 +9,17 @@ CREATE TABLE IF NOT EXISTS uploads (
   files_failed  INTEGER NOT NULL DEFAULT 0
 );
 
+-- Outbox for folder deletions (§3.2c): the request records intent and returns;
+-- a worker drains this and does the cascade, so deletes survive restarts and
+-- never block the UI. A row here means "still deleting"; gone means done.
+CREATE TABLE IF NOT EXISTS folder_deletions (
+  id           INTEGER PRIMARY KEY,
+  owner_id     INTEGER NOT NULL,
+  root_label   TEXT NOT NULL,
+  requested_at TEXT NOT NULL,
+  UNIQUE(owner_id, root_label)
+);
+
 CREATE TABLE IF NOT EXISTS photos (
   id              INTEGER PRIMARY KEY,
   owner_id        INTEGER NOT NULL,
@@ -28,6 +39,7 @@ CREATE TABLE IF NOT EXISTS photos (
   caption_model   TEXT,
   ai_title        TEXT,               -- AI-written short title (caption stage)
   ai_description  TEXT,               -- AI-written description (caption stage)
+  caption_vec     BLOB,               -- text embedding of the caption (§9 similar)
   embedding_model TEXT,
   exif_json       TEXT,
   created_at      TEXT NOT NULL,

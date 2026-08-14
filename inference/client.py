@@ -33,6 +33,10 @@ class InferenceClient(Protocol):
         timeout: float = 120.0,
     ) -> Iterator[str]: ...
 
+    def embed(
+        self, model: str, texts: list[str], *, timeout: float = 60.0
+    ) -> list[list[float]]: ...
+
 
 class OpenAICompatClient:
     """Talks to anything speaking the OpenAI chat-completions API.
@@ -92,3 +96,17 @@ class OpenAICompatClient:
                 delta = json.loads(data)["choices"][0].get("delta", {}).get("content")
                 if delta:
                     yield delta
+
+    def embed(
+        self, model: str, texts: list[str], *, timeout: float = 60.0
+    ) -> list[list[float]]:
+        """Text embeddings via the OpenAI-compatible `/embeddings` endpoint.
+
+        Ollama and vLLM both expose it, so any loaded model can embed — we reuse
+        the planner model that already stays resident, no extra model to pull.
+        """
+        response = self._client.post(
+            "/embeddings", json={"model": model, "input": texts}, timeout=timeout
+        )
+        response.raise_for_status()
+        return [item["embedding"] for item in response.json()["data"]]

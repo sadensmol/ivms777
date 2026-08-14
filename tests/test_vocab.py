@@ -31,6 +31,7 @@ def test_tag_id_map_keys_by_dimension_and_label(conn):
     assert isinstance(ids[("setting", "beach")], int)
 
 
-def test_thresholds_default_when_unspecified():
+def test_selection_params_load_with_sane_defaults():
     vocab = load_vocab(VOCAB)
-    assert 0.0 < vocab.threshold("subject") <= 1.0
+    assert vocab.max_per_dim >= 1
+    assert 0.0 < vocab.select_ratio <= 1.0

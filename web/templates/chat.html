@@ -12,13 +12,6 @@
     {% for m in messages %}
       <div class="msg user"><div class="bubble">{{ m.question }}</div></div>
       <div class="msg assistant">
-        {% if m.sources %}
-          <div class="sources">
-            {% for id in m.sources %}
-              <a href="/photo/{{ id }}"><img class="cite" src="/thumb/{{ id }}" alt="photo {{ id }}"></a>
-            {% endfor %}
-          </div>
-        {% endif %}
         <div class="bubble">{{ m.answer_html|safe }}</div>
       </div>
     {% endfor %}

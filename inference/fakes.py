@@ -1,4 +1,19 @@
+import hashlib
+
 from inference.client import ChatMessage
+
+
+def _fake_text_vector(text: str, dim: int = 16) -> list[float]:
+    """A stable unit vector per text, so identical captions embed identically and
+    similarity is reproducible offline — mirrors embedding.fakes for text."""
+    raw = bytearray()
+    counter = 0
+    while len(raw) < dim * 2:
+        raw += hashlib.sha256(text.strip().lower().encode() + counter.to_bytes(4, "big")).digest()
+        counter += 1
+    values = [int.from_bytes(raw[i : i + 2], "big") / 65535.0 - 0.5 for i in range(0, dim * 2, 2)]
+    norm = sum(v * v for v in values) ** 0.5 or 1.0
+    return [v / norm for v in values]
 
 
 class FakeInferenceClient:
@@ -27,3 +42,6 @@ class FakeInferenceClient:
         self.calls.append((model, messages))
         assert self._streams, "FakeInferenceClient ran out of queued streams"
         yield from self._streams.pop(0)
+
+    def embed(self, model: str, texts: list[str], *, timeout: float = 60.0) -> list[list[float]]:
+        return [_fake_text_vector(t) for t in texts]

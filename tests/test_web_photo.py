@@ -134,7 +134,7 @@ def test_photo_page_shows_model_tags_grouped_by_dimension(client):
     assert "siglip" in body  # the source badge
 
 
-def test_similar_strip_lists_other_photos(client):
+def test_similar_strip_lists_other_photos_with_reasons_and_ctx(client):
     ctx = client.app.state.context
     fake = FakeEmbedder()
     base = _first_id(client)
@@ -143,3 +143,21 @@ def test_similar_strip_lists_other_photos(client):
     write_vector(ctx.conn, other, fake.embed_texts(["a"])[0])  # identical → nearest
     body = client.get(f"/photo/{base}").text
     assert f"/thumb/{other}" in body
+    assert "why-line" in body                                    # reasons overlaid on the photo
+    assert f'href="/photo/{other}?ctx=similar:{base}"' in body   # drills into the similar layer
+
+
+def test_similar_photo_shows_origin_context_but_closes_to_the_library(client):
+    ctx = client.app.state.context
+    fake = FakeEmbedder()
+    base = _first_id(client)
+    write_vector(ctx.conn, base, fake.embed_texts(["a"])[0])
+    other = add_photo(ctx.conn, content_hash="cc" * 32, thumb_key="cc.jpg", caption="x")
+    write_vector(ctx.conn, other, fake.embed_texts(["a"])[0])
+    body = client.get(f"/photo/{other}?ctx=similar:{base}").text
+    assert "Similar to" in body                                      # origin shown as context
+    assert f'href="/photo/{base}"' in body                           # origin thumbnail, jump back
+    # A photo is one level below its grid: close goes UP to the library, never to
+    # a prior photo (§13). The origin thumbnail replaces history, never pushes.
+    assert 'class="photo-close" href="/library"' in body
+    assert "location.replace(this.href)" in body

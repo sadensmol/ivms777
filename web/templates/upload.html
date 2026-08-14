@@ -4,14 +4,37 @@
 <h1>Upload photos</h1>
 
 <p class="hint">
-  Pick a folder of photos. Pick more folders to add them to the same batch —
-  every photo format is accepted and videos are skipped. Nothing is sent until
-  each file has been hashed locally and the server has said which ones it does
-  not already have.
+  Your library is made of the folders below. Add a folder to upload its photos;
+  every photo format is accepted and videos are skipped. Deleting a folder removes
+  its photos from the library only — the folder on your disk is never touched.
 </p>
 
-<input type="file" id="picker" webkitdirectory directory multiple accept="image/*">
-<button id="start" disabled>Start upload</button>
+<h2 class="section-title">Folders in your library</h2>
+{% if folders %}
+  <ul class="folder-list">
+    {% for f in folders %}
+      <li class="folder-row">
+        <span class="folder-name">{{ f.name }}</span>
+        <span class="muted">{{ f.photos }} photo{{ '' if f.photos == 1 else 's' }}</span>
+        {% if f.deleting %}
+          <span class="folder-deleting">deleting…</span>
+        {% else %}
+          <form method="post" action="/upload/folder/delete" class="folder-delete"
+                onsubmit="return confirm('Delete “{{ f.name }}” and its {{ f.photos }} photo(s) from the library? Your folder on disk is NOT touched.');">
+            <input type="hidden" name="root_label" value="{{ f.name }}">
+            <button type="submit" class="danger reprocess-btn">Delete from library</button>
+          </form>
+        {% endif %}
+      </li>
+    {% endfor %}
+  </ul>
+{% else %}
+  <p class="hint">No folders yet — add one below.</p>
+{% endif %}
+
+<h2 class="section-title">Add a folder</h2>
+<label class="picker-btn">Choose folder<input type="file" id="picker" webkitdirectory directory multiple accept="image/*" hidden></label>
+<button id="start" disabled>Upload</button>
 <button id="clear" disabled>Clear</button>
 
 <p id="status">no folder selected</p>
@@ -21,20 +44,10 @@
 
 {% include "_progress.html" %}
 
-<form method="post" action="/reprocess" class="reprocess">
-  <p class="hint">Reprocess the photos already uploaded — no re-upload needed. Rebuilds
-    thumbnails, embeddings, and tags. Existing captions are kept — images are static,
-    so there is no reason to re-caption them.</p>
-  <input type="hidden" name="to_stage" value="taxonomy">
-  <button type="submit" name="from_stage" value="thumbnail">Reprocess all photos</button>
-</form>
-
-<form method="post" action="/reprocess" class="reprocess"
-      onsubmit="return confirm('This re-runs the vision model on EVERY photo and can take hours. Re-caption the whole library?');">
-  <p class="hint">Only needed after switching the caption model — it re-runs the slow
-    vision model on every photo and can take hours.</p>
-  <button type="submit" name="from_stage" value="caption" class="danger">Re-caption all photos</button>
-</form>
+<p class="hint">Reprocess the already-uploaded library — no re-upload needed. Each
+  stage above has its own <strong>Reprocess</strong> button that re-runs just that
+  stage: rebuild thumbnails, re-embed, re-tag (after editing <code>vocab.yaml</code>),
+  or re-caption. Re-caption runs the slow vision model and asks first.</p>
 
 </div>
 <script src="/static/upload.js" defer></script>

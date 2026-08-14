@@ -31,7 +31,7 @@ def test_caption_stage_writes_caption_title_description_and_vlm_tags(conn, tmp_p
     })])
     enqueue(conn, 1, "caption")
 
-    drain(conn, {"caption": caption_handler(derived, client, "fake-vlm", DIMS, 1600)})
+    drain(conn, {"caption": caption_handler(derived, client, "fake-vlm", "fake-embed", DIMS, 1600)})
 
     row = conn.execute(
         "SELECT caption, caption_model, ai_title, ai_description FROM photos WHERE id = 1"
@@ -48,6 +48,8 @@ def test_caption_stage_writes_caption_title_description_and_vlm_tags(conn, tmp_p
     }
     assert ("subject", "pet") in vlm and ("setting", "beach") in vlm
     assert conn.execute("SELECT rowid FROM photo_fts WHERE photo_fts MATCH 'beach'").fetchone() is not None
+    # The caption's text embedding is computed in the same stage (§9).
+    assert conn.execute("SELECT caption_vec FROM photos WHERE id = 1").fetchone()["caption_vec"] is not None
     assert stage_counts(conn, "caption")["done"] == 1
 
 
@@ -62,7 +64,7 @@ def test_caption_makes_a_photo_findable_by_keyword(conn, tmp_path):
         "description": "A cheesy slice on a plate.", "tags": {},
     })])
     enqueue(conn, 1, "caption")
-    drain(conn, {"caption": caption_handler(derived, client, "fake-vlm", DIMS, 1600)})
+    drain(conn, {"caption": caption_handler(derived, client, "fake-vlm", "fake-embed", DIMS, 1600)})
     assert keyword_search(conn, owner_id=1, query="Neapolitan", k=10) == [1]
 
 
@@ -73,7 +75,7 @@ def test_caption_skips_a_photo_with_no_thumbnail(conn, tmp_path):
     client = FakeInferenceClient([])  # must never be called
     enqueue(conn, 1, "caption")
 
-    drain(conn, {"caption": caption_handler(derived, client, "fake-vlm", DIMS, 1600)})
+    drain(conn, {"caption": caption_handler(derived, client, "fake-vlm", "fake-embed", DIMS, 1600)})
 
     assert conn.execute("SELECT caption FROM photos WHERE id = 1").fetchone()["caption"] is None
     assert stage_counts(conn, "caption")["done"] == 1  # skipped cleanly, not a crash/failure
@@ -91,7 +93,7 @@ def test_caption_falls_back_to_the_grid_thumb_when_the_detail_is_missing(conn, t
     )])
     enqueue(conn, 1, "caption")
 
-    drain(conn, {"caption": caption_handler(derived, client, "fake-vlm", DIMS, 1600)})
+    drain(conn, {"caption": caption_handler(derived, client, "fake-vlm", "fake-embed", DIMS, 1600)})
 
     assert conn.execute("SELECT caption FROM photos WHERE id = 1").fetchone()["caption"] == "c"
 
@@ -103,7 +105,7 @@ def test_invalid_json_leaves_the_photo_uncaptioned(conn, tmp_path):
     client = FakeInferenceClient(["not json at all"])
     enqueue(conn, 1, "caption")
 
-    drain(conn, {"caption": caption_handler(derived, client, "fake-vlm", DIMS, 1600)})
+    drain(conn, {"caption": caption_handler(derived, client, "fake-vlm", "fake-embed", DIMS, 1600)})
 
     assert conn.execute("SELECT caption FROM photos WHERE id = 1").fetchone()["caption"] is None
     assert stage_counts(conn, "caption")["done"] == 0  # not marked done; retried later

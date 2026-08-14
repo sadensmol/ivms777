@@ -8,19 +8,22 @@ import yaml
 @dataclass(frozen=True)
 class Vocab:
     dimensions: dict[str, list[str]]
-    _thresholds: dict[str, float]
-    _default: float
-
-    def threshold(self, dimension: str) -> float:
-        return self._thresholds.get(dimension, self._default)
+    # SigLIP zero-shot selection (§7): softmax over each dimension's labels, keep
+    # the top one plus any runner-up within `select_ratio` of it, up to
+    # `max_per_dim` labels total.
+    max_per_dim: int
+    select_ratio: float
+    # "Similar photos" (§9): per-dimension importance weight; 0 ignores a dimension.
+    dimension_weights: dict[str, float]
 
 
 def load_vocab(path: Path) -> Vocab:
     data = yaml.safe_load(path.read_text())
     return Vocab(
         dimensions=data["dimensions"],
-        _thresholds=data.get("thresholds", {}),
-        _default=float(data.get("default_threshold", 0.18)),
+        max_per_dim=int(data.get("max_per_dim", 3)),
+        select_ratio=float(data.get("select_ratio", 0.5)),
+        dimension_weights={k: float(v) for k, v in (data.get("similar_dimension_weights") or {}).items()},
     )
 
 

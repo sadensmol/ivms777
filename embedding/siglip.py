@@ -1,3 +1,5 @@
+from functools import lru_cache
+
 import numpy as np
 import torch
 from PIL import Image
@@ -44,3 +46,15 @@ class SiglipEmbedder:
         unit = array / norms
         assert unit.shape[1] == EMBED_DIM, f"expected {EMBED_DIM}, got {unit.shape[1]}"
         return unit.tolist()
+
+
+@lru_cache(maxsize=2)
+def get_siglip_embedder(model_name: str, device: str) -> SiglipEmbedder:
+    """Load the SigLIP model once and reuse it.
+
+    Building a `SiglipEmbedder` loads ~400M of weights from disk into torch — far
+    too slow to redo per request. Every route (search, /photo ctx paging, chat)
+    goes through this cache, so the model is resident after the first use and a
+    photo click no longer reloads it.
+    """
+    return SiglipEmbedder(model_name, device)

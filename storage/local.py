@@ -34,6 +34,11 @@ class LocalStorage:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
 
+    def delete(self, key: str) -> None:
+        """Remove a stored object. A no-op if it is already gone, so a partial
+        prior delete still converges (used by folder deletion, §3.2c)."""
+        self._resolve(key).unlink(missing_ok=True)
+
     def exists(self, key: str) -> bool:
         return self._resolve(key).is_file()
 

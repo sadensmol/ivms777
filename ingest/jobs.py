@@ -102,6 +102,23 @@ def reprocess(
     return len(photo_ids)
 
 
+def reprocess_one(conn: sqlite3.Connection, photo_id: int, stage: str) -> None:
+    """Reset one photo's one stage to 'pending' so the worker re-runs just it.
+
+    For the per-photo re-tag / re-caption on `/photo` — the model-derived stages
+    change (new vocab, new caption model) while thumbnails/embeddings are static.
+    Idempotent; creates the job row if the photo predates the stage.
+    """
+    if stage not in STAGES:
+        raise ValueError(f"unknown stage: {stage}")
+    enqueue(conn, photo_id, stage)
+    conn.execute(
+        "UPDATE jobs SET status = 'pending', attempts = 0, error = NULL, updated_at = ?"
+        " WHERE photo_id = ? AND stage = ?",
+        (_now(), photo_id, stage),
+    )
+
+
 def stage_counts(conn: sqlite3.Connection, stage: str) -> dict[str, int]:
     counts = dict.fromkeys(STATUSES, 0)
     for row in conn.execute(

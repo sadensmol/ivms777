@@ -19,14 +19,21 @@ from albums.memories_build import build_memories
 from albums.memory_store import current_signature, stored_signature
 from albums.registry import ORGANIZERS, get_organizer
 from chat.context import build_context as build_chat_context
-from chat.history import add_message, current_session, new_session, session_messages
+from chat.history import (
+    add_message,
+    cited_ids,
+    current_session,
+    new_session,
+    session_messages,
+)
 from chat.retrieve import is_photo_question, retrieve
 from config import Settings
 from inference.prompts import chat_messages
-from ingest.caption import backfill_captions, caption_handler
+from ingest.caption import backfill_caption_vectors, backfill_captions, caption_handler
+from ingest.folders import enqueue_folder_deletion, list_folders, process_folder_deletions
 from ingest.embed import backfill_embeds, embed_handler
 from ingest.facets import backfill_place_facets
-from ingest.jobs import STAGES, reprocess, stage_counts
+from ingest.jobs import STAGES, reprocess, reprocess_one, stage_counts
 from ingest.taxonomy import backfill_taxonomy, taxonomy_handler
 from ingest.thumbs import backfill_thumbnails, thumb_key
 from ingest.vocab import load_vocab, seed_tags
@@ -42,7 +49,7 @@ from search.facets import (
 from search.fusion import reciprocal_rank_fusion
 from search.keyword import keyword_search
 from search.planner import plan, spec_to_params
-from search.semantic import search_photos, similar_photos
+from search.semantic import search_photos, similar_photos, similarity_breakdown
 from search.tags import parse_tag_filters, tag_sidebar, tag_where
 from web.deps import AppContext, build_context
 from web.upload_api import register as register_upload_api
@@ -133,6 +140,11 @@ def create_app(settings: Settings) -> FastAPI:
         backfill_taxonomy(ctx.conn)
         backfill_place_facets(ctx.conn)
         backfill_captions(ctx.conn)
+        backfill_caption_vectors(ctx.conn, client, ctx.settings.caption_embed_model)
+        process_folder_deletions(
+            ctx.conn, ctx.originals, ctx.derived, ctx.settings.owner_id,
+            ctx.settings.thumb_grid_px, ctx.settings.thumb_detail_px,
+        )
         drain(
             ctx.conn,
             {
@@ -145,7 +157,7 @@ def create_app(settings: Settings) -> FastAPI:
                 "embed": embed_handler(ctx.originals, embedder, model_name),
                 "taxonomy": taxonomy_handler(ctx.derived, embedder, vocab),
                 "caption": caption_handler(
-                    ctx.derived, client, caption_model,
+                    ctx.derived, client, caption_model, ctx.settings.caption_embed_model,
                     list(vocab.dimensions), ctx.settings.thumb_detail_px,
                 ),
             },
@@ -338,6 +350,28 @@ def create_app(settings: Settings) -> FastAPI:
         reprocess(ctx.conn, ctx.settings.owner_id, stage, bound)
         return RedirectResponse("/upload", status_code=303)
 
+    # Model-derived stages a single photo can re-run from its own page. Thumbnails
+    # and embeddings are static (the bytes never change), so they are not offered.
+    _PHOTO_REPROCESS_STAGES = ("taxonomy", "caption")
+
+    @app.post("/photo/{photo_id}/reprocess")
+    def reprocess_photo(
+        photo_id: int, stage: str = Form(...), back: str = Form(""),
+    ) -> RedirectResponse:
+        # Re-run one model stage for THIS photo only (re-tag / re-caption). `back`
+        # carries the photo's collection query so the user lands back where they were.
+        ctx = context()
+        owned = ctx.conn.execute(
+            "SELECT 1 FROM photos WHERE id = ? AND owner_id = ?",
+            (photo_id, ctx.settings.owner_id),
+        ).fetchone()
+        if owned is None:
+            raise HTTPException(status_code=404)
+        if stage in _PHOTO_REPROCESS_STAGES:
+            reprocess_one(ctx.conn, photo_id, stage)
+        target = f"/photo/{photo_id}" + (f"?{back}" if back else "")
+        return RedirectResponse(target, status_code=303)
+
     @app.get("/organize", response_class=HTMLResponse)
     def organize(
         request: Request, by: str | None = None, grain: str | None = None
@@ -474,6 +508,25 @@ def create_app(settings: Settings) -> FastAPI:
                         return {"ids": album.photo_ids, "title": album.title,
                                 "description": album.description}
             # The album is gone (e.g. memories rebuilt) — fall back to the library.
+        if ctx_param and ctx_param.startswith("similar:"):
+            # Drilled into a photo FROM another photo's "similar" strip: this layer
+            # IS that origin photo's similar set, and it pages within it (§9, §13).
+            origin = _lookup_photo(ctx.conn, owner, ctx_param.split(":", 1)[1])
+            if origin is not None:
+                ids = [
+                    r["id"] for r in similar_photos(
+                        ctx.conn, owner, origin["id"], k=12,
+                        min_cosine=ctx.settings.similar_min_cosine,
+                        caption_min=ctx.settings.similar_caption_min,
+                        dimension_weights=vocab.dimension_weights,
+                    )
+                ]
+                label = origin["ai_title"] or origin["caption"] or f"photo #{origin['id']}"
+                return {
+                    "ids": ids, "title": f"Similar to {label}", "description": None,
+                    "origin_id": origin["id"],  # the photo this layer is similar to
+                }
+            # The origin is gone — fall back to the library.
         query = params.get("q", "").strip()
         return {
             "ids": _ordered_ids(params),
@@ -481,13 +534,25 @@ def create_app(settings: Settings) -> FastAPI:
             "description": None,
         }
 
+    def _lookup_photo(conn, owner_id: int, raw_id: str):
+        try:
+            return conn.execute(
+                "SELECT id, ai_title, caption FROM photos WHERE id = ? AND owner_id = ?",
+                (int(raw_id), owner_id),
+            ).fetchone()
+        except (ValueError, TypeError):
+            return None
+
     def _origin_url(ctx_param: str | None, params: dict[str, str]) -> str:
-        # The top-level grid a photo was opened from — where "close" returns to.
+        # The layer a photo was opened from — where "close" returns to.
         if ctx_param and ctx_param.startswith("album:"):
             parts = ctx_param.split(":", 3)
             if len(parts) == 4:
                 _, by, grain, _key = parts
                 return f"/organize?by={by}" + (f"&grain={grain}" if grain else "")
+        # A similar photo's grid is the library (a photo is always exactly one level
+        # below a grid — §13). The origin photo is reachable via its thumbnail in
+        # the header, but "close" goes UP to the grid, never sideways to a photo.
         library_query = _query_string(params)
         return "/library" + (f"?{library_query}" if library_query else "")
 
@@ -519,7 +584,12 @@ def create_app(settings: Settings) -> FastAPI:
             tags.setdefault(row["dimension"], []).append(
                 {"label": row["label"], "score": row["score"], "source": row["source"]}
             )
-        similar = similar_photos(ctx.conn, ctx.settings.owner_id, photo_id, k=12)
+        similar = similar_photos(
+            ctx.conn, ctx.settings.owner_id, photo_id, k=12,
+            min_cosine=ctx.settings.similar_min_cosine,
+            caption_min=ctx.settings.similar_caption_min,
+            dimension_weights=vocab.dimension_weights,
+        )
 
         # Page within the collection this photo was opened from (§13) — never leak
         # into another memory/album. `ctx` names the collection; ids are its order.
@@ -537,6 +607,15 @@ def create_app(settings: Settings) -> FastAPI:
         prev_id = ids[index - 1] if index > 0 else None
         next_id = ids[index + 1] if 0 <= index < len(ids) - 1 else None
 
+        # Opened from another photo's "similar" strip: explain the match, base vs
+        # this photo, strongest facet first (§13).
+        similarity = None
+        if collection.get("origin_id") and collection["origin_id"] != photo_id:
+            similarity = similarity_breakdown(
+                ctx.conn, ctx.settings.owner_id, collection["origin_id"], photo_id,
+                dimension_weights=vocab.dimension_weights,
+            )
+
         keep = {
             k: v for k, v in params.items()
             if k == "ctx" or k.startswith(("f_", "n_", "t_"))
@@ -548,6 +627,7 @@ def create_app(settings: Settings) -> FastAPI:
             {
                 "photo": photo, "sources": sources, "facets": facets,
                 "similar": similar, "wasted_bytes": wasted,
+                "similarity": similarity,
                 "embedded": photo["embedding_model"] is not None,
                 "tags": tags,
                 "prev_id": prev_id, "next_id": next_id,
@@ -570,9 +650,23 @@ def create_app(settings: Settings) -> FastAPI:
                 " WHERE j.status = 'failed' ORDER BY path LIMIT 50"
             )
         )
+        last = ctx.conn.execute(
+            "SELECT root_label FROM uploads WHERE owner_id = ? AND files_sent > 0"
+            " ORDER BY id DESC LIMIT 1",
+            (ctx.settings.owner_id,),
+        ).fetchone()
+        photo_count = ctx.conn.execute(
+            "SELECT COUNT(*) AS n FROM photos WHERE owner_id = ?", (ctx.settings.owner_id,)
+        ).fetchone()["n"]
         return {
             "stages": [(stage, stage_counts(ctx.conn, stage)) for stage in STAGES],
             "failures": failures,
+            # The folder currently in the library — persisted in `uploads`, so it
+            # survives restarts (the file picker cannot remember a selection).
+            "last_folder": last["root_label"] if last else None,
+            "photo_count": photo_count,
+            # The persistent folder list (§3.2c): every uploaded folder, deletable.
+            "folders": list_folders(ctx.conn, ctx.settings.owner_id),
         }
 
     OFF_TOPIC_REPLY = (
@@ -598,9 +692,11 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.get("/chat/stream")
     def chat_stream(q: str = "") -> StreamingResponse:
-        # Gate off-topic questions, else retrieve + ground + stream (§10). The
-        # retrieved ids go first so the client shows its evidence thumbnails
-        # before the answer streams in. The finished turn is persisted.
+        # Gate off-topic questions, else retrieve + ground + stream (§10).
+        # Retrieval gives the model candidates to reason over, but the UI and the
+        # stored turn show only the photos the answer actually CITES (§6) — never
+        # the loosely-related candidate set, which used to dump 30 thumbnails for
+        # a one-photo answer. The finished turn is persisted.
         ctx = context()
         owner_id = ctx.settings.owner_id
         embedder, _ = ctx.settings.build_embedder()
@@ -610,19 +706,18 @@ def create_app(settings: Settings) -> FastAPI:
 
         def events():
             if not is_photo_question(client, model, q):
-                yield f"event: sources\ndata: {json.dumps({'ids': []})}\n\n"
                 yield f"data: {json.dumps({'delta': OFF_TOPIC_REPLY})}\n\n"
                 add_message(ctx.conn, session_id, q, OFF_TOPIC_REPLY, [])
                 yield "event: done\ndata: {}\n\n"
                 return
             ids = retrieve(ctx.conn, embedder, owner_id, q, k=30)
             messages = chat_messages(q, build_chat_context(ctx.conn, ids))
-            yield f"event: sources\ndata: {json.dumps({'ids': ids})}\n\n"
             parts: list[str] = []
             for delta in client.stream(model, messages):
                 parts.append(delta)
                 yield f"data: {json.dumps({'delta': delta})}\n\n"
-            add_message(ctx.conn, session_id, q, "".join(parts), ids)
+            answer = "".join(parts)
+            add_message(ctx.conn, session_id, q, answer, cited_ids(answer))
             yield "event: done\ndata: {}\n\n"
 
         return StreamingResponse(events(), media_type="text/event-stream")
@@ -634,6 +729,14 @@ def create_app(settings: Settings) -> FastAPI:
     @app.get("/upload/progress", response_class=HTMLResponse)
     def progress(request: Request) -> HTMLResponse:
         return templates.TemplateResponse(request, "_progress.html", progress_payload())
+
+    @app.post("/upload/folder/delete")
+    def delete_folder(root_label: str = Form(...)) -> RedirectResponse:
+        # Remove a folder from the LIBRARY (never the source folder on disk, §3.2c):
+        # enqueue the deletion, the worker cascades it away. Returns to /upload.
+        ctx = context()
+        enqueue_folder_deletion(ctx.conn, ctx.settings.owner_id, root_label)
+        return RedirectResponse("/upload", status_code=303)
 
     return app
 
