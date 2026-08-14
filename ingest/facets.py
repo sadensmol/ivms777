@@ -3,13 +3,14 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from ingest.exif import ExifFacts
+from ingest.geocode import reverse, reverse_many
 
 FACET_KEYS: tuple[str, ...] = (
     "camera_make", "camera_model", "lens", "software",
     "iso", "aperture", "shutter_speed", "focal_length", "exposure_bias",
     "flash", "exposure_program", "metering_mode", "white_balance",
     "year", "month", "weekday", "hour", "time_of_day", "is_weekend",
-    "has_gps", "gps_lat", "gps_lon",
+    "has_gps", "gps_lat", "gps_lon", "place_city", "place_country",
     "megapixels", "orientation", "aspect",
 )
 
@@ -122,6 +123,11 @@ def derive_facets(facts: ExifFacts, width: int | None, height: int | None) -> li
     if has_gps:
         add_num("gps_lat", facts.gps_lat)
         add_num("gps_lon", facts.gps_lon)
+        # A real place name for filtering — coordinates stay technical (§11).
+        place = reverse(facts.gps_lat, facts.gps_lon)
+        if place is not None:
+            add_text("place_city", place.city)
+            add_text("place_country", place.country)
 
     orientation = raw.get("Orientation")
     if isinstance(orientation, int):
@@ -144,3 +150,29 @@ def store_facets(conn: sqlite3.Connection, photo_id: int, facets: list[Facet]) -
         "INSERT INTO photo_facets(photo_id, key, value_text, value_num) VALUES (?, ?, ?, ?)",
         [(photo_id, f.key, f.value_text, f.value_num) for f in facets],
     )
+
+
+def backfill_place_facets(conn: sqlite3.Connection) -> int:
+    """Add place_city/place_country facets to every GPS photo that lacks them.
+
+    Photos ingested before place facets existed carry GPS but no place name; this
+    geocodes them in one batch pass on the next drain. Idempotent — a photo that
+    already has a place_city facet is skipped.
+    """
+    rows = conn.execute(
+        "SELECT id, gps_lat, gps_lon FROM photos p"
+        " WHERE gps_lat IS NOT NULL AND gps_lon IS NOT NULL"
+        " AND NOT EXISTS (SELECT 1 FROM photo_facets f"
+        "                 WHERE f.photo_id = p.id AND f.key = 'place_city')"
+    ).fetchall()
+    if not rows:
+        return 0
+    places = reverse_many([(row["gps_lat"], row["gps_lon"]) for row in rows])
+    for row, place in zip(rows, places):
+        for key, value in (("place_city", place.city), ("place_country", place.country)):
+            if value:
+                conn.execute(
+                    "INSERT INTO photo_facets(photo_id, key, value_text) VALUES (?, ?, ?)",
+                    (row["id"], key, value),
+                )
+    return len(rows)

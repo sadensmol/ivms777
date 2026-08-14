@@ -66,3 +66,29 @@ def test_sort_by_facet_changes_order(client):
 def test_filters_survive_into_the_infinite_scroll_link(client):
     body = client.get("/library?f_camera_model=X-T5").text
     assert "f_camera_model=X-T5" in body or 'class="tile"' in body
+
+
+def test_place_filter_narrows_by_city(client):
+    from ingest.facets import backfill_place_facets
+    from tests.factories import add_photo
+
+    conn = client.app.state.context.conn
+    add_photo(conn, photo_id=10, content_hash="rome", thumb_key="r.jpg",
+              gps_lat=41.9028, gps_lon=12.4964)  # Rome
+    add_photo(conn, photo_id=11, content_hash="kyiv", thumb_key="k.jpg",
+              gps_lat=50.4501, gps_lon=30.5234)  # Kyiv
+    backfill_place_facets(conn)
+
+    body = client.get("/library").text
+    assert "Place" in body and "Rome" in body           # sidebar place group
+    assert client.get("/library?f_place_city=Rome").text.count('class="tile"') == 1
+
+
+def test_filters_apply_in_place_without_reloading_the_sidebar(client):
+    body = client.get("/library").text
+    # the filter form swaps only #grid via htmx, so the sidebar (and its scroll)
+    # is never re-rendered on a filter change; a clear-all resets everything.
+    assert 'id="grid"' in body
+    assert 'hx-target="#grid"' in body
+    assert 'hx-select="#grid"' in body
+    assert "Clear all" in body

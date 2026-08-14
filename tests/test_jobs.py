@@ -4,9 +4,40 @@ from ingest.jobs import (
     complete,
     enqueue,
     fail,
+    reprocess,
     stage_counts,
 )
 from tests.factories import add_photo
+
+
+def test_reprocess_resets_the_stage_and_everything_downstream(conn):
+    add_photo(conn, photo_id=1, content_hash="a", thumb_key="1.jpg")
+    for stage in ("embed", "taxonomy"):
+        enqueue(conn, 1, stage)
+        complete(conn, 1, stage)
+    assert reprocess(conn, owner_id=1, from_stage="embed") == 1
+    assert stage_counts(conn, "embed")["pending"] == 1
+    assert stage_counts(conn, "taxonomy")["pending"] == 1  # downstream reset too
+
+
+def test_reprocess_taxonomy_leaves_embed_alone(conn):
+    add_photo(conn, photo_id=1, content_hash="a", thumb_key="1.jpg")
+    enqueue(conn, 1, "embed")
+    complete(conn, 1, "embed")
+    reprocess(conn, owner_id=1, from_stage="taxonomy")
+    assert stage_counts(conn, "embed")["done"] == 1        # upstream untouched
+    assert stage_counts(conn, "taxonomy")["pending"] == 1  # created and pending
+
+
+def test_reprocess_is_owner_scoped(conn):
+    add_photo(conn, photo_id=1, owner_id=1, content_hash="a", thumb_key="1.jpg")
+    add_photo(conn, photo_id=2, owner_id=2, content_hash="b", thumb_key="2.jpg")
+    enqueue(conn, 2, "taxonomy")
+    complete(conn, 2, "taxonomy")
+    reprocess(conn, owner_id=1, from_stage="taxonomy")
+    counts = stage_counts(conn, "taxonomy")
+    assert counts["done"] == 1     # owner 2 untouched
+    assert counts["pending"] == 1  # owner 1's reset job
 
 
 def insert_photo(conn, digest="h1"):

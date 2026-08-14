@@ -15,6 +15,10 @@ class SiglipEmbedder:
         self.device = device
         self.model = AutoModel.from_pretrained(_HF_ID).to(device).eval()
         self.processor = AutoProcessor.from_pretrained(_HF_ID)
+        # SigLIP's learned zero-shot calibration (see embedding.vectors); read from
+        # the model so it is always exact for this checkpoint.
+        self.logit_scale = float(self.model.logit_scale.exp().item())
+        self.logit_bias = float(self.model.logit_bias.item())
 
     @torch.no_grad()
     def embed_images(self, images: list[Image.Image]) -> list[list[float]]:

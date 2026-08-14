@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS photos (
   thumb_key       TEXT,
   caption         TEXT,
   caption_model   TEXT,
+  ai_title        TEXT,               -- AI-written short title (caption stage)
+  ai_description  TEXT,               -- AI-written description (caption stage)
   embedding_model TEXT,
   exif_json       TEXT,
   created_at      TEXT NOT NULL,

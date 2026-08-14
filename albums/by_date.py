@@ -3,10 +3,14 @@ from datetime import datetime
 
 from albums.base import Album
 
-# A gap longer than this between consecutive shots starts a new event. Six hours
-# separates "morning at the beach" from "dinner that night" without splitting a
-# single afternoon into fragments.
-EVENT_GAP_HOURS = 6.0
+# The "By date" grains: one axis (the calendar) at three zooms. `month` is the
+# default — the most useful bucket for browsing a phone dump. Order here is the
+# sub-selector order. There is deliberately no "events" grain: time-gap
+# clustering is a different principle, used only for Memories seeding (see
+# docs/design.md §11), never a zoom level of the calendar.
+GRAIN_LABELS = [("day", "Day"), ("month", "Month"), ("year", "Year")]
+GRAINS = tuple(value for value, _ in GRAIN_LABELS)
+DEFAULT_GRAIN = "month"
 
 
 def _parse(shot_at: str) -> datetime | None:
@@ -16,19 +20,30 @@ def _parse(shot_at: str) -> datetime | None:
         return None
 
 
-def _format_range(start: datetime, end: datetime) -> str:
-    if start.date() == end.date():
-        return start.strftime("%-d %b %Y")
-    if (start.year, start.month) == (end.year, end.month):
-        return f"{start.strftime('%-d')}–{end.strftime('%-d %b %Y')}"
-    return f"{start.strftime('%-d %b')} – {end.strftime('%-d %b %Y')}"
+def _bucket(dt: datetime, grain: str) -> tuple[str, str, object]:
+    """Return (url-safe key, display title, sort key) for a calendar grain."""
+    if grain == "day":
+        return f"day-{dt.date().isoformat()}", dt.strftime("%-d %b %Y"), dt.date()
+    if grain == "year":
+        return f"year-{dt.year}", str(dt.year), dt.year
+    return f"month-{dt.year:04d}-{dt.month:02d}", dt.strftime("%B %Y"), (dt.year, dt.month)
+
+
+def _describe(count: int, cameras: list[str | None]) -> str:
+    desc = f"{count} photo{'s' if count != 1 else ''}"
+    camera = _dominant(cameras)
+    return desc + (f", mostly {camera}." if camera else ".")
 
 
 class ByDateOrganizer:
     name = "date"
-    label = "By date (events)"
+    label = "By date"
+    grains = GRAINS
 
-    def organize(self, conn: sqlite3.Connection, owner_id: int) -> list[Album]:
+    def organize(
+        self, conn: sqlite3.Connection, owner_id: int, grain: str | None = None
+    ) -> list[Album]:
+        grain = grain if grain in GRAINS else DEFAULT_GRAIN
         rows = conn.execute(
             "SELECT id, shot_at, camera FROM photos"
             " WHERE owner_id = ? AND thumb_key IS NOT NULL AND shot_at IS NOT NULL"
@@ -36,40 +51,30 @@ class ByDateOrganizer:
             (owner_id,),
         ).fetchall()
 
-        events: list[list[sqlite3.Row]] = []
-        last: datetime | None = None
+        buckets: dict[str, dict] = {}
         for row in rows:
             when = _parse(row["shot_at"])
             if when is None:
                 continue
-            if last is None or (when - last).total_seconds() > EVENT_GAP_HOURS * 3600:
-                events.append([])
-            events[-1].append(row)
-            last = when
-
-        albums: list[Album] = []
-        for index, group in enumerate(events):
-            times = [_parse(r["shot_at"]) for r in group]
-            times = [t for t in times if t is not None]
-            start, end = times[0], times[-1]
-            cameras = _dominant([r["camera"] for r in group])
-            span_days = (end.date() - start.date()).days + 1
-            desc = f"{len(group)} photos over {span_days} day{'s' if span_days > 1 else ''}"
-            if cameras:
-                desc += f", mostly {cameras}"
-            desc += "."
-            albums.append(
-                Album(
-                    key=f"event-{index}",
-                    title=_format_range(start, end),
-                    description=desc,
-                    photo_ids=[r["id"] for r in group],
-                    cover_id=group[0]["id"],
-                    meta={"kind": "date"},
-                )
+            key, title, sort = _bucket(when, grain)
+            bucket = buckets.setdefault(
+                key, {"title": title, "sort": sort, "ids": [], "cameras": []}
             )
-        albums.sort(key=lambda a: a.photo_ids[0], reverse=True)
-        return albums
+            bucket["ids"].append(row["id"])
+            bucket["cameras"].append(row["camera"])
+
+        ordered = sorted(buckets.items(), key=lambda kv: kv[1]["sort"], reverse=True)
+        return [
+            Album(
+                key=key,
+                title=bucket["title"],
+                description=_describe(len(bucket["ids"]), bucket["cameras"]),
+                photo_ids=bucket["ids"],
+                cover_id=bucket["ids"][0],
+                meta={"kind": "date", "grain": grain},
+            )
+            for key, bucket in ordered
+        ]
 
 
 def _dominant(values: list[str | None]) -> str | None:

@@ -11,7 +11,7 @@ COPY pyproject.toml uv.lock* README.md ./
 RUN uv sync --no-dev --frozen --no-install-project || uv sync --no-dev --no-install-project
 
 # Flat layout: each top-level package lives at the repo root.
-COPY config.py ./
+COPY config.py vocab.yaml ./
 COPY albums ./albums
 COPY db ./db
 COPY embedding ./embedding

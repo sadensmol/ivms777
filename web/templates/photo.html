@@ -2,11 +2,26 @@
 {% block content %}
 <div class="photo-view">
   <div class="photo-stage">
-    <a class="photo-close" href="/library" title="Back to library">✕</a>
+    {# Back returns to the EXACT library view (filters + scroll) via history when
+       we came from it; /library is only a deep-link fallback. #}
+    <a class="photo-close" href="/library" title="Back"
+       onclick="if(history.length>1){history.back();return false;}">✕</a>
+    {# Paging replaces the history entry so it never buries the library — "close"
+       still lands back on the list. #}
+    {% if prev_id %}<a class="photo-nav prev" href="/photo/{{ prev_id }}" title="Newer (←)"
+       onclick="location.replace(this.href);return false;">‹</a>{% endif %}
     <img class="photo-full" src="/thumb/{{ photo['id'] }}?size=detail" alt="">
+    {% if next_id %}<a class="photo-nav next" href="/photo/{{ next_id }}" title="Older (→)"
+       onclick="location.replace(this.href);return false;">›</a>{% endif %}
   </div>
   <aside class="photo-panel">
-    {% if photo['caption'] %}<p class="photo-caption">{{ photo['caption'] }}</p>{% endif %}
+    {% if photo['ai_title'] %}<h2 class="photo-title">{{ photo['ai_title'] }}</h2>{% endif %}
+    {% if photo['ai_description'] %}<p class="photo-desc">{{ photo['ai_description'] }}</p>{% endif %}
+    {% if photo['caption'] %}
+      <p class="photo-caption">{{ photo['caption'] }}
+        {% if photo['caption_model'] %}<span class="muted">— {{ photo['caption_model'] }}</span>{% endif %}
+      </p>
+    {% endif %}
 
     <h3>AI</h3>
     {% if embedded %}
@@ -14,7 +29,20 @@
     {% else %}
       <p>Not yet embedded — it will appear in search once the embed stage runs.</p>
     {% endif %}
-    {# Tags grouped by dimension land here in plan 04. #}
+
+    {% if tags %}
+      {% for dimension, items in tags.items() %}
+        <div class="tag-dim">{{ dimension.replace('_', ' ') }}</div>
+        <div class="tag-row">
+          {% for t in items %}
+            <span class="tag">{{ t['label'] }}
+              <span class="tag-score">{{ '%.2f'|format(t['score']) }}</span>
+              <span class="tag-source">{{ t['source'] }}</span>
+            </span>
+          {% endfor %}
+        </div>
+      {% endfor %}
+    {% endif %}
 
     <h3>Files on disk{% if sources|length > 1 %} — {{ sources|length }} copies{% endif %}</h3>
     {% if wasted_bytes %}
@@ -39,4 +67,17 @@
   {% endfor %}
 </div>
 {% endif %}
+<script>
+  // Desktop keyboard paging: ← newer, → older. Mirrors the ‹/› buttons.
+  (function () {
+    var prev = {{ prev_id or 'null' }}, next = {{ next_id or 'null' }};
+    document.addEventListener("keydown", function (e) {
+      // replace (not push) so "close" always returns to the library, not the
+      // chain of photos paged through.
+      if (e.key === "ArrowLeft" && prev) { location.replace("/photo/" + prev); }
+      else if (e.key === "ArrowRight" && next) { location.replace("/photo/" + next); }
+      else if (e.key === "Escape" && history.length > 1) { history.back(); }
+    });
+  })();
+</script>
 {% endblock %}

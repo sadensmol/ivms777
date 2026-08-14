@@ -49,3 +49,16 @@ def test_unreadable_source_raises(tmp_path):
     broken.write_bytes(b"not an image")
     with pytest.raises(OSError):
         make_thumbnails(broken, "hash3", LocalStorage(tmp_path / "thumbs"), 320, 1600)
+
+
+def test_backfill_thumbnails_enqueues_only_for_photos_without_one(conn):
+    from ingest.jobs import stage_counts
+    from ingest.thumbs import backfill_thumbnails
+    from tests.factories import add_photo
+
+    add_photo(conn, photo_id=1, content_hash="a")                  # no thumb_key -> needs one
+    add_photo(conn, photo_id=2, content_hash="b", thumb_key="2.jpg")  # already has one
+    assert backfill_thumbnails(conn) == 1
+    assert stage_counts(conn, "thumbnail")["pending"] == 1
+    backfill_thumbnails(conn)  # idempotent — no duplicate job
+    assert stage_counts(conn, "thumbnail")["pending"] == 1

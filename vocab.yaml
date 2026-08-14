@@ -1,0 +1,25 @@
+# Editable taxonomy vocabulary — ten dimensions (docs/design.md §7).
+# Add or remove labels here; re-scoring a changed dimension only re-runs the
+# cheap SigLIP taxonomy stage (use "Re-tag all" on /upload after editing).
+#
+# Thresholds are per-dimension floors on the SigLIP zero-shot PROBABILITY
+# (sigmoid(cosine·logit_scale + logit_bias)), 0..1 — not the raw cosine. Raise a
+# value to keep only confident tags, lower it to surface more. Tuned properly
+# against a hand-labeled dev set later; 0.2 is a permissive starting point that
+# actually populates the sidebar.
+default_threshold: 0.2
+thresholds:
+  # palette/quality also come from pixel stats; keep SigLIP's own picks confident.
+  palette: 0.35
+  quality: 0.35
+dimensions:
+  subject: [portrait, group of people, pet, food, architecture, nature, vehicle, document, artwork]
+  setting: [indoor, outdoor, beach, mountain, forest, city street, restaurant, home, office, water, snow]
+  vibe: [cozy, energetic, serene, moody, festive, nostalgic, dramatic, minimal, chaotic, romantic]
+  emotion: [joyful, sad, tense, affectionate, playful, contemplative, neutral]
+  light: [golden hour, blue hour, night, harsh midday, overcast, backlit, neon, candlelit]
+  season_weather: [summer, autumn, winter, spring, rain, snow, fog, clear sky]
+  composition: [close-up, wide shot, aerial, shallow depth of field, symmetry, silhouette, leading lines]
+  palette: [warm, cool, pastel, vivid, monochrome, dark, bright, high contrast]
+  occasion: [birthday, wedding, travel, hike, concert, holiday, everyday, work]
+  quality: [sharp, blurry, noisy, overexposed, underexposed]

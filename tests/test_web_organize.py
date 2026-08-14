@@ -22,15 +22,26 @@ def test_organize_tab_is_in_the_nav(client):
     assert 'href="/organize"' in client.get("/library").text
 
 
-def test_organize_offers_all_four_types_in_the_dropdown(client):
+def test_organize_offers_the_live_types_in_the_dropdown(client):
     body = client.get("/organize").text
-    for label in ("By date", "By similarity", "By camera", "By place"):
+    for label in ("By date", "By camera", "By place"):
         assert label in body
+    assert "By similarity" not in body  # replaced by Memories (phase 5)
 
 
-def test_default_organization_is_by_date_with_a_described_album(client):
+def test_date_shows_a_grain_selector(client):
+    assert 'name="grain"' in client.get("/organize?by=date").text
+
+
+def test_date_grain_year_titles_albums_by_year(client):
+    # both fixture photos are on 2025-07-12: events -> "12 Jul 2025", year -> "2025"
+    body = client.get("/organize?by=date&grain=year").text
+    assert "<h2>2025</h2>" in body
+
+
+def test_default_organization_is_by_date_month_with_a_described_album(client):
     body = client.get("/organize").text
-    assert "12 Jul 2025" in body
+    assert "July 2025" in body  # month grain is the default
     assert "2 photos" in body  # the album description
 
 

@@ -1,8 +1,16 @@
 <aside class="sidebar">
-  <form method="get" action="/library">
+  {# Filters update only #grid via htmx, so the sidebar (and its scroll position)
+     is never re-rendered when a filter is toggled. hx-select pulls #grid out of
+     the full /library response; hx-push-url keeps the address bar shareable. #}
+  <form method="get" action="/library"
+        hx-get="/library" hx-trigger="change"
+        hx-target="#grid" hx-select="#grid" hx-swap="outerHTML"
+        hx-push-url="true">
+    <a class="clear-all" href="/library">Clear all filters</a>
+
     <label class="sort-row">
       Sort
-      <select name="sort" onchange="this.form.submit()">
+      <select name="sort">
         <option value="">Date taken</option>
         <option value="year_asc" {% if active.get('sort') == 'year_asc' %}selected{% endif %}>Year, oldest first</option>
         <option value="year_desc" {% if active.get('sort') == 'year_desc' %}selected{% endif %}>Year, newest first</option>
@@ -27,11 +35,24 @@
       {% endfor %}
     {% endfor %}
 
+    {% if tag_sidebar %}
+      <h3>Tags</h3>
+      {% for group in tag_sidebar %}
+        <div class="facet-key">{{ group['dimension'].replace('_', ' ') }}</div>
+        {% for value in group['values'] %}
+          <label class="facet-row">
+            <input type="checkbox" name="t_{{ group['dimension'] }}" value="{{ value['label'] }}"
+                   {% if value['label'] in (active.get('t_' ~ group['dimension'], '')).split(',') %}checked{% endif %}>
+            <span>{{ value['label'] }}</span><span class="facet-count">{{ value['count'] }}</span>
+          </label>
+        {% endfor %}
+      {% endfor %}
+    {% endif %}
+
     <h3>Ranges</h3>
     <label class="facet-row">ISO <input type="text" name="n_iso" placeholder="200:6400" value="{{ active.get('n_iso', '') }}"></label>
     <label class="facet-row">Year <input type="text" name="n_year" placeholder="2020:2025" value="{{ active.get('n_year', '') }}"></label>
 
-    <button type="submit">Apply</button>
-    <a href="/library">Clear</a>
+    <noscript><button type="submit">Apply</button></noscript>
   </form>
 </aside>

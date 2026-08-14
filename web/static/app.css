@@ -51,6 +51,10 @@ h1 { margin: 0 0 1rem; }
 .facet-row span:first-of-type { flex: 1; }
 .facet-count { color: #888; }
 .sort-row select { width: 100%; margin-top: 4px; }
+.clear-all { display: block; text-align: center; margin-bottom: 10px; padding: 6px 10px;
+  background: #262626; border: 1px solid #3a3a3a; border-radius: 8px;
+  color: #8ab4f8; text-decoration: none; font-size: 12px; }
+.clear-all:hover { background: #2f2f2f; }
 
 /* ---- Progress (upload) ---- */
 .upload-shell { max-width: 900px; }
@@ -89,10 +93,25 @@ h1 { margin: 0 0 1rem; }
 .photo-close { position: absolute; top: 0.6rem; right: 0.85rem; font-size: 1.5rem;
   color: #fff; text-decoration: none; background: rgba(0,0,0,0.4); border-radius: 50%;
   width: 2rem; height: 2rem; display: flex; align-items: center; justify-content: center; }
+.photo-nav { position: absolute; top: 50%; transform: translateY(-50%); z-index: 2;
+  color: #fff; text-decoration: none; font-size: 2rem; line-height: 1;
+  background: rgba(0,0,0,0.4); border-radius: 50%; width: 2.6rem; height: 2.6rem;
+  display: flex; align-items: center; justify-content: center; opacity: 0.7; }
+.photo-nav:hover { opacity: 1; }
+.photo-nav.prev { left: 0.75rem; }
+.photo-nav.next { right: 0.75rem; }
 .photo-panel { flex: 0 0 30%; overflow-y: auto; padding-right: 0.5rem; }
+.tag-dim { margin: 10px 0 4px; font-size: 11px; text-transform: uppercase; color: #888; }
+.tag-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.tag { display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px;
+  background: #1e1e1e; border: 1px solid #333; border-radius: 999px; font-size: 12px; }
+.tag-score { color: #9a9; font-variant-numeric: tabular-nums; }
+.tag-source { color: #777; font-size: 10px; text-transform: uppercase; }
 .photo-panel h3 { margin: 18px 0 6px; font-size: 12px; text-transform: uppercase; color: #999;
   letter-spacing: 0.04em; }
-.photo-caption { font-size: 16px; }
+.photo-title { font-size: 20px; margin: 0 0 4px; }
+.photo-desc { font-size: 14px; color: #ccc; margin: 0 0 8px; }
+.photo-caption { font-size: 15px; color: #aaa; }
 .photo-panel ul { margin: 0; padding-left: 1.1rem; font-size: 13px; word-break: break-all; }
 .wasted { color: #ffd479; font-size: 13px; }
 .exif { width: 100%; font-size: 12px; border-collapse: collapse; }

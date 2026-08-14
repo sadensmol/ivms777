@@ -1,10 +1,34 @@
 from ingest.exif import ExifFacts
-from ingest.facets import derive_facets, store_facets
+from ingest.facets import backfill_place_facets, derive_facets, store_facets
 from tests.factories import add_photo
 
 
 def facet_map(facets):
     return {f.key: (f.value_text, f.value_num) for f in facets}
+
+
+def test_gps_yields_place_name_facets():
+    facts = ExifFacts(gps_lat=41.9028, gps_lon=12.4964)  # Rome
+    m = facet_map(derive_facets(facts, None, None))
+    assert m["place_city"] == ("Rome", None)
+    assert m["place_country"] == ("Italy", None)
+
+
+def test_no_place_facets_without_gps():
+    m = facet_map(derive_facets(ExifFacts(shot_at="2025-07-12T20:30:00"), None, None))
+    assert "place_city" not in m
+
+
+def test_backfill_place_facets_names_existing_gps_photos(conn):
+    add_photo(conn, photo_id=1, content_hash="a", thumb_key="1.jpg",
+              gps_lat=41.9028, gps_lon=12.4964)  # Rome
+    add_photo(conn, photo_id=2, content_hash="b", thumb_key="2.jpg")  # no GPS -> skipped
+    assert backfill_place_facets(conn) == 1
+    city = conn.execute(
+        "SELECT value_text FROM photo_facets WHERE photo_id = 1 AND key = 'place_city'"
+    ).fetchone()
+    assert city["value_text"] == "Rome"
+    assert backfill_place_facets(conn) == 0  # idempotent
 
 
 def test_time_facets_come_from_shot_at():

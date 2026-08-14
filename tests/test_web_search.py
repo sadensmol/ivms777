@@ -29,6 +29,17 @@ def test_search_returns_the_matching_photo_first(client):
     assert body.index("/thumb/1") < body.index("/thumb/2")
 
 
+def test_keyword_match_surfaces_via_fusion(client):
+    # A caption-only match (no close vector) still appears, proving keyword feeds fusion.
+    conn = client.app.state.context.conn
+    pid = add_photo(conn, content_hash="zz" * 32, thumb_key="zz.jpg", caption="Zermatt ski trip")
+    write_vector(conn, pid, FakeEmbedder().embed_texts(["unrelated subject"])[0])
+    conn.execute(
+        "INSERT INTO photo_fts(rowid, caption, tags_text) VALUES (?, 'Zermatt ski trip', '')", (pid,)
+    )
+    assert f"/thumb/{pid}" in client.get("/library?q=Zermatt").text
+
+
 def test_duplicates_toggle_is_offered(client):
     assert "dupes=1" in client.get("/library").text
 

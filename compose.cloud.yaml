@@ -18,14 +18,30 @@ services:
     ports:
       - "8001:8000"
 
+  # SigLIP runs in-process in app and worker with embed_device=cuda, so both need
+  # a GPU reservation — not just the vLLM inference container.
   app:
     environment:
       IVMS777_PROFILE: cloud
     depends_on: [inference]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
   worker:
     environment:
       IVMS777_PROFILE: cloud
     depends_on: [inference]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
 
 volumes:
   hf-cache:

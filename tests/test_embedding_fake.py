@@ -4,7 +4,23 @@ from PIL import Image
 
 from embedding.base import EMBED_DIM
 from embedding.fakes import FakeEmbedder
-from embedding.vectors import from_blob, l2_normalize, to_blob
+from embedding.vectors import from_blob, l2_normalize, siglip_probability, to_blob
+
+
+def test_siglip_probability_separates_strong_from_weak_cosines():
+    # SigLIP's learned scale/bias turn a small cosine into a real probability;
+    # a strong match reads high, a near-orthogonal pair reads ~0.
+    strong = siglip_probability(1.0, logit_scale=10.0, logit_bias=-5.0)
+    weak = siglip_probability(0.0, logit_scale=10.0, logit_bias=-5.0)
+    assert strong > 0.9
+    assert weak < 0.1
+    assert 0.0 <= weak < strong <= 1.0
+
+
+def test_fake_embedder_exposes_calibration():
+    fake = FakeEmbedder()
+    assert fake.logit_scale > 0
+    assert fake.logit_bias < 0
 
 
 def test_blob_round_trips_as_float32():

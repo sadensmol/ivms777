@@ -7,7 +7,9 @@ class ByCameraOrganizer:
     name = "camera"
     label = "By camera / device"
 
-    def organize(self, conn: sqlite3.Connection, owner_id: int) -> list[Album]:
+    def organize(
+        self, conn: sqlite3.Connection, owner_id: int, grain: str | None = None
+    ) -> list[Album]:
         rows = conn.execute(
             "SELECT id, camera FROM photos"
             " WHERE owner_id = ? AND thumb_key IS NOT NULL"

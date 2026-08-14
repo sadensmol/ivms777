@@ -17,6 +17,8 @@ dependencies = [
     "torch>=2.13.0",
     "transformers>=5.15.0",
     "numpy>=2.5.2",
+    "reverse-geocoder>=1.5.1",
+    "pycountry>=26.2.16",
 ]
 
 [dependency-groups]

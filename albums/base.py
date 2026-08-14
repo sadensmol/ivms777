@@ -28,6 +28,11 @@ class Organizer(Protocol):
     """Turns a library into albums by one organizing principle."""
 
     name: str      # url value, e.g. "date"
-    label: str     # dropdown label, e.g. "By date (events)"
+    label: str     # dropdown label, e.g. "By date"
 
-    def organize(self, conn: sqlite3.Connection, owner_id: int) -> list[Album]: ...
+    def organize(
+        self, conn: sqlite3.Connection, owner_id: int, grain: str | None = None
+    ) -> list[Album]:
+        """Group the library into albums. `grain` is an organizer-specific
+        sub-option (only ByDateOrganizer uses it); others ignore it."""
+        ...

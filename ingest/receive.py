@@ -158,6 +158,8 @@ def receive(
     added = _add_source(conn, photo_id, upload_id, rel_path, mtime)
     enqueue(conn, photo_id, "thumbnail")
     enqueue(conn, photo_id, "embed")
+    enqueue(conn, photo_id, "taxonomy")
+    enqueue(conn, photo_id, "caption")
     return ReceiveResult(
         photo_id=photo_id, content_hash=digest, created=True, source_added=added
     )

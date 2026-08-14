@@ -63,6 +63,77 @@ def test_unknown_photo_is_404(client):
     assert client.get("/photo/99999").status_code == 404
 
 
+def _dated(conn, pid, shot_at):
+    add_photo(conn, photo_id=pid, content_hash=f"n{pid}", thumb_key=f"{pid}.jpg", shot_at=shot_at)
+
+
+def test_photo_page_links_to_newer_and_older_neighbors(client):
+    conn = client.app.state.context.conn
+    # Dates in 2030 keep these three contiguous, clear of the fixture photo.
+    _dated(conn, 101, "2030-01-01T00:00:00")  # older
+    _dated(conn, 102, "2030-06-01T00:00:00")  # this one
+    _dated(conn, 103, "2030-12-01T00:00:00")  # newer
+    body = client.get("/photo/102").text
+    assert 'class="photo-nav prev" href="/photo/103"' in body  # ‹ newer
+    assert 'class="photo-nav next" href="/photo/101"' in body  # › older
+
+
+def test_photo_page_omits_the_newer_arrow_at_the_newest(client):
+    conn = client.app.state.context.conn
+    _dated(conn, 301, "2099-01-01T00:00:00")  # newest in the whole library
+    body = client.get("/photo/301").text
+    assert "photo-nav prev" not in body   # nothing newer
+    assert "photo-nav next" in body       # something older exists
+
+
+def test_close_and_paging_preserve_the_library_view(client):
+    body = client.get(f"/photo/{_first_id(client)}").text
+    assert "history.back()" in body    # close returns to the exact filtered/scrolled library
+    assert "location.replace" in body  # paging replaces history so close still lands on the list
+
+
+def test_arrow_key_navigation_script_carries_the_neighbor_ids(client):
+    conn = client.app.state.context.conn
+    _dated(conn, 401, "2025-03-01T00:00:00")
+    _dated(conn, 402, "2025-04-01T00:00:00")
+    _dated(conn, 403, "2025-05-01T00:00:00")
+    body = client.get("/photo/402").text
+    assert "ArrowLeft" in body and "ArrowRight" in body
+    assert "var prev = 403, next = 401" in body  # ← newer, → older
+
+
+def test_photo_page_shows_ai_title_description_and_caption(client):
+    conn = client.app.state.context.conn
+    base = _first_id(client)
+    conn.execute(
+        "UPDATE photos SET caption = ?, caption_model = ?, ai_title = ?, ai_description = ?"
+        " WHERE id = ?",
+        ("a dog on a beach", "fake-vlm", "Beach day", "A dog runs on the sand.", base),
+    )
+    body = client.get(f"/photo/{base}").text
+    assert "Beach day" in body                # ai_title
+    assert "A dog runs on the sand." in body  # ai_description
+    assert "a dog on a beach" in body         # caption
+    assert "fake-vlm" in body                 # caption model
+
+
+def test_photo_page_shows_model_tags_grouped_by_dimension(client):
+    conn = client.app.state.context.conn
+    base = _first_id(client)
+    # tags are seeded at app startup; attach one to this photo
+    tag_id = conn.execute(
+        "SELECT id FROM tags WHERE dimension = 'setting' AND label = 'beach'"
+    ).fetchone()["id"]
+    conn.execute(
+        "INSERT INTO photo_tags(photo_id, tag_id, score, source) VALUES (?, ?, 0.87, 'siglip')",
+        (base, tag_id),
+    )
+    body = client.get(f"/photo/{base}").text
+    assert "beach" in body
+    assert "setting" in body
+    assert "siglip" in body  # the source badge
+
+
 def test_similar_strip_lists_other_photos(client):
     ctx = client.app.state.context
     fake = FakeEmbedder()

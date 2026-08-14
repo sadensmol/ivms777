@@ -4,14 +4,19 @@
 # containerised model would silently fall back to CPU and run several times
 # slower. Ollama therefore runs natively on the host and the containers reach
 # it through host.docker.internal.
+# Build/run natively on Apple Silicon (arm64). The Linux arm64 torch wheel is
+# CPU-only, so SigLIP runs on CPU (§4) without pulling ~2 GB of unused NVIDIA CUDA
+# libraries the amd64 wheel would drag in — and native arm64 avoids emulation.
 services:
   app:
+    platform: linux/arm64
     environment:
       IVMS777_PROFILE: mac
       IVMS777_INFERENCE_BASE_URL: http://host.docker.internal:11434/v1
     extra_hosts:
       - "host.docker.internal:host-gateway"
   worker:
+    platform: linux/arm64
     environment:
       IVMS777_PROFILE: mac
       IVMS777_INFERENCE_BASE_URL: http://host.docker.internal:11434/v1

@@ -66,6 +66,36 @@ def fail(conn: sqlite3.Connection, photo_id: int, stage: str, error: str) -> Non
     )
 
 
+def reprocess(conn: sqlite3.Connection, owner_id: int, from_stage: str) -> int:
+    """Reset `from_stage` and every later stage to 'pending' for the owner's photos.
+
+    Downstream stages are reset too because their output depends on the one being
+    rerun (re-embedding changes the vectors the taxonomy reads). Handlers are
+    idempotent, so the worker simply re-runs them on its next drain. Returns the
+    number of photos queued.
+    """
+    if from_stage not in STAGES:
+        raise ValueError(f"unknown stage: {from_stage}")
+    stages = STAGES[STAGES.index(from_stage):]
+    photo_ids = [
+        row["id"] for row in conn.execute(
+            "SELECT id FROM photos WHERE owner_id = ?", (owner_id,)
+        )
+    ]
+    for photo_id in photo_ids:
+        for stage in stages:
+            enqueue(conn, photo_id, stage)  # create a job row where one is missing
+    if photo_ids:
+        placeholders = ", ".join("?" for _ in photo_ids)
+        for stage in stages:
+            conn.execute(
+                "UPDATE jobs SET status = 'pending', attempts = 0, error = NULL, updated_at = ?"
+                f" WHERE stage = ? AND photo_id IN ({placeholders})",
+                (_now(), stage, *photo_ids),
+            )
+    return len(photo_ids)
+
+
 def stage_counts(conn: sqlite3.Connection, stage: str) -> dict[str, int]:
     counts = dict.fromkeys(STATUSES, 0)
     for row in conn.execute(

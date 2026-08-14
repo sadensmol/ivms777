@@ -21,6 +21,12 @@
 
 {% include "_progress.html" %}
 
+<form method="post" action="/reprocess" class="reprocess">
+  <p class="hint">Reprocess the photos already uploaded — no re-upload needed. Re-runs
+    the whole pipeline: thumbnails, embeddings, tags, and captions.</p>
+  <button type="submit" name="from_stage" value="thumbnail">Reprocess all photos</button>
+</form>
+
 </div>
 <script src="/static/upload.js" defer></script>
 {% endblock %}

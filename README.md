@@ -7,22 +7,46 @@ See `docs/design.md` for the design and `docs/plans/` for implementation plans.
 
 ## Run on a Mac
 
-Docker Desktop on macOS cannot reach the Apple GPU, so Ollama runs natively on
-the host. Everything else — app, worker, database — runs in containers.
-
 ```bash
-brew install ollama
-ollama serve &
-ollama pull gemma4:26b-a4b
-ollama pull gemma4:e4b
-
-docker compose -f compose.yaml -f compose.mac.yaml up --build -d
+make up          # everything: Ollama + models on the host, then the stack → http://localhost:8000
+make worker-logs # watch embedding / tagging / captioning progress
+make down        # stop the stack
+make help        # all targets (restart, dev, clean, …)
 ```
+
+`make up` does it all in one command: it makes sure **Ollama is running on the
+host** with the caption + planner models (Docker Desktop on macOS has no GPU
+passthrough, so the LLMs run natively for Metal), then builds and starts the
+containerised app, worker, and database. SigLIP runs on CPU inside the container.
+
+The **first** `make up` pulls the vision model (~6 GB) once — later runs are fast.
+It needs Ollama installed (`brew install ollama`); everything else it handles.
 
 Open http://localhost:8000/upload, pick one or more folders of photos, and wait.
 The browser hashes each file locally, uploads only what the server does not
 already have, and skips videos. Nothing on your disk is touched — the originals
 are copied into the app's own storage on the `/data` volume.
+
+## Browse, search, and organize
+
+Once photos are indexed, `/library` is a searchable grid. Every photo is embedded
+with SigLIP and tagged across ten dimensions (subject, setting, vibe, light,
+palette, and more) by a `taxonomy` job stage that runs after embedding; `palette`
+and `quality` also get cheap pixel-statistic tags. The left sidebar filters by
+those model tags and by exact EXIF facets, both with live counts.
+
+Search blends three signals: SigLIP semantic similarity, FTS5 keyword match over
+captions and tag text, and reciprocal-rank fusion of the two — so "dogs in snow"
+finds the look while a proper noun finds the word. `/photo` shows every tag with
+its score and source; `‹`/`›` and the arrow keys page through the library.
+`/organize` groups the library by date (day/month/year), camera, or place.
+
+**Captions** add a sentence, an AI-written title/description, and model-chosen tags
+per photo — filling the `/photo` AI panel and feeding search. The vision model they
+need is pulled and started by `make up` automatically; the `caption` stage runs
+after tagging. Override the model with `IVMS777_CAPTION_MODEL`.
+
+The query planner, chat, and Memories are later phases — see `docs/plans/`.
 
 ## Run on a Jetson Orin Nano
 

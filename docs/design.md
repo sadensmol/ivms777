@@ -46,9 +46,15 @@ config. Ingest is identical everywhere — photos always arrive by upload
 
 | Profile | Inference | Caption model | Planner / chat model | Embed device |
 |---|---|---|---|---|
-| `mac` | Ollama on the **host** | `gemma4:26b-a4b` | `gemma4:e4b` | `cpu` |
-| `jetson` | Ollama in a container | `qwen3-vl:4b` | `qwen3-vl:4b` | `cuda` |
-| `cloud` | vLLM in a container, `--gpus all` | `gemma4:26b-a4b` | `gemma4:e4b` | `cuda` |
+| `mac` | Ollama on the **host** | `qwen2.5vl:7b` | `qwen2.5:3b` | `cpu` |
+| `jetson` | Ollama in a container | `qwen2.5vl:3b` | `qwen2.5:3b` | `cuda` |
+| `cloud` | vLLM in a container, `--gpus all` | `qwen2.5vl:7b` | `qwen2.5:3b` | `cuda` |
+
+The caption model must be **vision-capable**. The tags above are the shipping
+defaults in `config.py` — real, currently-pullable Ollama models — overridable
+with `IVMS777_CAPTION_MODEL` / `IVMS777_PLANNER_MODEL`. The "Gemma 4" family named
+in the rationale below (§4) is the intended target once it is available on Ollama;
+until then Qwen2.5-VL is the working default.
 
 **Why Ollama runs on the host under `mac`.** Docker Desktop on macOS boots a
 Linux VM, and Apple exposes no GPU to Linux guests — there is no Metal in a
@@ -356,8 +362,10 @@ uploads (
 );
 ```
 
-Plus an FTS5 virtual table `photo_fts(caption, tags_text)` kept in sync by
-triggers.
+Plus an FTS5 virtual table `photo_fts(caption, tags_text)`, its rows keyed by
+`photos.id` and refreshed by the taxonomy and caption stages. Because `tags_text`
+is derived from many `photo_tags` rows, the stage rebuilds the row explicitly
+(delete-then-insert) rather than through per-row triggers.
 
 `tags` is a shared vocabulary and deliberately has no `owner_id`; ownership
 comes from the joined photo. Every user-scoped query filters on `owner_id`, and
@@ -409,7 +417,7 @@ of **facets** is derived into `photo_facets`, each either categorical
 | Camera | `camera_make`, `camera_model`, `lens`, `software` |
 | Exposure | `iso`, `aperture`, `shutter_speed`, `focal_length`, `exposure_bias`, `flash`, `exposure_program`, `metering_mode`, `white_balance` |
 | Time | `year`, `month`, `weekday`, `hour`, `time_of_day` (night/dawn/morning/afternoon/evening), `is_weekend` |
-| Place | `has_gps`, `gps_lat`, `gps_lon` |
+| Place | `has_gps`, `gps_lat`, `gps_lon`, `place_city`, `place_country` (reverse-geocoded, §11) |
 | Image | `megapixels`, `orientation`, `aspect` (portrait/landscape/square) |
 
 Facets are used four ways:
@@ -511,6 +519,23 @@ format — never becomes a `photos` row. It is counted in `uploads.files_failed`
 and reported to the client, which lists it on the upload screen so a failed
 transfer is visible rather than silently missing.
 
+**Reprocessing.** Originals are kept (§3.2b), so the derived state — thumbnails,
+embeddings, tags, captions — can be rebuilt without re-uploading. `POST
+/reprocess` resets a chosen stage and every stage after it to `pending` for the
+owner's photos; the `worker` re-runs them in `STAGES` order on its next poll. The
+`/upload` UI exposes this as a single **Reprocess all photos** button
+(`from=thumbnail` — the whole pipeline: thumbnails, embeddings, tags, captions).
+The endpoint itself accepts any stage, so a narrower re-run — `from=taxonomy`
+after a `vocab.yaml` change, `from=embed` for a new model — is one POST away.
+Every stage handler is idempotent — it
+overwrites its own output — so a reprocess is safe to trigger at any time.
+Self-healing backfills run automatically each drain: they queue `thumbnail` for a
+photo still without one, `embed` for one missing a vector, `taxonomy` for an
+embedded-but-untagged photo, and `caption` for a thumbnailed-but-uncaptioned one —
+so a library predating a stage, or a photo whose thumbnail once failed, heals with
+no manual action. A photo that genuinely can't be thumbnailed is skipped by the
+later stages rather than crashing them.
+
 **The manifest gate.** Stage 2 must not run against a half-processed library, so
 `/api/manifest` reports the collection as `complete` only when no `pending` or
 `running` job rows remain for the owner. It still serves a manifest while
@@ -603,20 +628,28 @@ has a title, a description, a cover, and its photos. The organizers live in
 `albums/` behind an `Organizer` protocol, so a new principle is one module and
 one dropdown entry.
 
-**By date.** A `grain` sub-selector chooses how capture time is bucketed. It is a
-query parameter on `/organize` alongside the organizer name; all grains need only
-EXIF, no model.
+**By date.** A `grain` sub-selector picks the calendar bucket — `day`, `month`
+(default), or `year`. It is a query parameter on `/organize` alongside the
+organizer name and needs only EXIF, no model. Title is the period ("14 Jun 2025",
+"June 2025", "2025"); description is the photo count and dominant camera — "140
+photos, mostly Canon EOS R6."
 
-- `events` (default) — cluster `shot_at` by time gaps; a gap > 6 h starts a new
-  event. Title is the date range ("12–14 Jul 2025"); description is the photo
-  count, span, and dominant camera — "47 photos over 3 days, mostly Canon EOS R6."
-- `day` / `month` / `year` — calendar buckets. Title is the period ("14 Jun 2025",
-  "June 2025", "2025"); description is the count and dominant camera.
+Day, month, and year are the **same axis at three zooms** — a real hierarchy. There
+is deliberately no "events" grouping here: time-gap clustering is a different
+principle, not a zoom level of the calendar, so it never sits in this sub-selector.
+It lives on only as an internal seeding step for Memories (below).
 
 **By camera / device.** Group by EXIF camera model. Exact, trivial.
 
-**By place (GPS).** Bucket by GPS rounded to ~1 km. Only photos carrying GPS
-appear. Real place names arrive with offline reverse geocoding later.
+**By place.** Group photos by where they were taken and title each album with a
+**real place name** — "Kyiv", "Rome", "Toronto" — from offline reverse geocoding
+of the GPS, **never raw coordinates**. A bundled GeoNames dataset (`reverse_geocoder`)
+resolves each point on the box, with no network, so one city is one album. Only
+photos carrying GPS appear. Coordinates are a technical detail, shown only on
+`/photo` (§13) and never in Organize — bare lat/long is not a place a person
+recognizes. The library also filters by place: the facets stage reverse-geocodes
+GPS into `place_city`/`place_country` facets (§6.2), shown as a "Place" group in
+the `/library` sidebar.
 
 **Memories.** The interesting one, and the reason the Organize tab needs the LLM.
 It composes the library into named, described *memories* — "Family night in
@@ -626,8 +659,8 @@ raw SigLIP cosine and produced palette-alike blobs with no meaning. It runs as a
 background job in three steps:
 
 1. **Seed** — form candidate clusters cheaply, no model. Start from capture-time
-   events (the `events` grain), then split or merge them by GPS bucket (~1 km) and
-   SigLIP similarity. A candidate is a time-and-place-contiguous run of related
+   gaps (a gap > 6 h starts a new run), then split or merge by GPS bucket (~1 km)
+   and SigLIP similarity. A candidate is a time-and-place-contiguous run of related
    photos — the natural boundary of a memory.
 2. **Curate with an agent** — for each candidate, the planner model (Gemma 4 E4B,
    which stays loaded) reads the photos' captions, tags, and EXIF facts (date,
@@ -803,7 +836,9 @@ The tool moves other people's photographs, so its defaults are paranoid.
 - `/upload` — pick a folder or drop files, watch client-side hashing, then the
   transfer, then live processing progress per stage with counts, throughput,
   ETA, and a list of failed files. Hashing and upload progress come from the
-  Web Worker; processing progress is HTMX polling.
+  Web Worker; processing progress is HTMX polling. A single **Reprocess all photos**
+  button re-runs the whole pipeline (thumbnails, embeddings, tags, captions) over
+  the already-uploaded library without re-uploading; the worker drains the reset jobs.
 - `/export` — choose a layout, preview the folder tree it would produce, and
   download the manifest. Shows whether the collection is fully processed, and
   the exact `ivms777-sync` command line to run next.
@@ -811,18 +846,28 @@ The tool moves other people's photographs, so its defaults are paranoid.
   tags; an `×N` badge marks photos with exact duplicates. Left sidebar has two
   filter groups with counts: model-derived tags per dimension, and EXIF facets
   (camera, lens, ISO and aperture ranges, year, time of day, orientation). A
-  sort control offers capture date or any numeric facet. Top bar has the search
-  box and parsed-filter chips.
+  sort control offers capture date or any numeric facet. Filters and sort
+  **apply on change** — no Apply button — swapping only the grid via HTMX so the
+  sidebar and its scroll position stay put; a single **Clear all filters** button
+  at the top resets them. Top bar has the search box and parsed-filter chips.
 - `/photo/{id}` — a full-screen view of one photo. The image fills the viewport;
-  a panel carries everything known about it: caption, tags grouped by dimension
-  with scores and source badges (the "AI data"), the full EXIF panel, every
-  local path the file arrived from with the wasted-space total when there is more
-  than one, and a "similar photos" strip. This is where duplicate paths are seen,
-  since there is no separate duplicates screen.
+  `‹`/`›` buttons and the ← / → arrow keys page to the newer/older photo in the
+  library's default capture-date order (owner-scoped; the arrows are absent at the
+  ends). Closing returns to the **exact** library view it was opened from —
+  filters, search, and scroll intact — via the browser's history; paging replaces
+  the history entry so close always lands back on the list, never on a prior photo. A panel carries everything known about it: an **AI-written title and
+  description**, the caption, tags grouped by dimension with scores and source
+  badges (the "AI data"), the full EXIF panel — including GPS **coordinates**,
+  which live here as a technical detail and nowhere else — every local path the
+  file arrived from with the wasted-space total when there is more than one, and a
+  "similar photos" strip. The AI title/description and tags fill in with the caption and
+  planner phases (3–4); until then the panel shows EXIF, sources, and embedding
+  status. This is where duplicate paths are seen, since there is no separate
+  duplicates screen.
 - `/organize` — a dropdown of organization principles (date, memories, camera,
   place) over a list of album cards, each with a cover, title, description, and a
-  strip of its photos. `date` shows a grain sub-selector (events / day / month /
-  year). Live principles recompute on selection; `memories` reads stored rows and
+  strip of its photos. `date` shows a grain sub-selector (day / month / year,
+  default month). Live principles recompute on selection; `memories` reads stored rows and
   offers a "Rebuild memories" control that queues the background build.
 - `/chat` — question box, streamed answer, inline thumbnail citations.
 
@@ -858,6 +903,8 @@ ingest/
   receive.py           # verify hash, store original, create photo + source rows
   exif.py              # full EXIF capture
   facets.py            # EXIF -> queryable facets
+  geocode.py           # offline reverse geocoding: GPS -> city/country
+
   thumbs.py
   embed.py             # embed stage + backfill
   taxonomy.py          # zero-shot + pixel stats           (plan 04)
@@ -870,11 +917,13 @@ organize/              # stage 2, server side                (plan 09)
   manifest.py
 search/
   semantic.py          # text->vector KNN, similar photos
-  facets.py
-  keyword.py / fusion.py / planner.py                        (plan 04+)
+  facets.py            # EXIF facet filters + sidebar counts
+  tags.py              # model-tag filters + sidebar counts   (plan 04)
+  keyword.py / fusion.py                                       (plan 04)
+  planner.py                                                   (plan 06)
 albums/                # Organize tab — grouping into described albums
   base.py              # Album, Organizer protocol
-  by_date.py           # events / day / month / year grains
+  by_date.py           # day / month / year grains
   by_camera.py / by_place.py
   memories.py          # organizer: reads stored memory groups        (plan 07)
   memories_build.py    # agentic RAG builder + owner-level worker job  (plan 07)
@@ -947,7 +996,7 @@ executes the paths it is given.
 | 0 | Skeleton, config and profiles, compose files, SQLite schema with `sqlite-vec` and FTS5, storage and inference interfaces, fakes, test harness |
 | 1 | Upload — client-side hashing worker, probe endpoint, receive stage, full EXIF capture and facet derivation, thumbnails, `/upload` progress, `/library` grid with EXIF facet filters and sorting, `/duplicates`, caption model bake-off script |
 | 2 | SigLIP embeddings, taxonomy scoring, semantic + facet + keyword + fusion search, similar photos, `/photo` detail |
-| 3 | Captioning stage against the inference service, captions in the UI |
+| 3 | Captioning stage against the inference service, captions in the UI; the caption stage also emits a per-photo **AI title + description**, and `/photo` renders the full AI panel (title, description, caption, tags) |
 | 4 | Query planner, parsed-filter chips, caption vocabulary mining with tag suggestions |
 | 5 | Memories organizer — agentic RAG builder, persisted `groups(kind='memory')`, `/organize?by=memories` with rebuild |
 | 6 | Ask-your-library chat with streaming and citations |
@@ -985,7 +1034,9 @@ reorganizing the disk matters more than chat does.
 - Face detection and person clustering.
 - Object storage backend behind the existing `Storage` interface.
 - Optional XMP sidecar export so other tools see the tags.
-- Offline reverse geocoding for place names.
+- Offline reverse geocoding place names — the "By place" organizer names albums
+  by city and a `place_city`/`place_country` sidebar facet filters the library by
+  place (plan 08, done). Future: sub-city neighbourhoods and user-editable labels.
 - Postgres and pgvector if concurrent writes become a real constraint.
 - Video support.
 - A watch mode for `ivms777-sync` that uploads new files as they appear.

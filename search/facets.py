@@ -13,6 +13,7 @@ SORTABLE: dict[str, str] = {
 
 SIDEBAR_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Camera", ("camera_make", "camera_model", "lens")),
+    ("Place", ("place_city", "place_country")),
     ("Time", ("time_of_day", "weekday", "is_weekend")),
     ("Image", ("aspect", "has_gps", "flash")),
 )

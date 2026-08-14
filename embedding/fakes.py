@@ -25,6 +25,11 @@ def _vector_from_bytes(seed: bytes) -> list[float]:
 
 
 class FakeEmbedder:
+    # Calibration chosen so identical vectors (cosine 1.0) score ~0.99 and
+    # near-orthogonal ones ~0.007 — separable by any sane threshold in tests.
+    logit_scale = 10.0
+    logit_bias = -5.0
+
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
         return [_vector_from_bytes(text.encode("utf-8")) for text in texts]
 

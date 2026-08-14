@@ -6,26 +6,26 @@ from config import Settings
 def test_defaults_to_mac_profile():
     s = Settings(data_dir=Path("/tmp/pl"))
     assert s.profile == "mac"
-    assert s.caption_model == "gemma4:26b-a4b"
+    assert s.caption_model == "qwen2.5vl:7b"
     assert s.embed_device == "cpu"
 
 
 def test_jetson_profile_overrides_model_and_device():
     s = Settings(profile="jetson", data_dir=Path("/tmp/pl"))
-    assert s.caption_model == "qwen3-vl:4b"
-    assert s.planner_model == "qwen3-vl:4b"
+    assert s.caption_model == "qwen2.5vl:3b"
+    assert s.planner_model == "qwen2.5:3b"
     assert s.embed_device == "cuda"
 
 
 def test_cloud_profile_overrides_model_and_device():
     s = Settings(profile="cloud", data_dir=Path("/tmp/pl"))
-    assert s.caption_model == "gemma4:26b-a4b"
+    assert s.caption_model == "qwen2.5vl:7b"
     assert s.embed_device == "cuda"
 
 
 def test_explicit_value_beats_profile_default():
-    s = Settings(profile="jetson", data_dir=Path("/tmp/pl"), caption_model="gemma4:e4b")
-    assert s.caption_model == "gemma4:e4b"
+    s = Settings(profile="jetson", data_dir=Path("/tmp/pl"), caption_model="my-vlm:latest")
+    assert s.caption_model == "my-vlm:latest"
 
 
 def test_derived_paths_hang_off_data_dir():

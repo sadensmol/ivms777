@@ -10,7 +10,7 @@ from db.connection import connect, migrate
 def settings(tmp_path: Path) -> Settings:
     # Fake embedder keeps the suite offline and instant; the real SigLIP (torch)
     # is exercised only by the slow-marked test and by hand.
-    return Settings(data_dir=tmp_path, use_fake_embedder=True)
+    return Settings(data_dir=tmp_path, use_fake_embedder=True, use_fake_inference=True)
 
 
 @pytest.fixture

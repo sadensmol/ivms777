@@ -4,7 +4,7 @@ from pathlib import Path
 import sqlite_vec
 
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class SchemaTooOldError(RuntimeError):
@@ -45,5 +45,16 @@ def migrate(conn: sqlite3.Connection) -> None:
             "path — photos are now keyed by content hash. Delete the database file "
             "and re-upload."
         )
+    if version <= 2:
+        # v3 adds the AI title/description columns; ALTER an existing photos table
+        # in place (executescript below only CREATEs missing tables).
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(photos)")}
+        for column in ("ai_title", "ai_description"):
+            if "photos" in _table_names(conn) and column not in cols:
+                conn.execute(f"ALTER TABLE photos ADD COLUMN {column} TEXT")
     conn.executescript(SCHEMA_PATH.read_text())
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+
+def _table_names(conn: sqlite3.Connection) -> set[str]:
+    return {r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}

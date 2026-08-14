@@ -28,6 +28,23 @@ snapshots — once written they describe a unit of work, not the current state.
 When the design changes, the plan does not get rewritten retroactively; a new
 plan supersedes it.
 
+## UI: never lose the user's place
+
+Any state the user set is sacred. A search query, active filters, the chosen
+sort, the scroll position, an expanded panel — all of it must **survive
+navigation**. Drilling into a photo (or anything) and coming back returns the
+user to *exactly* what they had: same filters, same query, same scroll.
+
+- Prefer letting the browser restore state (`history.back()` / bfcache) over
+  rebuilding a fresh page — it is the only thing that also restores scroll.
+- Never hardcode a navigation that drops query state (e.g. a close button that
+  links to a bare `/library` instead of returning to the filtered view).
+- When a drill-down has its own navigation (prev/next), don't let it bury the
+  origin in history — replace, don't stack, so "close" still returns to the list.
+
+This is a hard rule for every feature, current and future — resetting the user's
+context is a bug, not a detail.
+
 ## Code
 
 - Python, `uv` for dependency management. Run things with `uv run`.

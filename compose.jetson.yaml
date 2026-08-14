@@ -13,11 +13,15 @@ services:
     ports:
       - "11434:11434"
 
+  # SigLIP runs in-process in app and worker with embed_device=cuda, so both need
+  # GPU access — not just the inference container.
   app:
+    runtime: nvidia
     environment:
       IVMS777_PROFILE: jetson
     depends_on: [inference]
   worker:
+    runtime: nvidia
     environment:
       IVMS777_PROFILE: jetson
     depends_on: [inference]

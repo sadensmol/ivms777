@@ -88,6 +88,26 @@ def test_receive_queues_an_embed(conn, originals):
     assert stage_counts(conn, "embed")["pending"] == 1
 
 
+def test_receive_queues_taxonomy(conn, originals):
+    upload_id = add_upload(conn)
+    data = jpeg_bytes()
+    receive(
+        conn, originals, owner_id=1, upload_id=upload_id,
+        rel_path="a.jpg", declared_hash=sha(data), data=data,
+    )
+    assert stage_counts(conn, "taxonomy")["pending"] == 1
+
+
+def test_receive_queues_caption(conn, originals):
+    upload_id = add_upload(conn)
+    data = jpeg_bytes()
+    receive(
+        conn, originals, owner_id=1, upload_id=upload_id,
+        rel_path="a.jpg", declared_hash=sha(data), data=data,
+    )
+    assert stage_counts(conn, "caption")["pending"] == 1
+
+
 def test_the_same_bytes_from_two_paths_make_one_photo_and_two_sources(conn, originals):
     upload_id = add_upload(conn)
     data = jpeg_bytes()

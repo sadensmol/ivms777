@@ -9,6 +9,14 @@
         <option value="{{ name }}" {% if name == active %}selected{% endif %}>{{ label }}</option>
       {% endfor %}
     </select>
+    {% if grains %}
+      <label for="grain">grouped by</label>
+      <select id="grain" name="grain" onchange="this.form.submit()">
+        {% for value, label in grains %}
+          <option value="{{ value }}" {% if value == active_grain %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    {% endif %}
     <noscript><button type="submit">Go</button></noscript>
   </form>
 </div>
