@@ -2,6 +2,9 @@ import pytest
 
 from embedding.fakes import FakeEmbedder
 from embedding.store import write_vector
+from inference.fakes import FakeInferenceClient
+from search import planner as planner_module
+from search import retriever as retriever_module
 from search.semantic import search_photos, similar_photos
 from tests.factories import add_photo
 
@@ -138,3 +141,82 @@ def test_similarity_breakdown_explains_the_match(library):
     assert dog["origin"] == "90%" and dog["current"] == "60%"
     assert dog["match"] == 60                        # match is the weaker confidence
     assert any(r["param"] == "visual (image)" for r in rows)  # visual always compared
+
+
+# --- plan 12 task 3: similar_photos is now a thin wrapper over the core --------
+
+
+def test_similar_photos_delegates_to_the_retriever_core(library, monkeypatch):
+    # similar_photos must be a thin wrapper: build a Query(seed_photo_id=...) and
+    # go through refine(candidates(...)) — not its own scoring path anymore.
+    calls: list[str] = []
+    real_candidates, real_refine = retriever_module.candidates, retriever_module.refine
+
+    def spy_candidates(conn, embedder, owner_id, query, **kwargs):
+        calls.append("candidates")
+        assert query.seed_photo_id == 1
+        return real_candidates(conn, embedder, owner_id, query, **kwargs)
+
+    def spy_refine(conn, embedder, client, owner_id, query, ids, **kwargs):
+        calls.append("refine")
+        assert query.seed_photo_id == 1
+        return real_refine(conn, embedder, client, owner_id, query, ids, **kwargs)
+
+    monkeypatch.setattr(retriever_module, "candidates", spy_candidates)
+    monkeypatch.setattr(retriever_module, "refine", spy_refine)
+
+    _tag(library, 1, "subject", "dog", 0.9)
+    _tag(library, 3, "subject", "dog", 0.8)
+    results = similar_photos(library, owner_id=1, photo_id=1, k=5)
+
+    assert calls == ["candidates", "refine"]
+    assert {r["id"] for r in results} == {3}
+
+
+def test_similar_photos_seed_path_touches_no_text_or_llm_machinery(library, monkeypatch):
+    # "similar stays incredible-fast" (plan 12): a seed query must reach the
+    # image-vector KNN path ONLY. Monkeypatch every piece of text-query / LLM
+    # machinery to explode, then prove similar_photos still runs and returns its
+    # normal answer — none of them were ever reached.
+    def _boom(*args, **kwargs):
+        raise AssertionError("similar_photos seed path reached text/LLM machinery")
+
+    monkeypatch.setattr(retriever_module, "search_photos", _boom)
+    monkeypatch.setattr(retriever_module, "keyword_search", _boom)
+    monkeypatch.setattr(FakeEmbedder, "embed_texts", _boom)
+    monkeypatch.setattr(FakeInferenceClient, "embed", _boom)
+    monkeypatch.setattr(planner_module, "plan", _boom)
+
+    _tag(library, 1, "subject", "dog", 0.9)
+    _tag(library, 3, "subject", "dog", 0.8)
+
+    results = similar_photos(library, owner_id=1, photo_id=1, k=5)
+
+    assert {r["id"] for r in results} == {3}
+
+
+def test_similar_finds_a_tag_match_outside_the_seeds_image_knn_top(conn):
+    # PARITY GAP (plan 12 task 3): similar_photos' candidate set has always been
+    # the UNION of (shared-tag photos) ∪ (caption-meaning matches) ∪ (image-KNN).
+    # >30 photos so the seed's image-KNN (bounded to max(k,30)=30) does NOT cover
+    # every candidate. Photo 2 shares a strong `subject` tag with the seed (a
+    # content signal) but its image vector is engineered to be the FARTHEST
+    # possible from the seed's, so it is guaranteed to fall outside the KNN
+    # top-30. A candidates() that is image-KNN-only drops it; the union must not.
+    embedder = FakeEmbedder()
+    seed_vec = embedder.embed_texts(["seed photo"])[0]
+    add_photo(conn, photo_id=1, content_hash="h1", thumb_key="1.jpg")
+    write_vector(conn, 1, seed_vec)
+    _tag(conn, 1, "subject", "dog", 0.9)
+
+    add_photo(conn, photo_id=2, content_hash="h2", thumb_key="2.jpg")
+    write_vector(conn, 2, [-x for x in seed_vec])  # antipodal: the worst possible KNN match
+    _tag(conn, 2, "subject", "dog", 0.9)
+
+    for pid in range(3, 33):  # 30 distractors, no shared tag, fill the KNN top-30
+        add_photo(conn, photo_id=pid, content_hash=f"h{pid}", thumb_key=f"{pid}.jpg")
+        write_vector(conn, pid, embedder.embed_texts([f"distractor {pid}"])[0])
+
+    results = similar_photos(conn, owner_id=1, photo_id=1, k=5)
+
+    assert 2 in {r["id"] for r in results}

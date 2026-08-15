@@ -33,6 +33,21 @@ def test_date_shows_a_grain_selector(client):
     assert 'name="grain"' in client.get("/organize?by=date").text
 
 
+def test_organize_returns_to_the_last_opened_organizer(client):
+    # Opening /organize (via the nav) restores the organizer last used, not the
+    # default date view ("never lose the user's place").
+    client.get("/organize?by=camera")
+    body = client.get("/organize").text
+    assert '<option value="camera" selected>' in body
+    assert '<option value="date" selected>' not in body
+
+
+def test_organize_remembers_the_date_grain(client):
+    client.get("/organize?by=date&grain=year")
+    body = client.get("/organize").text
+    assert '<option value="year" selected>' in body
+
+
 def test_date_grain_year_titles_albums_by_year(client):
     # both fixture photos are on 2025-07-12: events -> "12 Jul 2025", year -> "2025"
     body = client.get("/organize?by=date&grain=year").text

@@ -233,32 +233,41 @@ in config, not in code.
 Three containers and one SQLite file in the cloud. One standalone binary on your
 machine.
 
-```
-  ── your machine ─────────────┐   ── the GPU box ───────────────────────────┐
-                               │                                             │
-   photos on disk              │       ┌─────────────────────────────────┐   │
-        │                      │       │ app        FastAPI + Jinja+HTMX │   │
-        │  ┌──────────┐ upload │       │            /upload /library     │   │
-        └─►│ browser  │────────┼──────►│            /photo /organize /chat │ │
-           └──────────┘        │       └────────┬───────────────┬────────┘   │
-        ▲                      │                │               │            │
-        │                      │                │        ┌──────▼─────────┐  │
-        │  ┌────────────────┐  │ manifest       │        │ inference      │  │
-        └──┤ ivms777-sync │◄─┼────────────────┤        │ ollama | vllm  │  │
-           │  plan / apply  │  │  GET /api/     │        │ (host on `mac`)│  │
-           └────────────────┘  │    manifest    │        └──────▲─────────┘  │
-                               │       ┌────────▼──────────────┴─────────┐   │
-                               │       │ worker                          │   │
-                               │       │ thumbs, SigLIP, taxonomy,       │   │
-                               │       │ caption, groups                 │   │
-                               │       └────────┬────────────────────────┘   │
-                               │                │                            │
-                               │  ┌─────────────▼───────┐  ┌──────────────┐  │
-                               │  │ SQLite (WAL)        │  │ Storage      │  │
-                               │  │ + sqlite-vec + FTS5 │  │ originals +  │  │
-                               │  │ on a named volume   │  │ thumbnails   │  │
-                               │  └─────────────────────┘  └──────────────┘  │
-                               └─────────────────────────────────────────────┘
+This diagram is the **canonical architecture picture** — keep it in step with the
+components and flows described in this section (CLAUDE.md § "docs/design.md is the
+source of truth").
+
+```mermaid
+flowchart TB
+    subgraph machine["Your machine"]
+        disk[("Photos on disk<br/>sources — the app never writes here")]
+        browser["Browser<br/>/upload · /library · /photo · /organize · /chat"]
+        sync["ivms777-sync CLI<br/>plan · apply · undo · verify"]
+    end
+
+    subgraph gpu["The GPU box · docker compose"]
+        app["app · FastAPI + Jinja + HTMX<br/>UI · read queries · upload receipt · /api/manifest"]
+        worker["worker · ingest pipeline (primary writer)<br/>facets · thumbs · SigLIP (in-process) · taxonomy · caption · memories · deletions"]
+        infer["inference · Ollama | vLLM<br/>caption + planner/chat/embed models<br/>(host on mac, container on jetson/cloud)"]
+        db[("SQLite WAL<br/>sqlite-vec + FTS5 · named volume")]
+        store[("Storage<br/>originals + thumbnails")]
+    end
+
+    disk -.->|user selects| browser
+    browser -->|"upload: probe hashes + send new bytes"| app
+    browser -->|"read UI · SSE chat"| app
+    sync -->|"GET /api/manifest"| app
+    sync -->|"plan / apply — the ONLY writer to disk"| disk
+
+    app <-->|"reads · small short writes"| db
+    worker <-->|"owns writes"| db
+    app -->|"read originals / thumbnails"| store
+    worker -->|"write originals / thumbnails"| store
+    worker -->|"caption + structured tags (HTTP)"| infer
+    app -->|"planner · chat answers · caption embeddings (HTTP)"| infer
+
+    classDef store fill:#eef2ff,stroke:#8899cc,color:#111;
+    class db,store,disk store;
 ```
 
 `app` serves the UI, read queries, upload receipt, and the manifest endpoint.
@@ -620,25 +629,74 @@ incomplete, marked as such, and `ivms777-sync` refuses to `apply` one unless
 
 ## 9. Retrieval
 
-Four mechanisms, composed:
+Retrieval is **one core, two stages** (`search/retriever.py`, plan 12 — see
+§9.2 for the full interface). **`candidates()`** is fast and has no LLM: for a
+seed photo it is the image-vector KNN unioned with shared-tag and
+caption-meaning matches (the same union `similar_photos` has always used); for
+text it is SigLIP semantic KNN fused with FTS5 keyword search. **`refine()`**
+then applies the rule that governs the whole core:
+
+**The ADR — hard filters gate, everything else scores.** EXIF facets and
+explicit user/planner *facet*/*date* predicates (section 6.2) are **hard**: an
+exact cut applied before ranking, and a photo that fails one is **out**, no
+matter how well it would otherwise score. Every model-derived signal — shared
+tags, caption-meaning cosine, image-vector cosine, the semantic/keyword fusion
+rank — is **soft**: an additive **contribution**. A missing signal (no caption
+vector yet, no tag) is *unavailable*, not zero, so it is skipped for that one
+photo, never a kill switch. This is the rule `similar` always followed; §10
+explains why chat needed it made structural too.
+
+What used to be described as four separate mechanisms are now candidate
+generation and contributions of the one core:
 
 - **Semantic** — query text through the SigLIP text encoder, KNN via
-  `sqlite-vec`. Handles "dogs playing in snow" with no matching caption.
-- **Tag facets** — model-derived tag filters from the sidebar, plain SQL over
-  `photo_tags` with a score threshold. AND across dimensions, OR within a
-  dimension.
-- **EXIF facets** — exact filters over `photo_facets` (section 6.2):
-  categorical equality and numeric ranges. Applied before any ranking, since
-  they are cheap and exact.
-- **Keyword** — FTS5 BM25 over captions and tag text. Catches proper nouns,
-  OCR'd text, and exact words embeddings smear over.
-- **Fusion** — semantic and keyword results merged by reciprocal rank fusion
-  (`score = sum 1/(60 + rank)`). Facet filters apply first, narrowing the
-  candidate set, then fusion ranks what survives.
+  `sqlite-vec`, inside `candidates()`. Handles "dogs playing in snow" with no
+  matching caption.
+- **Keyword** — FTS5 BM25 over captions and tag text, fused into `candidates()`
+  alongside semantic. Catches proper nouns, OCR'd text, and exact words
+  embeddings smear over.
+- **EXIF facets** — exact filters over `photo_facets` (section 6.2), now the
+  core's hard pre-filter (`_hard_filter`, §9.2): applied to the candidate list
+  before any scoring, since they are cheap and exact.
+- **Tag facets** — model-derived tag filters are no longer a pre-ranking SQL
+  narrow; a sidebar/planner tag hint is a **soft** contribution
+  (`_soft_tag_contributions`, §9.2) scored by `refine()`, never a gate.
+
+`/library` search calls `candidates()` directly for the fused ranking, then
+narrows that list by the sidebar's EXIF/tag filters — the same
+candidate-then-filter order the pre-core fusion always used, just generated by
+the shared core now, with no per-click LLM latency (§9.1). `similar`, chat, and
+memory call the fuller `refine(candidates())` for the graceful additive score.
+
+**Retriever core flow.** Keep this diagram in step with `search/retriever.py`.
+
+```mermaid
+flowchart TB
+    q["Query · text OR seed_photo_id<br/>+ hard_filters + soft_tags + k + floor (§9.2)"] --> gen
+
+    subgraph gen["1 · candidates() — fast, no LLM"]
+        t["text → SigLIP text→image KNN ⊕ FTS keyword, RRF-fused"]
+        s["seed → image-vector KNN ∪ shared-tag ∪ caption-meaning matches"]
+    end
+
+    gen --> hard["2 · HARD pre-filter (_hard_filter)<br/>EXIF facets + explicit date (§6.2) — exact cut"]
+    hard --> score["3 · refine(): additive scoring (search/scoring.py)<br/>shared tags ⊕ caption-meaning cosine ⊕ image cosine ⊕ fused rank<br/>per-photo graceful skip · decayed sum · content gate"]
+    score --> floorstep["4 · Optional floor (caller-set)<br/>search/similar: none (rank, don't cut) · chat: honest-empty cut"]
+    floorstep --> out["ranked [{id, score, reasons}]"]
+```
+
+The query planner (§9.1) sits **outside** this core — it is an **input
+adapter** that turns free text into `hard_filters` + `soft_tags` once, then
+hands the core a `Query`. It is not part of the core itself: keeping it outside
+is what keeps the core LLM-free and single-pass, honouring §9.1's
+interactive-latency rule.
 
 **Similar photos** — a photo's whole character, from three signals fused, and it
 **degrades gracefully with the pipeline** so it is useful the moment a photo is
-embedded and richer once it is tagged and captioned:
+embedded and richer once it is tagged and captioned. This scorer now *is* the
+core's `refine()` (§9.2) — `similar_photos` is a thin wrapper over
+`refine(candidates(Query(seed_photo_id=...)))` — so what follows describes the
+core's seed-query scoring, not a separate mechanism:
 
 | A photo has… | Similar is computed from… |
 |---|---|
@@ -695,6 +753,24 @@ on a rooftop returned other rooftops rather than the other dog. An LLM reranker
 was also rejected for this interactive path — it reintroduces per-click latency
 that §9.1 forbids.
 
+**Similar-photo flow.** Degrades with the pipeline; the content gate is mandatory.
+
+```mermaid
+flowchart TB
+    p["A photo"] --> sig{"What signals exist?"}
+    sig -->|"no embedding"| none["not comparable"]
+    sig -->|"embedding"| v["image-vector KNN<br/>cosine ≥ similar_min_cosine (0.8)"]
+    sig -->|"+ taxonomy"| t["shared tags · ALL dimensions<br/>dimension_weight × agreement × idf"]
+    sig -->|"+ caption"| c["caption meaning<br/>caption-vec cosine ≥ similar_caption_min (0.6)"]
+
+    v --> gate{"CONTENT GATE — shares a content signal?<br/>subject tag · caption meaning · visual near-dup"}
+    t --> gate
+    c --> gate
+    gate -->|no| drop["not similar<br/>(style/scene facets only RERANK, never qualify)"]
+    gate -->|yes| score["contributions sorted high→low,<br/>summed WITH decay<br/>→ one strong match beats many weak"]
+    score --> reasons["top-3 reasons + match %<br/>overlaid on each thumbnail (§13)"]
+```
+
 ### 9.1 Query planner
 
 Gemma 4 E4B converts a natural-language query into a `QuerySpec` in one call:
@@ -724,38 +800,212 @@ trade. This applies to *interactive* retrieval only. The Memories organizer
 (section 11) does run an agent loop, because it is a batch, offline job whose
 per-step latency is paid once at build time, not on every keystroke.
 
+**Chat is the one interactive exception (§10).** The user accepted the latency of
+an agent loop for chat specifically — a wrong answer there is worse than a slow
+one — so chat may run a bounded multi-round retrieval loop. `/library` search
+stays a single call; chat does not.
+
 The planner is strictly an enhancement. If it fails, times out, or returns
 invalid JSON, the raw query goes straight to semantic + keyword fusion. The UI
 shows the parsed filters as removable chips, so the interpretation is always
 visible and correctable.
 
+### 9.2 The retriever core
+
+`search/retriever.py` is the **one** retrieval pipeline (plan 12). Every
+consumer — `/library` search, `/photo` similar, chat, memory — is a caller of
+it; nothing else in the codebase scores, fuses, narrows, or floors photos.
+
+```python
+Query = {
+  text: str | None            # NL query — search, chat, theme discovery
+  seed_photo_id: int | None   # a photo — similar, memory "more like this"
+  hard_filters: dict          # EXIF facets + explicit date — EXACT, gates (§6.2)
+  soft_tags: dict             # {dimension: [label, ...]} — planner hints, SCORE only
+  k: int
+  weights: dict[str, float] | None   # per-dimension importance, vocab.yaml
+  floor: float | None         # caller-set relevance floor; None = rank, don't cut
+}
+```
+
+Exactly one of `text` / `seed_photo_id` is set. The core exposes its two
+stages separately so an interactive caller can paint fast, then refine:
+
+```python
+candidates(conn, embedder, owner_id, query) -> [id]                 # phase 1 — FAST
+refine(conn, embedder, client, owner_id, query, ids) -> [{id, score, reasons}]  # phase 2 — graceful
+retrieve(...) = refine(candidates(...))                              # synchronous convenience
+```
+
+**Two tiers, one core.** The **fast tier** — `/library` search and `/photo`
+similar — calls the core directly, no agent, no per-click latency (§9.1): search
+uses `candidates()`'s fused ranking, similar uses the full `refine(candidates())`.
+The **agentic-RAG tier** — chat (§10) and memory (§11) — is layered *on top* of
+the same core: it calls `candidates()`/`refine()` as its retrieval tool (to seed
+the loop, and again mid-loop for `search`/`similar`/`nearby`), then adds
+judgement (verify, curate, decide membership) that the core itself never
+performs. Neither tier re-implements ranking, fusion, or a floor — the agent
+loop's job is judgement over what the core already returned, not a second
+retrieval pass.
+
+```mermaid
+flowchart TB
+    subgraph fast["Interactive · no LLM · single pass (§9.1)"]
+        lib["/library search"] --> core
+        sim["/photo similar<br/>(similar_photos = thin wrapper)"] --> core
+    end
+    subgraph agentic["Agentic wrappers · LLM, latency-tolerant"]
+        chat["/chat<br/>off-topic gate → core → verify/refine loop → answer"] --> core
+        mem["Memories<br/>theme discovery + event context tools"] --> core
+    end
+    core["search/retriever.py · graceful additive core"]
+    core --> stores[("photo_vec · caption_vec · photo_tags · photo_facets · FTS")]
+```
+
+**The single-pipeline invariant.** If a code review ever finds a second place
+that scores, fuses, narrows, or floors photos, that is a bug against this
+design — `candidates()`/`refine()` are the only two stages, everywhere.
+
+**Shipped: `/photo` paints instantly, the similar strip loads async (plan 12,
+task 3b).** `/photo/{id}` no longer waits on `similar_photos` to render — the
+image, EXIF, tags, sources, and collection collage are all cheap and render on
+the first response. The "Similar photos" section ships as an HTMX placeholder
+(`hx-trigger="load"`) that fires a follow-up `GET /photo/{id}/similar` the
+moment the page loads; that route runs the full `similar_photos` (i.e.
+`refine(candidates())`, with the same collection-member exclusion as the main
+route) and returns the strip as a fragment, which swaps into place. First paint
+never waits on the full-library scan.
+
+**Still future: splitting that fragment into KNN-paint-then-refine.** The
+`/photo/{id}/similar` route above still runs the *whole* `refine(candidates())`
+in one call — it does not yet separate phase-1 instant KNN order from a
+phase-2 reasoned reorder. The core's `candidates()`/`refine()` split exists to
+make that finer two-phase (KNN list first, reasons swapped in a second later
+request) possible without a new code path; that split has not landed.
+
 ## 10. Ask-your-library chat
 
-1. The question drives retrieval directly through semantic + keyword fusion
-   (§9) — the same path interactive search uses. The query planner (§9.1) is a
-   future enhancement; when it lands the question will pass through it first to
-   get a `QuerySpec`. Until then the raw question is retrieved as-is.
-2. Retrieval returns the top 30 photos.
-3. Context assembly builds a compact block per photo: id, date, caption, top
-   tags, and its EXIF facts — camera, lens, ISO, aperture, shutter, focal
-   length, coordinates when present. About 60 tokens each, ~2k tokens total.
-   Including the facts means questions like "what lens did I use most on that
-   trip?" are answered from data, not inferred from captions.
-4. Gemma 4 answers, citing photos as `[photo:123]`.
-5. The UI streams tokens over SSE and renders each citation inline as a
-   clickable thumbnail.
+Retrieval is **agentic RAG**, not a one-shot dump. The old path fused the top-30
+neighbours and force-fed them to the model, which then invented matches ("a dog
+on the dashboard" with no dog) because a semantic KNN always returns *k*
+neighbours — there was no "nothing matches". The path is now precise, cheapest
+layer first:
 
-**Off-topic guard.** Before retrieving anything, a one-word classifier decides
-whether the question is actually about the photo collection. A question that is
-not — general advice, trivia, "should I walk or drive?" — skips retrieval
-entirely and gets a short "I can only answer questions about your photos" reply,
-so unrelated questions never dump the library as false evidence. Only questions
-that pass the gate reach retrieval.
+1. **Plan** the question into a `QuerySpec` (§9.1): a `hard_filters` dict (EXIF
+   facets + explicit date, §6.2) and `soft_tags` hints, the same split the core
+   uses everywhere. "a photo with a dog" becomes a `subject: dog` tag hint, not
+   a vibe.
+2. **Generate candidates via the core, then hard-filter.** `search/retriever.py`'s
+   `candidates()` (§9.2) — the same semantic+keyword fusion `/library` search
+   uses — produces the pool; `_hard_filter` then cuts it **exactly** by the
+   planner's EXIF/date predicates (a photo failing one is out, no exceptions).
+   If that empties a non-empty pool, chat answers honest-empty right there — an
+   EXIF/date mismatch is a fact, not something to second-guess.
+3. **Rerank, degrading per photo — deliberately *not* the core's `refine()`.**
+   Candidates are reranked by caption-meaning cosine (`search/rerank.py`) — the
+   question, embedded in the caption space, against each photo's caption vector.
+   A caption below the floor is dropped, **but a photo whose caption vector is
+   not computed yet is kept** (sunk below the scored matches): the caption
+   signal is *unavailable*, not *weak*, exactly as `similar` degrades (§9). Chat
+   calls `candidates()` + `_hard_filter` directly and does its own caption-cosine
+   floor instead of calling the core's `refine()`, because `refine()` folds the
+   fusion/KNN rank in as an **unconditional** content contribution
+   (`fusion_rank_contribution`, §9.2) — correct for `/library` search, where a
+   semantic neighbour *is* a result, but wrong for chat: a KNN always returns
+   *k* neighbours, so if fusion proximity alone could clear the content gate,
+   chat would always answer *something* — the exact confabulation this section
+   killed. The caption-cosine floor keeps chat's honest-empty structurally
+   intact: only a genuine caption match clears it. Planner `soft_tags` travel on
+   the `Query` for parity but, since chat doesn't call `refine()`, never score
+   here either — they stay strictly informational, never a gate. So chat works
+   from the moment photos are embedded and sharpens as caption vectors backfill
+   (§8); "nothing clears the floor" means *the candidate pool truly has no
+   caption match* (an honest "I couldn't find photos of X", **no sources**), not
+   *the floor ate a photo the library simply hasn't captioned yet*. The floor is
+   tuned on a hand-labelled dev set (§17).
+4. **Bounded verify/refine loop** (the §9.1 interactive exception). Seeded with
+   those candidates, an agent verifies each match and, for questions one
+   retrieval cannot answer, pulls more via read-only tools (`search`, `similar`,
+   `nearby`) over a few rounds before returning the **verified** id set — these
+   tools call the same core (`search_photos`/`similar_photos`, §9.2), never a
+   private fetch. It never invents a match; a candidate that does not fit is
+   dropped, not narrated.
 
-The answer is grounded only in retrieved captions and tags. When retrieval
-returns nothing above a relevance floor, the model is instructed to say so
-rather than invent an answer. Captions are model-generated and imperfect, so the
-chat view always shows its sources — the thumbnails are the evidence.
+   The same loop also has three **fact tools** for a count, total, or
+   organization question the candidates alone cannot answer — `count(query)` (an
+   FTS keyword count over captions/tags; an empty query or `"all"` gives the real
+   total photo count), `memories()` (this owner's memories — name, date, size,
+   from `groups`/`group_photos` where `kind='memory'`), and `periods(grain)`
+   (`"month"` or `"year"` — the count of distinct calendar buckets that have
+   photos). Unlike `search`/`similar`/`nearby`, a fact tool returns no candidate
+   photos — it returns one FACT line (`chat/agent.py::_tool`), which the loop
+   both feeds back to the agent and collects. `agent_retrieve` returns
+   `(verified_ids, facts)`; the chat route appends any gathered facts to the
+   grounding context before the final answer streams, so "how many photos do I
+   have in total?" is answered from the real count (897), never by counting the
+   handful of candidate photos the model happens to see — the bug this closes.
+   Because a small planner model is unreliable at *choosing* a fact tool,
+   `agent_retrieve` also routes **deterministically**: an aggregate question
+   (`is_aggregate_question` — "how many …", "number of …") fires the matching fact
+   itself (`_auto_facts`) even if the model never calls the tool, and the chat
+   route grounds such a question **on the fact alone** (dropping the candidate
+   photos), so a weak model cannot miscount the few photos shown.
+5. **Context assembly** builds a compact block per verified photo: id, date,
+   caption, top tags, and its EXIF facts — camera, lens, ISO, aperture, shutter,
+   focal length, coordinates when present. ~60 tokens each. The facts let "what
+   lens did I use most on that trip?" be answered from data, not captions.
+6. **Gemma 4 answers**, grounded only on those blocks, citing photos as
+   `[photo:123]`. The UI **streams** tokens over SSE and renders each citation
+   inline as a clickable thumbnail. The loop drives *retrieval* only; the answer
+   still streams — it is not produced inside the loop.
+
+**Agentic RAG flow.** Cheapest layer first; every stage degrades to plain fusion.
+
+```mermaid
+flowchart TB
+    quest["User question · /chat"] --> gate{"Off-topic gate<br/>one-word classifier: about the photos?"}
+    gate -->|no| refuse["Short refuse: answers only about your photos<br/>· skips retrieval entirely"]
+    gate -->|yes| plan["1 · Plan → QuerySpec §9.1<br/>hard_filters (EXIF+date) + soft_tags hints"]
+    plan --> core["2 · Core §9.2: candidates() + _hard_filter<br/>same fusion as /library · EXACT EXIF/date cut"]
+    core -->|hard filter empties a non-empty pool| honestfilter["Honest 'couldn't find X'<br/>· NO sources (EXIF/date fact mismatch)"]
+    core -->|survivors| rerank["3 · Caption-cosine rerank + floor (search/rerank.py)<br/>NOT core's refine() — its fused rank is unconditional content,<br/>which would resurrect confabulation · NO caption vector = kept"]
+    rerank -->|nothing clears the floor| honest["Honest 'couldn't find X'<br/>· NO sources"]
+    rerank -->|candidates| loop["4 · Bounded verify / refine agent loop<br/>candidate tools: search · similar · nearby (same core)<br/>fact tools: count · memories · periods (no candidates, one fact)<br/>drops non-fits, never invents"]
+    loop --> ctx["5 · Context assembly<br/>~60 tok/photo: id · date · caption · tags · EXIF facts<br/>+ any gathered count/memories/periods facts"]
+    ctx --> ans["6 · Gemma answers, grounded ONLY on blocks + facts<br/>streams SSE · cites [photo:id] as thumbnails"]
+
+    plan -.->|any failure → degrade| fb["plain semantic + keyword fusion<br/>chat/retrieve.py → core candidates() §9.2 · no second pipeline"]
+    core -.-> fb
+    rerank -.-> fb
+    loop -.-> fb
+    fb --> ans
+```
+
+**Off-topic guard.** Before retrieving anything, a one-word classifier
+(`chat/retrieve.py::is_photo_question`, prompt in `inference/prompts.py`)
+decides whether the question is actually about the photo collection — broadly:
+any question about the photos, the collection's totals/counts, its memories or
+other organizers, dates/periods, cameras, places, or a follow-up about a number
+the app already showed ("why do I see over 800?"). Only a question that is
+clearly unrelated to the library — general life advice, math, coding, world
+trivia, chit-chat — is refused with a short "I can only answer questions about
+your photos" reply, skipping retrieval entirely so unrelated questions never
+dump the library as false evidence. Any classifier error, or an unexpected
+reply, defaults to on-topic — a gate that occasionally lets an off-topic
+question through is far better than one that blocks a real question. Only
+questions that pass the gate reach retrieval.
+
+The answer is grounded only in the verified matches' captions and tags. When
+nothing clears the relevance floor, the model is instructed to say so rather than
+invent an answer, and no sources are shown. Captions are model-generated and
+imperfect, so the chat view always shows its sources — the thumbnails are the
+evidence. Shown and stored sources are the ids the answer actually **cites** (a
+subset of the verified matches), never the raw candidate set.
+
+**Degrade, never crash.** Any planner, rerank, embed, or loop failure falls back
+to the plain semantic + keyword fusion, so chat always answers. That fallback is
+itself the core's `candidates()` stage (§9.2) — it re-implements no ranking of its
+own, so fusion lives in exactly one place (plan 12 single-pipeline invariant).
 
 The view reads like a normal chat: each question and its grounded answer are kept
 on the page as a running conversation, a processing indicator shows while the
@@ -860,6 +1110,25 @@ change**. Overlap is a feature to embrace, not a conflict to resolve.
    *memories*, never collapses the overlap between an event and a theme.
 5. **Persist.** Each memory → `groups(kind='memory')` + `group_photos`; a photo may
    land in many. `params` records how it was built (kind, seed, model).
+
+The event-composition agent's `similar` expand tool (`albums/compose.py`) now
+goes through the one retriever core — `similar_photos` is a core wrapper (§9.2)
+— so how candidates reach the agent changed, but the agent still decides every
+membership itself, unchanged.
+
+**Memory composition flow.** The agent decides every membership; heuristics only
+bound context. Runs only over processed photos.
+
+```mermaid
+flowchart TB
+    lib["Owner's PROCESSED photos<br/>caption + embedding present"] --> pool["1 · Pool (cheap, NO decisions)<br/>coarse sessions by time + ~50 km region<br/>— only to bound context"]
+    pool --> events["2 · Compose events (AGENT, per session)<br/>reads summaries, decides the carve<br/>tools: similar · facets · nearby-in-time · same-subject"]
+    lib --> themes["3 · Discover themes (AGENT + RAG)<br/>propose thread → retrieve candidates → curate"]
+    events --> recon["4 · Reconcile (AGENT)<br/>dedupe, merge fragments, final titles/covers<br/>keeps event⇆theme overlap"]
+    themes --> recon
+    recon --> persist["5 · Persist<br/>groups(kind='memory') + group_photos (many-to-many)<br/>params = signature: owner count + newest updated_at"]
+    persist --> ui["/organize?by=memories<br/>manual background rebuild · stale flag when signature moves"]
+```
 
 **Cost is bounded, per §9.1** (this is the batch, offline exception to the
 one-call rule): per-session and per-theme agent loops are capped at a few rounds
@@ -1030,8 +1299,10 @@ The tool moves other people's photographs, so its defaults are paranoid.
   (§3.2c) with its photo count and a confirm-guarded **Delete from library**
   button (a folder mid-deletion shows "deleting…"). Below it, a **directory-only**
   picker adds a new folder; watch client-side hashing, the transfer, then live
-  processing progress per stage with counts, throughput, ETA, and failed files
-  (Web Worker for hashing/upload, HTMX polling for processing). Every stage row
+  processing progress per stage with counts, **per-stage throughput** (`done/sec`,
+  measured from recent `jobs.updated_at` so it is derived — not stored — and the
+  last speed **survives a restart**), and failed files (Web Worker for
+  hashing/upload, HTMX polling for processing). Every stage row
   carries its own **Reprocess** button that re-runs just that stage over the
   already-uploaded library without re-uploading — `thumbnail`, `embed`, `taxonomy`
   (re-tag), and a confirm-guarded `caption` (re-caption, the slow one); the worker
@@ -1064,7 +1335,18 @@ The tool moves other people's photographs, so its defaults are paranoid.
   badges (the "AI data"), the full EXIF panel — including GPS **coordinates**,
   which live here as a technical detail and nowhere else — every local path the
   file arrived from with the wasted-space total when there is more than one, and a
-  "similar photos" strip. Each similar thumbnail is **enlarged and labelled with
+  "similar photos" strip. The photo itself and everything above render on first
+  paint; the similar strip is the one expensive part (a full-library scan), so it
+  loads **asynchronously** — the page ships a placeholder that fires
+  `GET /photo/{id}/similar` on load and swaps in the finished strip (§9.2) — so
+  opening a photo is never delayed by it. When the photo was opened within an album or memory, a
+  **collage of that whole collection** — every photo in it, the current one
+  highlighted — sits between the photo and the similar strip; each thumbnail opens
+  in place (`replace`, §13.1) so paging stays within the collection, and the
+  collage uses the **same tile size as the similar strip** so the two read as one
+  gallery. The similar strip then **excludes any photo already in that collection**,
+  so a member never appears twice. Each similar
+  thumbnail is **enlarged and labelled with
   why it matched** — its top-3 reasons (shared tags / caption words / "looks
   alike") with confidence percentages, one per line, sorted highest-confidence
   first, overlaid on the image — so similarity is never a black box (§9). Opening a
@@ -1090,7 +1372,10 @@ The tool moves other people's photographs, so its defaults are paranoid.
   default month). Live principles recompute on selection; `memories` reads stored rows and
   offers a "Rebuild memories" control that queues the background build, showing a
   live `done/total (%)` indicator (HTMX polling) while it runs and reloading to the
-  finished albums when it completes.
+  finished albums when it completes. The **last-opened organizer and grain are
+  remembered** (a per-owner cookie), so loading `/organize` from the nav returns to
+  the view you last used — memories, place, or a specific date grain — rather than
+  snapping back to the default date view ("never lose the user's place").
 - `/chat` — a normal chat view: a running **conversation history** of questions
   and their grounded answers, a text **input** at the bottom, a **processing
   indicator** while the model works, streamed answer tokens, and inline thumbnail
@@ -1098,7 +1383,9 @@ The tool moves other people's photographs, so its defaults are paranoid.
   re-rendered server-side on load, so it survives navigation and restarts; a **New
   session** button starts a fresh conversation. Each question is grounded
   independently — retrieval runs per question, and the persisted history is the
-  transcript, not multi-turn model memory.
+  transcript, not multi-turn model memory. A cited thumbnail opens the photo as a
+  **leaf of the chat grid** (`ctx=chat`, §13.1), so closing it returns to the
+  conversation, not the library.
 
 The nav order is **Upload → Library → Chat → Organize**: bring photos in, browse
 and search them, ask about them to understand the collection, then — last, once
@@ -1122,6 +1409,9 @@ drill-down follows them exactly.
    - `ctx=similar:<id>` → the library grid; the origin photo `<id>` is shown as
      clickable **context** (a thumbnail in the header), but it is **not** the
      parent — close still goes up to the library.
+   - `ctx=chat` → the grid is the **conversation**; close returns to `/chat`. A
+     cited thumbnail carries this ctx, and it pages within the photos the current
+     chat session cited (its evidence set), never the wider library.
 
 3. **History invariant: `[grid, leaf]` — depth two, always.** Grid→leaf (clicking
    a photo in a grid) is the ONE `push`. Every move at the leaf level —
@@ -1202,7 +1492,7 @@ albums/                # Organize tab — grouping into described albums
   memories_build.py    # agentic RAG builder + owner-level worker job  (plan 07)
   registry.py
 chat/                  #                                     (plan 06)
-  retrieve.py          # off-topic gate + question -> top photo ids via fusion
+  retrieve.py          # off-topic gate + fusion fallback (via core candidates)
   context.py           # photo ids -> compact grounding block
   history.py           # persisted chat sessions/messages + answer HTML render
 web/
@@ -1293,6 +1583,7 @@ reorganizing the disk matters more than chat does.
 | SigLIP on CPU makes the `mac` embed pass slow | ~1.5 h one-time for 5,000 photos, and it is a background stage; `cuda` on the other profiles |
 | Jetson 8 GB cannot hold SigLIP and the captioner together | Stages drain library-wide in order, so the two are never resident at once |
 | SigLIP zero-shot scores are poorly calibrated across dimensions | Per-dimension thresholds tuned against a ~100-photo hand-labeled dev set in phase 2 |
+| Chat rerank floor set too high hides real matches, too low lets confabulation back in | The floor is tuned by F1 on a ~100-photo hand-labelled query/relevance dev set (§10, plan 10), the same way the SigLIP thresholds are |
 | Overnight indexing fails silently partway | Per-photo, per-stage job rows; resume on restart; failed files surfaced in the UI |
 | HEIC and RAW files fail to open | `pillow-heif` for HEIC; RAW files are skipped in v1 and logged, not silently dropped |
 | Captions are wrong and mislead chat answers | Chat always renders source thumbnails; captions display their model name |
@@ -1313,13 +1604,48 @@ reorganizing the disk matters more than chat does.
 - Offline reverse geocoding place names — the "By place" organizer names albums
   by city and a `place_city`/`place_country` sidebar facet filters the library by
   place (plan 08, done). Future: sub-city neighbourhoods and user-editable labels.
-- Agentic RAG + reranking for chat retrieval (plan 10). Chat is one-shot fusion
-  today and dumps loosely-related photos with a sometimes-confabulated answer; the
-  future phase reranks candidates against the question, applies a relevance floor
-  (honest "nothing found" instead of 30 neighbours), reuses the query planner, and
-  adds a bounded verify-before-answer agent loop — the documented interactive
-  exception to §9.1's "one call" rule.
+- Agentic RAG + reranking for chat retrieval (plan 10, **done**). Chat routes the
+  question through the query planner, reranks candidates by caption-meaning cosine,
+  applies a relevance floor (honest "nothing found" instead of 30 neighbours), and
+  runs a bounded verify-before-answer agent loop — the documented interactive
+  exception to §9.1's "one call" rule (see §10). Still future here: multi-turn
+  conversational memory and a learned reranker model.
 - Postgres and pgvector if concurrent writes become a real constraint.
 - Video support.
 - A watch mode for `ivms777-sync` that uploads new files as they appear.
+- **MCP server exposing the organized library, read-only (plan 11).** The
+  counterpart to stage 2: instead of exporting a change plan to reshape the disk,
+  expose the *organized* library over the Model Context Protocol so an external
+  agent (Claude Desktop, a local agent) reads it live — `search`, ask-your-library,
+  list memories/albums, get a photo with its metadata, get the export plan as a
+  resource. Read-only and single-owner over stdio (no auth, matching §3.2); it
+  goes through the app's read layer only (`app` serves reads, §5) and never writes
+  disk or DB, so "source folders are sacred" (§3.2c) still holds. Hosted,
+  multi-tenant MCP with per-owner tokens waits on the auth work above (v02).
 - User-defined layouts, expressed as a path template over facets and tags.
+- **Chat degradation now covers empty results, not only exceptions (done).** §10's
+  rerank keeps a candidate whose `caption_vec` is not computed yet (signal-unavailable,
+  not floored), so a partially-processed library no longer answers a false "no photos
+  matching". An honest "no sources" now means the candidate pool truly has no caption
+  match. The soft `_narrow` predicate this bullet originally shipped was superseded by
+  plan 12's `hard_filters`/`soft_tags` split (§9.2) — see §10 steps 2–3.
+- **One graceful retriever core shared by search, similar, chat, and memory
+  (done, plan 12).** Retrieval used to be duplicated and inconsistent: similar
+  degraded gracefully by scoring additively; chat's `_narrow` and rerank floor were
+  hard gates that wiped everything when one signal was absent; `/library` search and
+  memory each rolled their own fusion/retrieval calls. All four now sit on **one
+  core**, `search/retriever.py` (§9.2): `candidates()` (fast, no LLM) then `refine()`
+  (hard EXIF/date filter → additive graceful scoring, `search/scoring.py`). `/library`
+  search and `/photo` similar call it directly, no agent, no per-click latency
+  (§9.1) — `similar_photos` is now a thin wrapper over `refine(candidates())`. Chat's
+  `retrieve()` (§10) calls the core's `candidates()` + hard-filter, then keeps its own
+  caption-cosine floor rather than `refine()`, for the reason §10 explains (the core's
+  fused rank is unconditional content, which would resurrect confabulation); its outer
+  "degrade, never crash" fallback (`chat/retrieve.py`) now also routes through the core's
+  `candidates()`, so the last stray fusion is gone — fusion lives in exactly one place.
+  Memory's event-composition `similar` tool (§11) also routes through the core. `/photo` (task
+  3b, **done**) now paints instantly and loads the similar strip asynchronously via
+  `GET /photo/{id}/similar` (§9.2, §13) — first paint never waits on the full-library
+  scan. Still open: splitting that async fragment itself into **phase-1 KNN paint,
+  phase-2 `refine()` swap** (§9.2) — today the fragment runs the whole
+  `refine(candidates())` in one call; the finer two-stage split remains a follow-up.

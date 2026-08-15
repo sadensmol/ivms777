@@ -21,6 +21,20 @@ wrong until it is fixed.
 Sections are numbered. Cite them when discussing changes (`§6.1`, `§3.2`) so it
 is obvious what is being changed.
 
+**The mermaid diagrams are part of that source of truth.** They are canonical —
+one diagram per concern, no ASCII copy to drift:
+
+- `§5` — system/container architecture (the boxes and the flows between them).
+- `§9` — search & fusion flow, and the similar-photo scoring flow.
+- `§10` — the agentic-RAG chat flow.
+- `§11` — the memory-composition flow.
+
+Any change that adds, removes, or re-wires a step, signal, tool, filter, or a flow
+between them — a new retrieval stage, a changed rerank/floor, a new agent tool, a
+moved responsibility, a new service or external writer — updates the owning mermaid
+block in the **same turn** as the code, exactly like any other design edit. If a
+diagram and the running system disagree, the diagram is wrong until it is fixed.
+
 ## Plans
 
 `docs/plans/NN-*.md` are execution plans derived from the design. They are

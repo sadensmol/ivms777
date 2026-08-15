@@ -103,27 +103,29 @@
     </table>
   </aside>
 </div>
-<h3>Similar photos</h3>
-{% if similar %}
-<div class="similar-strip">
-  {% for s in similar %}
-    {# Open a similar photo IN its similar-to-<this> layer. REPLACE (not push) so
-       history stays [grid, photo] and close always goes up to the grid, never
-       replaying the chain of photos visited (§13, CLAUDE.md navigation rules). #}
-    <a class="similar-item" href="/photo/{{ s.id }}?ctx=similar:{{ photo['id'] }}"
+{% if collection_grid %}
+{# The whole collection (memory/album) as a collage, the current photo highlighted.
+   Each opens in place (replace) carrying ctx forward, so paging stays within the
+   collection and "close" still lands on the grid (§13.1). #}
+<h3>{{ collection.title }} — {{ collection_grid|length }} photos</h3>
+<div class="collection-collage">
+  {% for pid in collection_grid %}
+    <a class="collage-item{{ ' current' if pid == photo['id'] else '' }}"
+       href="/photo/{{ pid }}{{ q }}" title="Photo {{ pid }}"
        onclick="location.replace(this.href);return false;">
-      <img src="/thumb/{{ s.id }}?size=detail" loading="lazy" alt="">
-      <div class="similar-why">
-        {% for r in s.reasons %}
-          <div class="why-line"><span class="why-label">{{ r.text }}</span><span class="why-pct">{{ r.pct }}%</span></div>
-        {% endfor %}
-      </div>
+      <img src="/thumb/{{ pid }}" loading="lazy" alt="">
     </a>
   {% endfor %}
 </div>
-{% else %}
-<p class="hint">No similar photos — nothing in the library shares this one's tags, caption words, or looks close enough.</p>
 {% endif %}
+{# The similar-photos scan is expensive (full-library), so it never blocks first
+   paint — this placeholder fires as soon as the page loads and HTMX swaps in the
+   finished strip from the fragment route (§9.2, §13). #}
+<div id="similar" hx-get="/photo/{{ photo['id'] }}/similar{{ ('?' + ctx_query) if ctx_query else '' }}"
+     hx-trigger="load" hx-swap="outerHTML">
+  <h3>Similar photos</h3>
+  <p class="hint">Finding similar photos…</p>
+</div>
 <script>
   // Desktop keyboard paging: ← newer, → older. Mirrors the ‹/› buttons.
   (function () {

@@ -12,6 +12,7 @@ from ingest.facets import backfill_place_facets
 from ingest.folders import process_folder_deletions
 from ingest.taxonomy import backfill_taxonomy, taxonomy_handler
 from ingest.thumbs import backfill_thumbnails
+from ingest.jobs import requeue_stalled
 from ingest.vocab import load_vocab, seed_tags
 from ingest.worker import drain, thumbnail_handler
 from web.deps import build_context
@@ -27,6 +28,9 @@ def main() -> None:
     client, caption_model = settings.build_inference_client()
     vocab = load_vocab(VOCAB_PATH)
     seed_tags(context.conn, vocab)
+    # Reclaim jobs a previous worker was mid-processing when it was killed (a crash,
+    # or the dev auto-reloader) — otherwise they sit 'running' forever (§8).
+    requeue_stalled(context.conn)
     handlers = {
         "thumbnail": thumbnail_handler(
             context.originals, context.derived,

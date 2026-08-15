@@ -134,14 +134,25 @@ def test_photo_page_shows_model_tags_grouped_by_dimension(client):
     assert "siglip" in body  # the source badge
 
 
+def test_photo_page_defers_the_similar_strip(client):
+    # The similar-photos scan is expensive; the page must render immediately and
+    # hand the strip to an async HTMX fetch instead of blocking on it.
+    photo_id = _first_id(client)
+    body = client.get(f"/photo/{photo_id}").text
+    assert "similar-item" not in body
+    assert f'hx-get="/photo/{photo_id}/similar"' in body
+    assert 'hx-trigger="load"' in body
+
+
 def test_similar_strip_lists_other_photos_with_reasons_and_ctx(client):
+    # This strip now loads via the async fragment route, not the /photo body.
     ctx = client.app.state.context
     fake = FakeEmbedder()
     base = _first_id(client)
     write_vector(ctx.conn, base, fake.embed_texts(["a"])[0])
     other = add_photo(ctx.conn, content_hash="bb" * 32, thumb_key="bb.jpg")
     write_vector(ctx.conn, other, fake.embed_texts(["a"])[0])  # identical → nearest
-    body = client.get(f"/photo/{base}").text
+    body = client.get(f"/photo/{base}/similar").text
     assert f"/thumb/{other}" in body
     assert "why-line" in body                                    # reasons overlaid on the photo
     assert f'href="/photo/{other}?ctx=similar:{base}"' in body   # drills into the similar layer

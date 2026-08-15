@@ -75,7 +75,7 @@ def answer_html(text: str) -> str:
     static HTML, not re-streamed). html.escape leaves [ ] intact, so the regex
     still matches after escaping."""
     return _CITE.sub(
-        lambda m: f'<a href="/photo/{m.group(1)}">'
+        lambda m: f'<a href="/photo/{m.group(1)}?ctx=chat">'
         f'<img class="cite" src="/thumb/{m.group(1)}" alt="photo {m.group(1)}"></a>',
         html.escape(text),
     )

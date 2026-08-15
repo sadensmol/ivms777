@@ -119,6 +119,60 @@ def reprocess_one(conn: sqlite3.Connection, photo_id: int, stage: str) -> None:
     )
 
 
+def requeue_stalled(conn: sqlite3.Connection) -> int:
+    """Return every 'running' job to 'pending' — call once at worker startup.
+
+    A job is 'running' only while a worker holds it; a killed or restarted worker
+    (a crash, or `watchfiles` reloading it on a code change) leaves its in-flight
+    jobs stranded in 'running', and `claim_next` only picks 'pending', so they
+    would never run again. At startup no job is legitimately running yet, so any
+    'running' row is an orphan to reclaim — this is what makes §8's "resume exactly
+    where it stopped" true across restarts. Single-owner (§3.2), so there is no
+    live worker whose job this could steal. Returns how many were requeued.
+    """
+    cur = conn.execute(
+        "UPDATE jobs SET status = 'pending', updated_at = ? WHERE status = 'running'",
+        (_now(),),
+    )
+    return cur.rowcount
+
+
+def format_speed(per_sec: float | None) -> str | None:
+    """Human-readable throughput label (§13). Fast stages read per second; a slow
+    stage like captioning (~30 s each) reads per minute instead of rounding to a
+    misleading `0.0/s`."""
+    if not per_sec:
+        return None
+    if per_sec >= 1.0:
+        return f"{per_sec:.1f}/s"
+    return f"{per_sec * 60:.1f}/min"
+
+
+def stage_speed(conn: sqlite3.Connection, stage: str, window: int = 50) -> float | None:
+    """Recent throughput for a stage — completed jobs per second (§13).
+
+    Measured over the most recent `window` completions from `jobs.updated_at`
+    (set by `complete`). Because that history lives in the database, the last
+    processing speed **survives a restart**: a freshly-started process reads the
+    same rows and reports the last session's rate with no in-memory state. Returns
+    None until there are two timed completions to measure a span across, or when
+    all of them share one instant (a fully-batched stage in under a second).
+    """
+    rows = conn.execute(
+        "SELECT updated_at FROM jobs WHERE stage = ? AND status = 'done'"
+        " AND updated_at IS NOT NULL ORDER BY updated_at DESC LIMIT ?",
+        (stage, window),
+    ).fetchall()
+    if len(rows) < 2:
+        return None
+    newest = datetime.fromisoformat(rows[0]["updated_at"])
+    oldest = datetime.fromisoformat(rows[-1]["updated_at"])
+    span = (newest - oldest).total_seconds()
+    if span <= 0:
+        return None
+    return (len(rows) - 1) / span  # N completions span N-1 intervals over `span`
+
+
 def stage_counts(conn: sqlite3.Connection, stage: str) -> dict[str, int]:
     counts = dict.fromkeys(STATUSES, 0)
     for row in conn.execute(

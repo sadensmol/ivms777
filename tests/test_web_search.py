@@ -51,3 +51,21 @@ def test_duplicates_filter_shows_only_multi_source_photos(client):
     body = client.get("/library?dupes=1").text
     assert f"/thumb/{dup}" in body
     assert "/thumb/1" not in body  # the beach photo has a single source
+
+
+def test_facet_filter_narrows_search_results(client):
+    # Candidate generation now goes through search/retriever.py's candidates(), but
+    # the hard EXIF-facet narrowing (_filter_where) must still apply exactly: a
+    # facet-mismatched photo is removed even though it matched the text query.
+    conn = client.app.state.context.conn
+    matching = add_photo(conn, content_hash="cc" * 32, thumb_key="cc.jpg")
+    write_vector(conn, matching, FakeEmbedder().embed_texts(["beach"])[0])
+    conn.execute(
+        "INSERT INTO photo_facets(photo_id, key, value_text) VALUES (?, 'camera_model', 'X-T5')",
+        (matching,),
+    )
+    # planned=1 skips the planner redirect (§9.1), which would otherwise rebuild
+    # the param set from a planner spec and drop the explicit f_camera_model.
+    body = client.get("/library?q=beach&f_camera_model=X-T5&planned=1").text
+    assert f"/thumb/{matching}" in body
+    assert "/thumb/1" not in body  # photo 1 also matches "beach" but has no camera_model

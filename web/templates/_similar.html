@@ -1,0 +1,23 @@
+<div id="similar">
+<h3>Similar photos</h3>
+{% if similar %}
+<div class="similar-strip">
+  {% for s in similar %}
+    {# Open a similar photo IN its similar-to-<this> layer. REPLACE (not push) so
+       history stays [grid, photo] and close always goes up to the grid, never
+       replaying the chain of photos visited (§13, CLAUDE.md navigation rules). #}
+    <a class="similar-item" href="/photo/{{ s.id }}?ctx=similar:{{ photo['id'] }}"
+       onclick="location.replace(this.href);return false;">
+      <img src="/thumb/{{ s.id }}?size=detail" loading="lazy" alt="">
+      <div class="similar-why">
+        {% for r in s.reasons %}
+          <div class="why-line"><span class="why-label">{{ r.text }}</span><span class="why-pct">{{ r.pct }}%</span></div>
+        {% endfor %}
+      </div>
+    </a>
+  {% endfor %}
+</div>
+{% else %}
+<p class="hint">No similar photos — nothing in the library shares this one's tags, caption words, or looks close enough.</p>
+{% endif %}
+</div>

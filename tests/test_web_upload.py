@@ -23,6 +23,19 @@ def test_upload_page_shows_stage_progress(client):
     assert "thumbnail" in client.get("/upload").text
 
 
+def test_progress_shows_per_stage_throughput(client):
+    # Two captions finished 1s apart -> 1.0/s, rendered on the caption row.
+    conn = client.app.state.context.conn
+    for pid, when in ((1, "2026-01-01T00:00:00"), (2, "2026-01-01T00:00:01")):
+        add_photo(conn, photo_id=pid, content_hash=f"h{pid}", thumb_key=f"{pid}.jpg")
+        conn.execute(
+            "INSERT INTO jobs(photo_id, stage, status, updated_at)"
+            " VALUES (?, 'caption', 'done', ?)",
+            (pid, when),
+        )
+    assert "1.0/s" in client.get("/upload/progress").text
+
+
 def test_upload_page_remembers_the_current_folder_across_restarts(client):
     conn = client.app.state.context.conn
     # A completed upload from a folder — the persisted `uploads` row is what a

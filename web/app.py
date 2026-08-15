@@ -1,5 +1,6 @@
 import json
 import threading
+import time
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -18,6 +19,7 @@ from albums.memories import MemoriesOrganizer
 from albums.memories_build import build_memories
 from albums.memory_store import current_signature, stored_signature
 from albums.registry import ORGANIZERS, get_organizer
+from chat.agent import agent_retrieve, is_aggregate_question
 from chat.context import build_context as build_chat_context
 from chat.history import (
     add_message,
@@ -26,14 +28,21 @@ from chat.history import (
     new_session,
     session_messages,
 )
-from chat.retrieve import is_photo_question, retrieve
+from chat.retrieve import is_photo_question
 from config import Settings
 from inference.prompts import chat_messages
 from ingest.caption import backfill_caption_vectors, backfill_captions, caption_handler
-from ingest.folders import enqueue_folder_deletion, list_folders, process_folder_deletions
 from ingest.embed import backfill_embeds, embed_handler
 from ingest.facets import backfill_place_facets
-from ingest.jobs import STAGES, reprocess, reprocess_one, stage_counts
+from ingest.folders import enqueue_folder_deletion, list_folders, process_folder_deletions
+from ingest.jobs import (
+    STAGES,
+    format_speed,
+    reprocess,
+    reprocess_one,
+    stage_counts,
+    stage_speed,
+)
 from ingest.taxonomy import backfill_taxonomy, taxonomy_handler
 from ingest.thumbs import backfill_thumbnails, thumb_key
 from ingest.vocab import load_vocab, seed_tags
@@ -46,10 +55,9 @@ from search.facets import (
     facet_counts,
     parse_filters,
 )
-from search.fusion import reciprocal_rank_fusion
-from search.keyword import keyword_search
 from search.planner import plan, spec_to_params
-from search.semantic import search_photos, similar_photos, similarity_breakdown
+from search.retriever import Query, candidates
+from search.semantic import similar_photos, similarity_breakdown
 from search.tags import parse_tag_filters, tag_sidebar, tag_where
 from web.deps import AppContext, build_context
 from web.upload_api import register as register_upload_api
@@ -95,6 +103,16 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.context = build_context(settings)
     templates = Jinja2Templates(directory=str(TEMPLATE_DIR))
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+    def _static_v(name: str) -> str:
+        # Cache-bust static assets by file mtime: the URL changes whenever the file
+        # does, so a browser never serves a stale app.css / chat.js after a rebuild.
+        try:
+            return str(int((STATIC_DIR / name).stat().st_mtime))
+        except OSError:
+            return "0"
+
+    templates.env.globals["static_v"] = _static_v
 
     # Load the taxonomy vocabulary once and seed the tag ids so the taxonomy stage
     # can reference them; seeding is idempotent.
@@ -188,11 +206,9 @@ def create_app(settings: Settings) -> FastAPI:
         ))
 
     def _search_page(ctx: AppContext, params: dict[str, str], query: str, offset: int) -> list:
-        # Semantic + keyword rankings, fused; facet/tag filters narrow the survivors.
+        # Candidate generation via the retriever core (§9.2); facet/tag filters narrow the survivors.
         embedder, _ = ctx.settings.build_embedder()
-        semantic = search_photos(ctx.conn, embedder, ctx.settings.owner_id, query, k=200)
-        keyword = keyword_search(ctx.conn, ctx.settings.owner_id, query, k=200)
-        fused = reciprocal_rank_fusion([semantic, keyword])
+        fused = candidates(ctx.conn, embedder, ctx.settings.owner_id, Query(text=query, k=200))
         if not fused:
             return []
         where, where_params = _filter_where(ctx, params)
@@ -377,6 +393,14 @@ def create_app(settings: Settings) -> FastAPI:
         request: Request, by: str | None = None, grain: str | None = None
     ) -> HTMLResponse:
         ctx = context()
+        # Return to the organizer/grain last opened, so loading /organize from the
+        # nav restores it instead of snapping back to the default date view
+        # ("never lose the user's place"). The choice rides a cookie, rewritten
+        # below to the resolved organizer so a stale value self-heals.
+        if by is None:
+            by = request.cookies.get("organize_by")
+            if grain is None:
+                grain = request.cookies.get("organize_grain")
         organizer = get_organizer(by)
         albums = organizer.organize(ctx.conn, ctx.settings.owner_id, grain)
         # The grain sub-selector only applies to the date organizer.
@@ -388,7 +412,7 @@ def create_app(settings: Settings) -> FastAPI:
         memories_stale = is_memories and (
             stored_signature(ctx.conn, owner_id) != current_signature(ctx.conn, owner_id)
         )
-        return templates.TemplateResponse(
+        response = templates.TemplateResponse(
             request,
             "organize.html",
             {
@@ -402,6 +426,13 @@ def create_app(settings: Settings) -> FastAPI:
                 "memories_building": app.state.memories_building,
             },
         )
+        # Remember this choice for the next bare /organize load (one year).
+        response.set_cookie("organize_by", organizer.name, max_age=31_536_000,
+                            samesite="lax", httponly=True)
+        if is_date:
+            response.set_cookie("organize_grain", active_grain, max_age=31_536_000,
+                                samesite="lax", httponly=True)
+        return response
 
     @app.post("/organize/memories/rebuild")
     def memories_rebuild() -> RedirectResponse:
@@ -470,9 +501,7 @@ def create_app(settings: Settings) -> FastAPI:
         query = params.get("q", "").strip()
         if query:
             embedder, _ = ctx.settings.build_embedder()
-            semantic = search_photos(ctx.conn, embedder, owner, query, k=200)
-            keyword = keyword_search(ctx.conn, owner, query, k=200)
-            fused = reciprocal_rank_fusion([semantic, keyword])
+            fused = candidates(ctx.conn, embedder, owner, Query(text=query, k=200))
             where, where_params = _filter_where(ctx, params)
             if where and fused:
                 placeholders = ", ".join("?" for _ in fused)
@@ -527,12 +556,48 @@ def create_app(settings: Settings) -> FastAPI:
                     "origin_id": origin["id"],  # the photo this layer is similar to
                 }
             # The origin is gone — fall back to the library.
+        if ctx_param == "chat":
+            # A cited photo's grid IS the conversation (§13.1): page within the
+            # photos this chat session actually cited, and "close" returns to /chat.
+            return {
+                "ids": _session_cited_ids(ctx.conn, owner),
+                "title": "Chat",
+                "description": None,
+            }
         query = params.get("q", "").strip()
         return {
             "ids": _ordered_ids(params),
             "title": f"Search: {query}" if query else "Library",
             "description": None,
         }
+
+    def _collection_for_photo(
+        ctx_param: str | None, params: dict[str, str], photo_id: int
+    ) -> tuple[dict, str | None, list[int]]:
+        # Resolve the collection a photo pages within, falling back to the whole
+        # library if the photo isn't actually a member (a stale link, a "similar"
+        # jump). Shared by /photo and /photo/{id}/similar so both agree on exactly
+        # which collection's members the similar strip must exclude (§13).
+        collection = _photo_context(ctx_param, params)
+        ids = collection["ids"]
+        if photo_id not in ids:
+            ids = _ordered_ids({})
+            collection = {"title": "Library", "description": None, "ids": ids}
+            ctx_param = None
+        return collection, ctx_param, ids
+
+    def _session_cited_ids(conn, owner_id: int) -> list[int]:
+        # The photos the current chat session cited, first-appearance order — the
+        # ordered "grid" a cited photo pages within (§13.1).
+        session_id = current_session(conn, owner_id)
+        seen: dict[int, None] = {}
+        for row in conn.execute(
+            "SELECT sources FROM chat_messages WHERE session_id = ? ORDER BY id",
+            (session_id,),
+        ):
+            for pid in json.loads(row["sources"] or "[]"):
+                seen.setdefault(int(pid), None)
+        return list(seen)
 
     def _lookup_photo(conn, owner_id: int, raw_id: str):
         try:
@@ -545,6 +610,8 @@ def create_app(settings: Settings) -> FastAPI:
 
     def _origin_url(ctx_param: str | None, params: dict[str, str]) -> str:
         # The layer a photo was opened from — where "close" returns to.
+        if ctx_param == "chat":
+            return "/chat"
         if ctx_param and ctx_param.startswith("album:"):
             parts = ctx_param.split(":", 3)
             if len(parts) == 4:
@@ -584,28 +651,18 @@ def create_app(settings: Settings) -> FastAPI:
             tags.setdefault(row["dimension"], []).append(
                 {"label": row["label"], "score": row["score"], "source": row["source"]}
             )
-        similar = similar_photos(
-            ctx.conn, ctx.settings.owner_id, photo_id, k=12,
-            min_cosine=ctx.settings.similar_min_cosine,
-            caption_min=ctx.settings.similar_caption_min,
-            dimension_weights=vocab.dimension_weights,
-        )
-
         # Page within the collection this photo was opened from (§13) — never leak
         # into another memory/album. `ctx` names the collection; ids are its order.
         params = _params(request)
         ctx_param = params.get("ctx")
-        collection = _photo_context(ctx_param, params)
-        ids = collection["ids"]
-        if photo_id not in ids:
-            # Opened outside any collection (a "similar" jump, a stale link) — fall
-            # back to the whole library so paging still works.
-            ids = _ordered_ids({})
-            collection = {"title": "Library", "description": None, "ids": ids}
-            ctx_param = None
+        collection, ctx_param, ids = _collection_for_photo(ctx_param, params, photo_id)
         index = ids.index(photo_id) if photo_id in ids else -1
         prev_id = ids[index - 1] if index > 0 else None
         next_id = ids[index + 1] if 0 <= index < len(ids) - 1 else None
+        # A memory/album is a bounded set, so the leaf can show the WHOLE collection
+        # as a collage (§13). The library/search/similar collections are unbounded
+        # or already shown, so they get no collage.
+        collection_grid = ids if (ctx_param and ctx_param.startswith("album:")) else None
 
         # Opened from another photo's "similar" strip: explain the match, base vs
         # this photo, strongest facet first (§13).
@@ -626,7 +683,7 @@ def create_app(settings: Settings) -> FastAPI:
             "photo.html",
             {
                 "photo": photo, "sources": sources, "facets": facets,
-                "similar": similar, "wasted_bytes": wasted,
+                "wasted_bytes": wasted,
                 "similarity": similarity,
                 "embedded": photo["embedding_model"] is not None,
                 "tags": tags,
@@ -634,9 +691,42 @@ def create_app(settings: Settings) -> FastAPI:
                 "ctx_query": urlencode(keep),
                 "origin_url": _origin_url(ctx_param, params),
                 "collection": collection,
+                "collection_grid": collection_grid,
                 "position": index + 1 if index >= 0 else None,
                 "total": len(ids),
             },
+        )
+
+    @app.get("/photo/{photo_id}/similar", response_class=HTMLResponse)
+    def photo_similar(request: Request, photo_id: int) -> HTMLResponse:
+        # The async counterpart to /photo's placeholder (§9.2, §13): runs the
+        # expensive full-library similar scan off the critical path, resolving the
+        # SAME collection (and its member-exclusion) as the main route so the two
+        # never disagree.
+        ctx = context()
+        photo = ctx.conn.execute(
+            "SELECT id FROM photos WHERE id = ? AND owner_id = ?",
+            (photo_id, ctx.settings.owner_id),
+        ).fetchone()
+        if photo is None:
+            raise HTTPException(status_code=404)
+        similar = similar_photos(
+            ctx.conn, ctx.settings.owner_id, photo_id, k=12,
+            min_cosine=ctx.settings.similar_min_cosine,
+            caption_min=ctx.settings.similar_caption_min,
+            dimension_weights=vocab.dimension_weights,
+        )
+        params = _params(request)
+        ctx_param = params.get("ctx")
+        _collection, ctx_param, ids = _collection_for_photo(ctx_param, params, photo_id)
+        collection_grid = ids if (ctx_param and ctx_param.startswith("album:")) else None
+        if collection_grid:
+            # Don't repeat the collection's own photos in the "similar" strip — the
+            # collage already shows them; a member appearing twice is noise (§13).
+            members = set(collection_grid)
+            similar = [s for s in similar if s["id"] not in members]
+        return templates.TemplateResponse(
+            request, "_similar.html", {"photo": photo, "similar": similar},
         )
 
     def progress_payload() -> dict:
@@ -659,7 +749,10 @@ def create_app(settings: Settings) -> FastAPI:
             "SELECT COUNT(*) AS n FROM photos WHERE owner_id = ?", (ctx.settings.owner_id,)
         ).fetchone()["n"]
         return {
-            "stages": [(stage, stage_counts(ctx.conn, stage)) for stage in STAGES],
+            "stages": [
+                (stage, stage_counts(ctx.conn, stage), format_speed(stage_speed(ctx.conn, stage)))
+                for stage in STAGES
+            ],
             "failures": failures,
             # The folder currently in the library — persisted in `uploads`, so it
             # survives restarts (the file picker cannot remember a selection).
@@ -681,7 +774,10 @@ def create_app(settings: Settings) -> FastAPI:
         session_id = current_session(ctx.conn, ctx.settings.owner_id)
         return templates.TemplateResponse(
             request, "chat.html",
-            {"messages": session_messages(ctx.conn, session_id)},
+            {
+                "messages": session_messages(ctx.conn, session_id),
+                "model": ctx.settings.planner_model or "fake",
+            },
         )
 
     @app.post("/chat/new")
@@ -704,21 +800,56 @@ def create_app(settings: Settings) -> FastAPI:
         model = ctx.settings.planner_model or "fake"
         session_id = current_session(ctx.conn, owner_id)
 
+        def _done(**stats) -> str:
+            # The done event carries the model and, for a generated answer, its
+            # measured decode speed (tokens/sec) so the UI can show model info.
+            return "event: done\ndata: " + json.dumps({"model": model, **stats}) + "\n\n"
+
         def events():
             if not is_photo_question(client, model, q):
                 yield f"data: {json.dumps({'delta': OFF_TOPIC_REPLY})}\n\n"
                 add_message(ctx.conn, session_id, q, OFF_TOPIC_REPLY, [])
-                yield "event: done\ndata: {}\n\n"
+                yield _done()
                 return
-            ids = retrieve(ctx.conn, embedder, owner_id, q, k=30)
-            messages = chat_messages(q, build_chat_context(ctx.conn, ids))
+            # Agentic RAG (§10): plan -> fuse -> narrow -> rerank -> floor -> a
+            # bounded verify/refine loop. Grounds only on verified matches; when
+            # none clear the floor build_chat_context([]) yields the no-match
+            # sentinel and the model is told to say so — never a 30-photo dump.
+            # The loop may also call count/memories/periods fact tools (never a
+            # candidate dump) for a count/total/memory question; their results
+            # are threaded into the grounding context so the answer is grounded
+            # on a real number, never on the count of photos merely shown (§10).
+            ids, facts = agent_retrieve(
+                ctx.conn, embedder, client,
+                owner_id=owner_id, question=q, dimensions=list(vocab.dimensions),
+                caption_model=ctx.settings.caption_embed_model,
+                tag_score_min=ctx.settings.tag_score_min,
+                planner_model=model,
+            )
+            # A count/aggregate question is answered from the deterministic facts
+            # ALONE — never alongside the retrieved photos, or a weak model counts
+            # the handful shown and confabulates a total ("8 photos", §10).
+            if facts and is_aggregate_question(q):
+                context_block = "\n".join(facts)
+            else:
+                context_block = build_chat_context(ctx.conn, ids)
+                if facts:
+                    context_block = context_block + "\n\n" + "\n".join(facts)
+            messages = chat_messages(q, context_block)
             parts: list[str] = []
+            started_at = None
             for delta in client.stream(model, messages):
+                if started_at is None:  # clock starts at the first token, not the wait before it
+                    started_at = time.monotonic()
                 parts.append(delta)
                 yield f"data: {json.dumps({'delta': delta})}\n\n"
+            # Chunk count is a close proxy for tokens with an OpenAI-style stream
+            # (one token per chunk); good enough for a live decode-speed readout.
+            elapsed = (time.monotonic() - started_at) if started_at else 0.0
+            tok_per_sec = round(len(parts) / elapsed, 1) if elapsed > 0 else None
             answer = "".join(parts)
             add_message(ctx.conn, session_id, q, answer, cited_ids(answer))
-            yield "event: done\ndata: {}\n\n"
+            yield _done(tok_per_sec=tok_per_sec, tokens=len(parts))
 
         return StreamingResponse(events(), media_type="text/event-stream")
 

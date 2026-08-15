@@ -3,7 +3,12 @@
 {% block content %}
 <div class="chat">
   <div class="chat-head">
-    <h1>Ask your library</h1>
+    <div>
+      <h1>Chat</h1>
+      <div class="chat-model" id="chat-model" data-model="{{ model }}">
+        model: <strong>{{ model }}</strong><span id="chat-tps"></span>
+      </div>
+    </div>
     <form method="post" action="/chat/new">
       <button type="submit" class="new-session">New session</button>
     </form>
@@ -17,10 +22,10 @@
     {% endfor %}
   </div>
   <form id="chat-form" class="chat-input" onsubmit="return askLibrary(event)">
-    <input id="chat-q" name="q" type="text" autocomplete="off"
-           placeholder="Ask about your photos — “what lens did I use most in Italy?”">
+    <textarea id="chat-q" name="q" rows="4" autocomplete="off"
+              placeholder="Ask about your photos — “what lens did I use most in Italy?”  (Shift+Enter for a new line)"></textarea>
     <button id="chat-send" type="submit">Ask</button>
   </form>
 </div>
-<script src="/static/chat.js"></script>
+<script src="/static/chat.js?v={{ static_v('chat.js') }}"></script>
 {% endblock %}

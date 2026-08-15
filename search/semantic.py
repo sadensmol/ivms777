@@ -2,7 +2,7 @@ import math
 import sqlite3
 
 from embedding.base import Embedder
-from embedding.store import all_caption_vectors, knn, read_caption_vector, read_vector
+from embedding.store import all_caption_vectors, knn, read_caption_vector, read_vector, read_vectors
 from embedding.vectors import l2_normalize
 
 # "similar" spans the photo's WHOLE character — subject, vibe, emotion, setting,
@@ -130,7 +130,9 @@ def similar_photos(
 ) -> list[dict]:
     """Photos similar to a given one, with the REASON each is similar (§9).
 
-    Progressive, by what the pipeline has produced (graceful degradation):
+    A thin wrapper over the retriever core (§9.2, plan 12 task 3):
+    ``refine(candidates(Query(seed_photo_id=photo_id)))``. Progressive, by what
+    the pipeline has produced (graceful degradation):
       * no embedding yet -> nothing (the photo can't be compared);
       * embedding only    -> visual neighbours (image-vector KNN, cosine floor);
       * + taxonomy        -> add shared tags, per-dimension weighted;
@@ -144,58 +146,44 @@ def similar_photos(
     PILE of weak ones (five faint scene tags). Each result's `reasons` are its top-3
     contributions, shown sorted by match %, highest first.
 
+    The seed path is image-vector KNN dispatch ONLY — no planner, no SigLIP text
+    encoder, no `client.embed` — so `embedder`/`client` are never constructed here;
+    `candidates()`/`refine()` structurally cannot reach them for a seed query.
+
     Returns [{"id", "score", "cosine", "tags": [(dim, label)],
     "reasons": [{"text", "pct"}]}], best first.
     """
-    weights = dimension_weights or DEFAULT_SIMILAR_DIMENSION_WEIGHTS
-    vector = read_vector(conn, photo_id)
-    if vector is None:
-        return []  # no embedding: nothing to compare against yet
-    vector = l2_normalize(vector)
-    cosine = {
-        pid: 1.0 - dist * dist / 2.0  # unit vectors: L2^2 = 2(1-cos)
-        for pid, dist in knn(conn, owner_id, vector, max(k, 30), exclude_id=photo_id)
-    }
-    tag_hits = _tag_similarity(conn, owner_id, photo_id, weights)
-    caption_hits = _caption_similarity(conn, owner_id, photo_id, caption_min)
+    # Local import: search.retriever imports _tag_similarity/_caption_similarity/
+    # DEFAULT_SIMILAR_DIMENSION_WEIGHTS/search_photos FROM this module, so a
+    # top-level import here would be circular. By call time both modules are
+    # already fully loaded, so this is safe.
+    from search.retriever import Query, candidates, refine
 
-    results: list[dict] = []
-    candidates = set(tag_hits) | set(caption_hits) | {p for p, c in cosine.items() if c >= min_cosine}
-    for pid in candidates:
-        tag_contribs = tag_hits.get(pid, [])
-        cap_cos = caption_hits.get(pid)
-        cos = cosine.get(pid, 0.0)
-        near = cos >= min_cosine
-        # GATE: a candidate is "similar" only if it shares a CONTENT signal — the
-        # same subject, a caption that means the same, or a genuine near-dup look.
-        # Style/scene tags alone (top-down + overcast + cool…) never qualify it.
-        has_subject = any(c["tag"][0] in _CONTENT_TAG_DIMENSIONS for c in tag_contribs)
-        if not (has_subject or cap_cos is not None or near):
-            continue
-        contribs: list[dict] = list(tag_contribs)
-        if cap_cos is not None:
-            contribs.append({"text": "caption (meaning)", "pct": round(cap_cos * 100),
-                             "contrib": _CAPTION_WEIGHT * cap_cos})
-        if near:
-            contribs.append({"text": "looks alike", "pct": round(cos * 100),
-                             "contrib": _VECTOR_WEIGHT * cos})
-        if not contribs:
-            continue
-        contribs.sort(key=lambda c: -c["contrib"])
-        # Decayed sum: the strongest facet counts fully, each next one less — so a
-        # single subject match outweighs a heap of faint scene tags.
-        score = sum(c["contrib"] * (_DECAY ** i) for i, c in enumerate(contribs))
-        # Reasons in CONTRIBUTION order (relevance = importance × rarity × match),
-        # most relevant first — so a generic style tag like composition:top-down
-        # never leads over a subject/caption match just for a higher raw %.
-        reasons = [{"text": c["text"], "pct": c["pct"]} for c in contribs[:3]]
-        results.append({
-            "id": pid, "score": score, "cosine": cos,
-            "tags": [c["tag"] for c in tag_hits.get(pid, [])],
-            "reasons": reasons,
-        })
-    results.sort(key=lambda r: -r["score"])
-    return results[:k]
+    weights = dimension_weights or DEFAULT_SIMILAR_DIMENSION_WEIGHTS
+    query = Query(seed_photo_id=photo_id, k=k, weights=weights, floor=None)
+    ids = candidates(conn, None, owner_id, query, caption_min=caption_min)
+    results = refine(
+        conn, None, None, owner_id, query, ids, min_cosine=min_cosine, caption_min=caption_min
+    )
+
+    # The core's generic contract has no "cosine" field (search/chat/memory never
+    # need it); similar's own contract always has — batch-read the FINAL results'
+    # vectors (bounded to <= k, never one query per candidate) to add it back.
+    seed_vector = read_vector(conn, photo_id)
+    seed_vector = l2_normalize(seed_vector) if seed_vector is not None else None
+    result_vectors = read_vectors(conn, [r["id"] for r in results])
+
+    def _cosine_to_seed(pid: int) -> float:
+        cand_vector = result_vectors.get(pid)
+        if seed_vector is None or cand_vector is None:
+            return 0.0
+        return sum(a * b for a, b in zip(seed_vector, l2_normalize(cand_vector)))
+
+    return [
+        {"id": r["id"], "score": r["score"], "cosine": _cosine_to_seed(r["id"]),
+         "tags": r["tags"], "reasons": r["reasons"]}
+        for r in results
+    ]
 
 
 def similarity_breakdown(

@@ -1,9 +1,12 @@
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 
 from config import Settings
 from embedding.fakes import FakeEmbedder
-from embedding.store import write_vector
+from embedding.store import write_caption_vector, write_vector
+from embedding.vectors import l2_normalize
 from inference.fakes import FakeInferenceClient
 from tests.factories import add_photo
 from web.app import create_app
@@ -45,6 +48,18 @@ def test_stream_emits_tokens_then_done_no_candidate_strip(chat_client):
     assert "event: sources" not in body
 
 
+def test_chat_page_shows_the_model_in_use(chat_client):
+    assert 'id="chat-model"' in chat_client.get("/chat").text
+
+
+def test_stream_done_event_reports_model_and_decode_speed(chat_client):
+    body = chat_client.get("/chat/stream?q=beach").text
+    done = [ln for ln in body.splitlines() if ln.startswith("data:") and "model" in ln][-1]
+    stats = json.loads(done[len("data:"):])
+    assert stats["model"]  # the configured planner model, shown in the UI
+    assert "tok_per_sec" in stats and "tokens" in stats  # decode-speed readout
+
+
 def test_only_cited_photos_are_persisted_not_the_candidate_set(chat_client):
     # photo 2 (keyboard) is retrieved as a candidate but never cited; only the
     # cited photo 1 must be stored/shown, so the "30 thumbnails, 1 dog" mismatch
@@ -75,6 +90,85 @@ def test_new_session_clears_the_visible_history(chat_client):
     chat_client.post("/chat/new")
     body = chat_client.get("/chat").text
     assert "beach" not in body                        # the fresh session is empty
+
+
+def _searchable(conn, pid, caption, *, with_caption_vec=True):
+    add_photo(conn, photo_id=pid, content_hash=f"h{pid}", thumb_key=f"{pid}.jpg", caption=caption)
+    write_vector(conn, pid, FakeEmbedder().embed_texts([caption])[0])          # semantic fusion
+    if with_caption_vec:
+        write_caption_vector(conn, pid, l2_normalize(FakeInferenceClient().embed("fake", [caption])[0]))
+
+
+def test_chat_grounds_only_on_the_agent_verified_match(settings, monkeypatch):
+    # The full agentic path runs: gate -> planner spec -> rerank -> verify loop.
+    # Photo 2 (pasta) is a candidate but the agent verifies only photo 1, so only
+    # photo 1 is ever grounded/cited — the "30 thumbnails, 1 dog" mismatch can't
+    # recur.
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    fake = FakeInferenceClient(
+        responses=["yes", '{"semantic": "a dog on a beach"}',
+                   json.dumps({"action": "answer", "photo_ids": [1]})],
+        streams=[["Here ", "[photo:1]", "."]],
+    )
+    monkeypatch.setattr(Settings, "build_inference_client", lambda self: (fake, "fake"))
+    app = create_app(settings)
+    conn = app.state.context.conn
+    _searchable(conn, 1, "a dog on a beach")
+    _searchable(conn, 2, "a plate of pasta")
+    with TestClient(app) as tc:
+        body = tc.get("/chat/stream", params={"q": "a dog on a beach"}).text
+        assert "[photo:1]" in body
+        page = tc.get("/chat").text
+        assert "/thumb/1" in page
+        assert "/thumb/2" not in page          # the pasta photo was never grounded
+
+
+def test_chat_reports_nothing_found_when_floor_rejects_all(settings, monkeypatch):
+    # A photo with no caption vector scores 0.0 < floor -> dropped, so retrieval is
+    # empty and the model is handed the no-match sentinel with no sources.
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    fake = FakeInferenceClient(
+        responses=["yes", '{"semantic": "a dog on a beach"}'],
+        streams=[["I couldn't find any photos of that."]],
+    )
+    monkeypatch.setattr(Settings, "build_inference_client", lambda self: (fake, "fake"))
+    app = create_app(settings)
+    conn = app.state.context.conn
+    _searchable(conn, 1, "a plate of pasta", with_caption_vec=False)
+    with TestClient(app) as tc:
+        body = tc.get("/chat/stream", params={"q": "a dog on a beach"}).text
+        assert "couldn't find" in body.lower()
+        assert "photo:" not in body            # nothing cited
+        assert "/thumb/1" not in tc.get("/chat").text
+
+
+def test_chat_total_count_question_grounds_on_the_real_total_not_shown_photos(settings, monkeypatch):
+    # The visible bug (§10): "how many photos in total" answered "8" (the
+    # retrieved-candidate count) instead of the real total. The agent must call
+    # the `count` tool and thread its fact into the context the final answer sees.
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    question = "how many photos do I have in total?"
+    fake = FakeInferenceClient(
+        responses=[
+            "yes",
+            '{"semantic": "photos"}',
+            json.dumps({"action": "expand", "tool": "count", "query": ""}),
+            json.dumps({"action": "answer", "photo_ids": [1]}),
+        ],
+        streams=[["You have 12 photos in total."]],
+    )
+    monkeypatch.setattr(Settings, "build_inference_client", lambda self: (fake, "fake"))
+    app = create_app(settings)
+    conn = app.state.context.conn
+    _searchable(conn, 1, question)  # guarantees a caption-cosine match clears the floor
+    for pid in range(2, 13):
+        _searchable(conn, pid, f"photo number {pid}")
+    with TestClient(app) as tc:
+        tc.get("/chat/stream", params={"q": question})
+    # The final streaming call's grounding context must carry the real total (12),
+    # not just the one cited photo.
+    grounding = fake.calls[-1][1][-1]["content"]
+    assert "12" in grounding
 
 
 def test_off_topic_question_is_refused_without_retrieval(settings, monkeypatch):

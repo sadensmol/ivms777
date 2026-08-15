@@ -3,9 +3,7 @@ import sqlite3
 from embedding.base import Embedder
 from inference.client import InferenceClient
 from inference.prompts import intent_messages
-from search.fusion import reciprocal_rank_fusion
-from search.keyword import keyword_search
-from search.semantic import search_photos
+from search.retriever import Query, candidates
 
 
 def is_photo_question(client: InferenceClient, model: str, question: str) -> bool:
@@ -31,13 +29,14 @@ def retrieve(
     question: str,
     k: int = 30,
 ) -> list[int]:
-    """Top photo ids for a chat question, via semantic + keyword fusion (§9).
+    """Top photo ids for a chat question — the documented outer fallback (§10) for
+    when the precise planner -> core -> rerank path throws.
 
-    The interactive-search path minus the sidebar filters: a raw question in,
-    the most relevant photos out. Empty question or no matches -> [].
+    Routes through the retriever core's candidate stage
+    (`search/retriever.py::candidates`, §9.2) so fusion lives in exactly ONE place
+    (plan 12 single-pipeline invariant): the same semantic + keyword RRF, minus the
+    sidebar filters and the caption-cosine floor. Empty question or no matches -> [].
     """
     if not question.strip():
         return []
-    semantic = search_photos(conn, embedder, owner_id, question, k=200)
-    keyword = keyword_search(conn, owner_id, question, k=200)
-    return reciprocal_rank_fusion([semantic, keyword])[:k]
+    return candidates(conn, embedder, owner_id, Query(text=question, k=200))[:k]

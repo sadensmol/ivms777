@@ -17,3 +17,15 @@ def test_anything_but_no_is_treated_as_a_photo_question():
 
 def test_classifier_error_fails_open():
     assert is_photo_question(FakeInferenceClient(responses=[]), "m", "find a dog") is True
+
+
+def test_count_and_meta_questions_pass_the_gate():
+    # §10: broadened gate — count/total/memory questions, and a follow-up about a
+    # number the app already showed, are on-topic, not refused.
+    for question in (
+        "how many photos do I have?",
+        "how many memories?",
+        "why do I see over 800?",
+    ):
+        client = FakeInferenceClient(responses=["yes"])
+        assert is_photo_question(client, "m", question) is True

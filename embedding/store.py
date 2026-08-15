@@ -18,6 +18,21 @@ def read_vector(conn: sqlite3.Connection, photo_id: int) -> list[float] | None:
     return from_blob(row["embedding"]) if row is not None else None
 
 
+def read_vectors(conn: sqlite3.Connection, ids: list[int]) -> dict[int, list[float]]:
+    """Every listed photo's image vector, batched — mirrors `all_caption_vectors`
+    so a caller scoring several candidates (e.g. `similar_photos`) never issues
+    one query per id."""
+    if not ids:
+        return {}
+    placeholders = ", ".join("?" for _ in ids)
+    return {
+        row["rowid"]: from_blob(row["embedding"])
+        for row in conn.execute(
+            f"SELECT rowid, embedding FROM photo_vec WHERE rowid IN ({placeholders})", ids
+        )
+    }
+
+
 def write_caption_vector(conn: sqlite3.Connection, photo_id: int, vector: list[float]) -> None:
     """Store the caption's text embedding on the photo (§9). Kept as a BLOB on
     `photos` rather than a vec0 table so it tolerates whatever dimension the text

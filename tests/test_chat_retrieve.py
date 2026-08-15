@@ -1,7 +1,19 @@
 from chat.retrieve import retrieve
 from embedding.fakes import FakeEmbedder
 from embedding.store import write_vector
+from search.retriever import Query, candidates
 from tests.factories import add_photo
+
+
+def test_fallback_delegates_to_the_retriever_core(conn):
+    """The chat fusion fallback owns NO ranking of its own (plan 12 single-pipeline
+    invariant): it returns exactly the core's candidate stage, sliced to k."""
+    fake = FakeEmbedder()
+    for pid, word in ((1, "beach"), (2, "keyboard"), (3, "beach hut")):
+        add_photo(conn, photo_id=pid, content_hash=word, thumb_key=f"{word}.jpg")
+        write_vector(conn, pid, fake.embed_texts([word])[0])
+    ids = retrieve(conn, fake, owner_id=1, question="beach", k=2)
+    assert ids == candidates(conn, fake, 1, Query(text="beach", k=200))[:2]
 
 
 def test_retrieve_fuses_semantic_and_keyword(conn):

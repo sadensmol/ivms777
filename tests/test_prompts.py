@@ -1,4 +1,4 @@
-from inference.prompts import CAPTION_SCHEMA, caption_messages, chat_messages
+from inference.prompts import CAPTION_SCHEMA, caption_messages, chat_messages, intent_messages
 
 
 def test_caption_schema_requires_the_four_fields():
@@ -36,3 +36,20 @@ def test_chat_messages_ground_and_require_citation():
 def test_chat_messages_handle_no_matches():
     msgs = chat_messages("anything", "No photos matched.")
     assert "No photos matched." in msgs[1]["content"]
+
+
+def test_chat_messages_instructs_using_count_facts_not_guessing():
+    # §10: totals/counts come from the count/memories/periods tool facts already
+    # threaded into the context — never inferred from the photos shown.
+    msgs = chat_messages("how many photos do I have?", "count: 897 photo(s) in total.")
+    system = msgs[0]["content"].lower()
+    assert "count" in system and "memories" in system and "periods" in system
+    assert "never" in system
+
+
+def test_intent_messages_covers_counts_totals_and_meta_questions():
+    # §10: the gate must treat counts/totals/memories/dates/organization questions
+    # as on-topic — only a clearly unrelated general question is refused.
+    system = intent_messages("how many photos do I have?")[0]["content"].lower()
+    for phrase in ("how many", "total", "memor", "month", "year", "camera", "place"):
+        assert phrase in system

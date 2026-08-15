@@ -1,13 +1,68 @@
+from datetime import UTC, datetime, timedelta
+
 from ingest.jobs import (
     MAX_ATTEMPTS,
     claim_next,
     complete,
     enqueue,
     fail,
+    format_speed,
     reprocess,
+    requeue_stalled,
     stage_counts,
+    stage_speed,
 )
 from tests.factories import add_photo
+
+
+def test_requeue_stalled_recovers_orphaned_running_jobs(conn):
+    # A job left 'running' by a killed/restarted worker (claim_next set it running,
+    # complete never came) must return to 'pending' so a fresh worker re-runs it —
+    # otherwise claim_next (which only picks 'pending') strands it forever (§8).
+    add_photo(conn, photo_id=1, content_hash="a", thumb_key="1.jpg")
+    enqueue(conn, 1, "caption")
+    claim_next(conn, "caption")
+    assert stage_counts(conn, "caption")["running"] == 1
+    assert requeue_stalled(conn) == 1
+    assert stage_counts(conn, "caption")["running"] == 0
+    assert stage_counts(conn, "caption")["pending"] == 1
+
+
+def test_format_speed_stays_readable_for_slow_stages():
+    assert format_speed(None) is None
+    assert format_speed(2.0) == "2.0/s"          # fast stages: per second
+    assert format_speed(0.0333333) == "2.0/min"  # ~30 s/caption reads as 2.0/min, not "0.0/s"
+
+
+def _done_at(conn, photo_id, stage, when):
+    add_photo(conn, photo_id=photo_id, content_hash=f"h{photo_id}", thumb_key=f"{photo_id}.jpg")
+    conn.execute(
+        "INSERT INTO jobs(photo_id, stage, status, updated_at) VALUES (?, ?, 'done', ?)",
+        (photo_id, stage, when.isoformat()),
+    )
+
+
+def test_stage_speed_measures_recent_throughput(conn):
+    # 5 captions finished 2s apart -> 4 intervals over 8s -> 0.5/s.
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    for i in range(5):
+        _done_at(conn, i + 1, "caption", base + timedelta(seconds=2 * i))
+    assert abs(stage_speed(conn, "caption") - 0.5) < 1e-9
+
+
+def test_stage_speed_none_without_two_completions(conn):
+    assert stage_speed(conn, "caption") is None
+    _done_at(conn, 1, "caption", datetime(2026, 1, 1, tzinfo=UTC))
+    assert stage_speed(conn, "caption") is None  # one completion can't span a rate
+
+
+def test_stage_speed_survives_restart_via_persisted_job_history(conn):
+    # The rate is read from jobs.updated_at, which persists — no in-memory state,
+    # so a fresh process (this fresh conn) still reports the last speed.
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    for i in range(3):
+        _done_at(conn, i + 1, "embed", base + timedelta(seconds=i))  # 2 intervals / 2s = 1/s
+    assert abs(stage_speed(conn, "embed") - 1.0) < 1e-9
 
 
 def test_reprocess_resets_the_stage_and_everything_downstream(conn):

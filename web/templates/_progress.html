@@ -1,10 +1,11 @@
 <div class="progress" id="progress" hx-get="/upload/progress"
      hx-trigger="every 2s, refresh" hx-swap="outerHTML">
-  {% for stage, counts in stages %}
+  {% for stage, counts, speed in stages %}
     <div class="progress-row">
       <span>{{ stage }}</span>
       <span class="progress-counts">
         {{ counts['done'] }} done · {{ counts['pending'] }} pending
+        {% if speed %}<span class="progress-speed" title="recent throughput — last speed persists across restarts">· {{ speed }}</span>{% endif %}
         {% if counts['failed'] %}<span class="failed">· {{ counts['failed'] }} failed</span>{% endif %}
       </span>
       <form method="post" action="/reprocess" class="reprocess-one"
