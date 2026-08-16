@@ -18,20 +18,21 @@ services:
     ports:
       - "8001:8000"
 
-  # SigLIP runs in-process in app and worker with embed_device=cuda, so both need
-  # a GPU reservation — not just the vLLM inference container.
+  # app/worker are thin clients (design §5.1, plan 15 task 6) — no GPU, no
+  # torch, just the network hop to `models:9000`.
   app:
     environment:
       IVMS777_PROFILE: cloud
-    depends_on: [inference]
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+    depends_on: [models]
   worker:
+    environment:
+      IVMS777_PROFILE: cloud
+    depends_on: [models]
+
+  # SigLIP runs in-process with embed_device=cuda, so the `models` service
+  # needs the GPU reservation — not just the vLLM inference container. Its HF
+  # cache (`ivms777-models`) already comes from the base compose.yaml.
+  models:
     environment:
       IVMS777_PROFILE: cloud
     depends_on: [inference]

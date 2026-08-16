@@ -26,34 +26,38 @@ services:
     ports:
       - "11434:11434"
 
-  # SigLIP runs in-process in app and worker with embed_device=cuda, so both need
-  # GPU access — not just the inference container. Both build from Dockerfile.jetson
+  # app/worker are thin clients (design §5.1, plan 15 task 6) — no GPU, no
+  # torch, the same slim `Dockerfile` as every other profile. Only the
+  # `models` service needs the iGPU.
+  app:
+    build: .
+    environment:
+      IVMS777_PROFILE: jetson
+      IVMS777_PLANNER_MODEL: ${IVMS777_PLANNER_MODEL:-qwen2.5:3b}
+    depends_on: [models]
+  worker:
+    build: .
+    environment:
+      IVMS777_PROFILE: jetson
+      IVMS777_PLANNER_MODEL: ${IVMS777_PLANNER_MODEL:-qwen2.5:3b}
+    depends_on: [models]
+
+  # SigLIP + the in-process caption VLM run with embed_device=cuda, so this is
+  # the one container that needs GPU access. Builds from Dockerfile.models.jetson
   # (python:3.12-slim + cu132 torch), which gives CUDA torch on JetPack 7; the
   # default python:3.12-slim image's aarch64 torch is CPU-only. See docs/design.md §3.1.
   #
   # 8 GB Orin: caption + planner default to a 4B-class captioner and a 3B planner
   # (config.py jetson defaults). Override via IVMS777_CAPTION_MODEL /
   # IVMS777_PLANNER_MODEL — `make run-jetson` passes them through and pulls them.
-  app:
+  models:
     build:
       context: .
-      dockerfile: Dockerfile.jetson
+      dockerfile: Dockerfile.models.jetson
     runtime: nvidia
     environment:
       # The slim base doesn't declare these (the ollama image does), so without
       # them the nvidia runtime injects no driver libs and torch sees no GPU.
-      NVIDIA_VISIBLE_DEVICES: all
-      NVIDIA_DRIVER_CAPABILITIES: all
-      IVMS777_PROFILE: jetson
-      IVMS777_CAPTION_MODEL: ${IVMS777_CAPTION_MODEL:-qwen2.5vl:3b}
-      IVMS777_PLANNER_MODEL: ${IVMS777_PLANNER_MODEL:-qwen2.5:3b}
-    depends_on: [inference]
-  worker:
-    build:
-      context: .
-      dockerfile: Dockerfile.jetson
-    runtime: nvidia
-    environment:
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: all
       IVMS777_PROFILE: jetson

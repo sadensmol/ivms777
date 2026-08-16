@@ -24,7 +24,7 @@ from albums.memory_store import (
     stored_signature,
 )
 from albums.registry import ORGANIZERS, get_organizer
-from chat.agent import agent_retrieve, direct_answer, memories_for_show
+from chat.agent import direct_answer, memories_for_show, retrieve
 from chat.context import build_context as build_chat_context
 from chat.history import (
     add_message,
@@ -304,6 +304,7 @@ def create_app(settings: Settings) -> FastAPI:
             ctx.conn,
             planner_model=ctx.settings.planner_model or "fake",
             caption_model=ctx.settings.caption_model or "fake",
+            models_client=ctx.settings.build_models_client(),
         ))
 
     @app.get("/library", response_class=HTMLResponse)
@@ -891,19 +892,19 @@ def create_app(settings: Settings) -> FastAPI:
                         add_message(ctx.conn, session_id, q, OFF_TOPIC_REPLY, [])
                         yield _done()
                         return
-                    # Agentic RAG (§10), semantic tail only: plan -> fuse -> narrow ->
-                    # rerank -> floor -> a bounded verify/refine loop over candidate
-                    # photos (search/similar/nearby). Grounds only on verified matches;
-                    # when none clear the floor build_chat_context([]) yields the no-match
-                    # sentinel and the model is told to say so — never a 30-photo dump.
-                    # Counts/memories/periods never reach here — direct_answer handled
-                    # them above, so the "8 photos" confabulation cannot happen.
-                    ids = agent_retrieve(
+                    # Standard RAG (§10), semantic tail only: plan -> fuse -> hard-filter
+                    # -> rank by caption meaning -> take the top-N. Those photos go
+                    # straight into the context; the answering model grounds ONLY on them
+                    # and cites the ones that match (`_CHAT_SYSTEM`), or says it has none
+                    # when nothing in the context fits. No agent verify/expand loop — the
+                    # retrieved captions ARE the evidence. Counts/memories/periods never
+                    # reach here — direct_answer handled them above.
+                    ids = retrieve(
                         ctx.conn, embedder, client,
                         owner_id=owner_id, question=q, dimensions=list(vocab.dimensions),
-                        caption_model=ctx.settings.caption_embed_model,
+                        caption_embed_model=ctx.settings.caption_embed_model,
                         tag_score_min=ctx.settings.tag_score_min,
-                        planner_model=model,
+                        planner_model=model, k=12,
                     )
                     context_block = build_chat_context(ctx.conn, ids)
                     messages = chat_messages(q, context_block)

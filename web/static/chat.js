@@ -30,18 +30,17 @@ function scrollToBottom() {
   log.scrollTop = log.scrollHeight;
 }
 
-// Open server-rendered history scrolled to the latest turn, and wire the input
-// so Enter and Cmd/Ctrl+Enter both submit (Enter alone is native on a single-line
-// input, but this makes both explicit and works even if defaults are prevented).
-// Closing a cited photo returns here via history.back(). The browser may restore
-// a frozen (bfcache) snapshot of this page — which can be stale or empty. Chat
-// history is authoritative in the DB and re-rendered server-side, so on a restored
-// back-navigation, reload to show the real current conversation, never a snapshot.
-window.addEventListener("pageshow", (e) => { if (e.persisted) location.reload(); });
-
-window.addEventListener("DOMContentLoaded", () => {
-  scrollToBottom();
+// Open server-rendered history scrolled to the latest turn, and wire the input so
+// Enter (and Cmd/Ctrl+Enter) submit — a textarea does not submit on Enter natively.
+// This runs on a full page load AND every time the nav's hx-boost swaps a fresh
+// <main> into the chat view: DOMContentLoaded does NOT fire on a boosted swap, so we
+// must not depend on it. The <script> sits at the end of the content, so #chat-q
+// already exists when this runs.
+function initChat() {
   const q = document.getElementById("chat-q");
+  if (!q || q.dataset.wired) return;  // boost re-runs this script; wire once
+  q.dataset.wired = "1";
+  scrollToBottom();
   // Grow the textarea to fit its content (up to the CSS max-height, then scroll).
   const autogrow = () => { q.style.height = "auto"; q.style.height = q.scrollHeight + "px"; };
   q.addEventListener("input", autogrow);
@@ -52,7 +51,18 @@ window.addEventListener("DOMContentLoaded", () => {
       document.getElementById("chat-form").requestSubmit();
     }
   });
-});
+}
+initChat();
+
+// Closing a cited photo returns here via history.back(). The browser may restore
+// a frozen (bfcache) snapshot of this page — which can be stale or empty. Chat
+// history is authoritative in the DB and re-rendered server-side, so on a restored
+// back-navigation, reload to show the real current conversation, never a snapshot.
+// Register once on window so a boosted re-run of this script does not stack it.
+if (!window.__chatPageshowWired) {
+  window.__chatPageshowWired = true;
+  window.addEventListener("pageshow", (e) => { if (e.persisted) location.reload(); });
+}
 
 // One assistant turn: a bubble that starts as a processing indicator and is
 // replaced by the streamed answer. Cited photos render inline in the answer as

@@ -118,8 +118,10 @@ embedder, or load any model in-process.
 - A model that has no ready server (SigLIP image embeddings, the in-process caption
   VLM) is wrapped by **our** inference service and exposed as an endpoint — it is
   never loaded inline in `app`/`worker`.
-- Text generation already lives in its own service (Ollama/vLLM); that counts as
-  the one model process for those models. The rule extends it to *all* models.
+- **Only the inference gateway talks to a model backend — including Ollama.**
+  `app`/`worker` never call Ollama/vLLM directly; text generation and text
+  embeddings are reached *through* the `models` service, which is the single client
+  of every backend. One gateway in front of all inference.
 
 This is non-negotiable for every feature, current and future. If a change would
 import an AI library or load a model outside the inference service, it is wrong.

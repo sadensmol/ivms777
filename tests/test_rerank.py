@@ -7,7 +7,8 @@ from tests.factories import add_photo
 
 def _cap(conn, pid, text):
     add_photo(conn, photo_id=pid, content_hash=f"h{pid}", thumb_key=f"{pid}.jpg", caption=text)
-    # caption vectors live in the inference-client embed space (caption_embed_model).
+    # caption vectors live in the dedicated text-embed space (nomic in prod), the same
+    # embedder the query uses (design §4/§9), so the cosine is meaningful.
     write_caption_vector(conn, pid, l2_normalize(FakeInferenceClient().embed("fake", [text])[0]))
 
 

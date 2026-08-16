@@ -8,19 +8,21 @@ See `docs/design.md` for the design and `docs/plans/` for implementation plans.
 ## Run on a Mac
 
 ```bash
-make up          # everything: Ollama + models on the host, then the stack → http://localhost:8000
-make worker-logs # watch embedding / tagging / captioning progress
-make down        # stop the stack
-make help        # all targets (restart, dev, clean, …)
+make up   # Ollama on the host, then models + worker + app NATIVELY → http://localhost:8000
+make help # all targets
 ```
 
 `make up` does it all in one command: it makes sure **Ollama is running on the
 host** with the caption + planner models (Docker Desktop on macOS has no GPU
-passthrough, so the LLMs run natively for Metal), then builds and starts the
-containerised app, worker, and database. SigLIP runs on CPU inside the container.
+passthrough, so the LLMs run natively for Metal), then runs the `models`
+service, `worker`, and `app` as plain **host processes — no containers on
+mac**. `app`/`worker` are thin HTTP clients with no torch; SigLIP and the
+caption VLM live only in the `models` service (design §5.1). Ctrl-C stops all
+three; data lives under `$HOME/.ivms777`.
 
-The **first** `make up` pulls the vision model (~6 GB) once — later runs are fast.
-It needs Ollama installed (`brew install ollama`); everything else it handles.
+The **first** `make up` installs the `models` extra (torch/transformers) and
+pulls the vision model (~6 GB) once — later runs are fast. It needs Ollama
+installed (`brew install ollama`); everything else it handles.
 
 Open http://localhost:8000/upload, pick one or more folders of photos, and wait.
 The browser hashes each file locally, uploads only what the server does not
@@ -61,10 +63,13 @@ chat retrieval is the next planned phase — see `docs/plans/10-chat-agentic-rer
 Fully containerised — the NVIDIA container runtime hands the Orin iGPU to
 containers, so the image builds and the GPU is reached **on the Jetson** (you
 cannot build the aarch64 image on a Mac). Requires **JetPack 7** (L4T r39,
-CUDA 13.2): the `app`/`worker` build from `Dockerfile.jetson`, which is
-`python:3.12-slim` with `torch`/`torchvision` from the CUDA-13.2 index
-(`cu132`) so SigLIP runs on the GPU — no jetson-containers, no `autotag`, no
-manual pinning. `make run-jetson` builds and starts all three containers. Two
+CUDA 13.2). Only the `models` service needs GPU/torch: it builds from
+`Dockerfile.models.jetson`, which is `python:3.12-slim` with
+`torch`/`torchvision` from the CUDA-13.2 index (`cu132`) so SigLIP and the
+in-process caption VLM run on the GPU — no jetson-containers, no `autotag`, no
+manual pinning. `app`/`worker` build from the plain `Dockerfile` (no GPU, no
+torch — thin HTTP clients of `models`, design §5.1). `make run-jetson` builds
+and starts all four containers (`inference`, `models`, `worker`, `app`). Two
 steps: get the code onto the Jetson, then start it there.
 
 **1. Get the code onto the Jetson.** Either clone it:
@@ -84,15 +89,16 @@ rsync -av --exclude .venv --exclude .git --exclude __pycache__ \
 **2. Start it (on the Jetson).**
 
 ```bash
-make run-jetson   # build + start the stack, pull the caption + planner models → http://<jetson>:8000
+make run-jetson   # build + start the stack, pull the planner model → http://<jetson>:8000
 ```
 
 Then open `http://<jetson>:8000/upload`.
 
 `make run-jetson` builds and starts the containerised `inference` (Ollama),
-`app`, and `worker`, waits for Ollama, then pulls the models. The **first** build
-compiles the CUDA image and is slow (tens of minutes) — later runs are cached.
-8 GB is shared
+`models`, `worker`, and `app`, waits for Ollama, then pulls the planner model
+(the caption VLM is not an Ollama tag on jetson — it loads in-process inside
+`models`, see below). The **first** build compiles the CUDA image and is slow
+(tens of minutes) — later runs are cached. 8 GB is shared
 between CPU and GPU, so the models default to a small vision captioner
 (`qwen2.5vl:3b`) and a 3B planner (`qwen2.5:3b`) — the `config.py` jetson
 defaults. Override either on the command line:
@@ -101,8 +107,10 @@ defaults. Override either on the command line:
 make run-jetson JETSON_CAPTION_MODEL=gemma4:e4b
 ```
 
-The chosen tags are passed to the `app`/`worker` containers **and** pulled into
-the in-container Ollama, so what runs matches what was pulled. Watch progress:
+The planner tag is passed to the `app`/`worker`/`models` containers **and**
+pulled into the in-container Ollama, so what runs matches what was pulled. The
+caption tag goes to `models` only — on jetson it names a Hugging Face
+in-process model, not an Ollama pull. Watch progress:
 `docker compose -f compose.yaml -f compose.jetson.yaml logs -f worker`.
 
 ## Run on a cloud GPU box
@@ -114,19 +122,24 @@ docker compose -f compose.yaml -f compose.cloud.yaml up --build -d
 
 ## Develop
 
-Tests run natively for a fast loop; the app itself always runs in containers.
+Tests run natively for a fast loop. On mac `make up` also runs natively (no
+containers, see above); jetson and cloud always run containerised.
 
 ```bash
-uv sync
+uv sync                # app/worker/CLI stay torch-free
 uv run pytest
 uv run ruff check .
 ```
 
-### Hot reload
+`uv sync --extra models` additionally installs torch/transformers, needed only
+to run the `models` service itself or its `slow`-marked tests
+(`uv run pytest -m slow`).
 
-Add `compose.dev.yaml` last. It bind-mounts the source and restarts the app
-(uvicorn `--reload`) and the worker (`watchfiles`) on every edit. Templates and
-CSS need no restart at all.
+### Hot reload (containerised — jetson/cloud, or as an alternative to native `make up` on mac)
+
+Add `compose.dev.yaml` last. It bind-mounts the source and restarts `app` and
+`models` (uvicorn `--reload`) and `worker` (`watchfiles`) on every edit.
+Templates and CSS need no restart at all.
 
 ```bash
 docker compose -f compose.yaml -f compose.mac.yaml -f compose.dev.yaml up -d

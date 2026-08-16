@@ -16,6 +16,8 @@ def _photo(conn, embedder, pid, caption, *, with_caption_vec=True):
     add_photo(conn, photo_id=pid, content_hash=f"h{pid}", thumb_key=f"{pid}.jpg", caption=caption)
     write_vector(conn, pid, embedder.embed_texts([caption])[0])
     if with_caption_vec:
+        # caption_vec lives in the dedicated text-embed space (the client's caption
+        # model — "fake" here), the SAME space retrieve() embeds the query in (§4/§9).
         write_caption_vector(conn, pid, FakeInferenceClient().embed("fake", [caption])[0])
 
 

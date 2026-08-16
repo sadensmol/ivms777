@@ -33,8 +33,14 @@ def _fake_loader_no_caption(model_id, device):
     return FakeModel().eval(), FakeProcessorNoCaption()
 
 
-def test_vlm_caption_extracts_json_result():
+def test_vlm_caption_extracts_json_result(monkeypatch):
     cap = VLMCaptioner("Qwen/Qwen2.5-VL-3B-Instruct", _loader=_fake_loader)
+    # `_stop()` unconditionally imports the real `transformers` (it wraps a
+    # genuine `StoppingCriteria` for the interactive-preemption hook, §8.1) —
+    # torch/transformers are exempt for this module (captioning/vlm_adapter.py,
+    # gate deliverable 1), but this test's intent is the fake JSON-extraction
+    # path only, so fake `_stop()` too and stay torch-free.
+    monkeypatch.setattr(cap, "_stop", lambda should_preempt: None)
     cap.load()
     r = cap.caption(jpeg_bytes(), ["subject"])
     assert isinstance(r, CaptionResult)
@@ -49,8 +55,9 @@ def test_caption_before_load_raises():
         cap.caption(b"x", ["subject"])
 
 
-def test_caption_missing_caption_key_raises():
+def test_caption_missing_caption_key_raises(monkeypatch):
     cap = VLMCaptioner("m", _loader=_fake_loader_no_caption)
+    monkeypatch.setattr(cap, "_stop", lambda should_preempt: None)  # see above
     cap.load()
     with pytest.raises(ValueError):
         cap.caption(jpeg_bytes(), ["subject"])

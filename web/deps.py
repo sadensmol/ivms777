@@ -42,32 +42,14 @@ class AppContext:
         return conn
 
     def make_coordinator(self, client, holder: str):
-        """Build a `ModelCoordinator` per use (design §8.1), never stored: it
-        must read `self.conn` — the thread-local connection — at call time, on
-        the thread that will hold the lease."""
-        from db.connection import connect
-        from models.coordinator import ModelCoordinator
+        """Return a `NoopCoordinator` (design §8.1 stub, plan 15 task 7):
+        app/worker hold no models anymore — `modelsvc` owns all loading and
+        residency — so there is nothing left to coordinate. `client` and
+        `holder` are accepted for signature compatibility with every
+        call site (`web/app.py`, `ingest/cli.py`); neither is used."""
+        from models.coordinator import NoopCoordinator
 
-        s = self.settings
-        db_path = self._db_path
-        # Built once here, not inside the coordinator, so the caption STAGE can
-        # reuse this exact instance (`coordinator.captioner`) under the
-        # INGEST_CAPTION lease — the coordinator loads it, the stage calls it;
-        # two separate instances would mean the stage's captioner is never
-        # actually loaded (design §4/§8.1, SHARED-INSTANCE requirement).
-        captioner = s.build_captioner(client)
-        coordinator = ModelCoordinator(
-            self.conn, client, holder=holder,
-            budget_mb=s.ram_budget_mb,
-            planner_model=s.planner_model or "fake",
-            caption_model=s.caption_model or "fake",
-            load_siglip=lambda: s.build_embedder(),
-            captioner=captioner,
-            # The heartbeat thread bumps liveness on its OWN connection (design
-            # §8.1) so a holder blocked in a long caption still proves it is alive.
-            heartbeat_connect=lambda: connect(db_path),
-        )
-        return coordinator
+        return NoopCoordinator()
 
 
 def build_context(settings: Settings) -> AppContext:

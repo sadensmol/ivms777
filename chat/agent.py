@@ -4,11 +4,12 @@ import sqlite3
 
 from chat.retrieve import retrieve as fusion_retrieve
 from embedding.base import Embedder
+from embedding.caption_text import embed_caption_texts
 from embedding.vectors import l2_normalize
 from inference.client import InferenceClient
 from search.keyword import keyword_search
 from search.planner import plan, spec_to_params
-from search.rerank import RERANK_FLOOR, rerank
+from search.rerank import rerank
 from search.retriever import Query, _hard_filter, candidates
 from search.semantic import search_photos, similar_photos
 
@@ -62,32 +63,27 @@ def retrieve(
     owner_id: int,
     question: str,
     dimensions: list[str],
-    caption_model: str,
+    caption_embed_model: str,
     tag_score_min: float,
     planner_model: str,
     k: int = 8,
-    floor: float = RERANK_FLOOR,
 ) -> list[int]:
-    """Precise chat retrieval (§10): plan -> core candidates -> hard-filter ->
-    rerank -> floor.
+    """Chat candidate retrieval (§10): plan -> core candidates -> hard-filter ->
+    rank the caption vectors by meaning -> **top-k** (NO floor).
 
-    The planner splits the question into HARD facet/date filters and SOFT tag
-    hints, then candidate generation runs through the retriever core
-    (`search/retriever.py`) so chat no longer rolls its own fusion. Final ranking
-    stays `search/rerank.py::rerank` — caption-meaning cosine + floor, the exact
-    tuned §10 mechanism — rather than the core's `refine()`. The core's text-query
-    scoring folds fusion/KNN proximity in as an UNCONDITIONAL content contribution
-    (§9.2, right for `/library` search: a semantic neighbour there IS a result),
-    which would be fatal here: a KNN always returns k neighbours, so if fusion
-    proximity alone could clear the content gate, chat would always answer
-    something and confabulate again — the exact bug §10 killed. Reusing `rerank`'s
-    caption-cosine floor keeps honest-empty structurally intact: only a genuine
-    caption-meaning match clears it. `tag_score_min` is accepted for signature
-    parity; planner tags are soft (never gate) and, as before this refactor, are
-    not an alternate way to clear the floor.
+    The planner splits the question into HARD facet/date filters and SOFT tag hints,
+    then candidate generation runs through the retriever core (`search/retriever.py`),
+    so chat does not roll its own fusion. Those candidates are then ranked by
+    caption-meaning cosine against the query — both embedded by the dedicated text
+    embedder (`caption_embed_model`, `nomic-embed-text`, design §4) — and the top-k are
+    returned as the SEED for the agent's verify loop. There is deliberately **no
+    cosine floor**: nomic's baseline is high, so a fixed floor is meaningless (design
+    §4); honest-empty is the AGENT's job (`agent_retrieve`), which reads the shortlisted
+    captions and answers `[]` when none match. `tag_score_min` is accepted for
+    signature parity (planner tags are soft, never a gate).
 
-    Returns the verified matches (<= k), or [] when nothing clears the floor. Any
-    failure degrades to today's fusion retrieval so chat never breaks."""
+    Returns up to k caption-nearest candidates. Any failure degrades to today's
+    fusion retrieval so chat never breaks."""
     if not question.strip():
         return []
     try:
@@ -95,14 +91,18 @@ def retrieve(
         hard_filters = spec_to_params(spec, query=question, dimensions=dimensions)
         query = Query(
             text=spec.semantic or question, hard_filters=hard_filters,
-            soft_tags=spec.tags, k=200, floor=floor,
+            soft_tags=spec.tags, k=200,
         )
         ids = candidates(conn, embedder, owner_id, query)
         ids = _hard_filter(conn, owner_id, query.hard_filters, ids)
         if not ids:
             return []
-        query_vec = l2_normalize(client.embed(caption_model, [question])[0])
-        return [pid for pid, _ in rerank(conn, query_vec, ids, floor=floor)][:k]
+        # Embed the query with the SAME dedicated text embedder that wrote caption_vec
+        # (design §4, §9) so the cosine is in one space, then take the top-k nearest.
+        query_vec = l2_normalize(
+            embed_caption_texts(client, caption_embed_model, [question], is_query=True)[0]
+        )
+        return [pid for pid, _ in rerank(conn, query_vec, ids)][:k]
     except Exception:  # noqa: BLE001 — degrade to fusion, never crash the chat route
         return fusion_retrieve(conn, embedder, owner_id, question, k=k)
 
@@ -115,11 +115,10 @@ def agent_retrieve(
     owner_id: int,
     question: str,
     dimensions: list[str],
-    caption_model: str,
+    caption_embed_model: str,
     tag_score_min: float,
     planner_model: str,
     k: int = 8,
-    floor: float = RERANK_FLOOR,
     max_rounds: int = 3,
 ) -> list[int]:
     """Bounded verify/refine loop over the retriever's candidates for the SEMANTIC
@@ -130,8 +129,8 @@ def agent_retrieve(
     Any loop failure degrades to the seed candidates."""
     seed = retrieve(
         conn, embedder, client, owner_id=owner_id, question=question,
-        dimensions=dimensions, caption_model=caption_model, tag_score_min=tag_score_min,
-        planner_model=planner_model, k=max(k, 30), floor=floor,
+        dimensions=dimensions, caption_embed_model=caption_embed_model,
+        tag_score_min=tag_score_min, planner_model=planner_model, k=max(k, 30),
     )
     if not seed:
         return []

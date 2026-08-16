@@ -17,6 +17,9 @@ PROFILE_DEFAULTS: dict[Profile, dict[str, object]] = {
         "inference_base_url": "http://host.docker.internal:11434/v1",
         "ram_budget_mb": 24000,
         "caption_backend": "ollama",
+        # Placeholder until the `models` service (design §5.1, plan 15) is
+        # actually deployed per profile.
+        "models_base_url": "http://models:9000",
     },
     "jetson": {
         "caption_model": "qwen2.5vl:3b",
@@ -28,6 +31,7 @@ PROFILE_DEFAULTS: dict[Profile, dict[str, object]] = {
         # kernels), so jetson captions in-process instead (design §3.1/§4/§8.1).
         "caption_backend": "inprocess",
         "caption_model_id": "Qwen/Qwen2.5-VL-3B-Instruct",
+        "models_base_url": "http://models:9000",
     },
     "cloud": {
         # vLLM serves whatever VLLM_MODEL is set to; point these at that model.
@@ -37,6 +41,7 @@ PROFILE_DEFAULTS: dict[Profile, dict[str, object]] = {
         "inference_base_url": "http://inference:8000/v1",
         "ram_budget_mb": 60000,
         "caption_backend": "ollama",
+        "models_base_url": "http://models:9000",
     },
 }
 
@@ -49,9 +54,11 @@ class Settings(BaseSettings):
 
     caption_model: str | None = None
     planner_model: str | None = None
-    # Text-embedding model for caption semantics (§9); defaults to the planner
-    # model, which is already loaded — no extra model to pull.
-    text_embed_model: str | None = None
+    # Dedicated text embedder for caption semantics (§9). A chat/planner model
+    # cannot embed (no embedding head — Ollama returns 501), and SigLIP's text tower
+    # has no text↔text separation (design §4), so this is a purpose-built text
+    # embedder — `nomic-embed-text` by default (benchmarked on real captions, §4).
+    text_embed_model: str = "nomic-embed-text"
     embed_device: Literal["cpu", "cuda", "mps"] | None = None
     inference_base_url: str | None = None
     # Captioner adapter selection (design §4, §8.1): "ollama" (mac/cloud, today's
@@ -60,6 +67,10 @@ class Settings(BaseSettings):
     # the HF repo id used only by the inprocess backend.
     caption_backend: Literal["ollama", "inprocess"] | None = None
     caption_model_id: str | None = None
+    # Base URL of the `models` service (design §5.1, plan 15) — the one process
+    # that imports torch/transformers and the only client of Ollama.
+    # `app`/`worker` reach every model/LLM through `build_models_client()`.
+    models_base_url: str | None = None
 
     owner_id: int = 1
     thumb_grid_px: int = 320
@@ -107,65 +118,55 @@ class Settings(BaseSettings):
     def build_embedder(self):
         """Return (embedder, model_name).
 
-        Defaults to the real SigLIP; tests and the fast path set
-        `use_fake_embedder`. Imports are local so torch loads only when the real
-        model is actually built.
+        Defaults to `RemoteEmbedder`, an HTTP shim over the `models` service
+        (design §5.1) — the real SigLIP now lives there, never in this
+        process. Tests and the fast path set `use_fake_embedder` to get the
+        in-process `FakeEmbedder` instead. Imports are local so importing
+        `config` never pulls in `httpx`/torch until a caller actually builds
+        an embedder; this module itself never imports torch.
         """
         if self.use_fake_embedder:
             from embedding.fakes import FakeEmbedder
 
             return FakeEmbedder(), "fake"
-        from embedding.siglip import get_siglip_embedder
+        from inference.remote_embedder import RemoteEmbedder
 
-        # Cached: the model loads once and is reused, so a search or a /photo click
-        # never reloads ~400M of weights (config.build_embedder was doing exactly
-        # that on every request).
-        return get_siglip_embedder(self.embed_model_name, self.embed_device), self.embed_model_name
+        return RemoteEmbedder(self.build_models_client(), self.embed_model_name), self.embed_model_name
 
     @property
     def caption_embed_model(self) -> str:
-        """Model used to embed caption text (§9) — the planner model by default,
-        already resident, so no extra pull."""
-        return self.text_embed_model or self.planner_model or "fake"
+        """Dedicated text embedder for caption meaning (§9), served by Ollama —
+        `nomic-embed-text` by default. NOT the planner (a chat model can't embed)
+        and NOT SigLIP (no text↔text separation). See `text_embed_model`."""
+        return self.text_embed_model
 
     def build_inference_client(self):
         """Return (client, caption_model).
 
-        Real `OpenAICompatClient` against `inference_base_url` normally; tests set
-        `use_fake_inference` to get an empty `FakeInferenceClient` and never touch
-        a backend. The caption model is the (real) `caption_model` config value.
+        Defaults to `RemoteInferenceClient`, an HTTP shim over the `models`
+        service (design §5.1) — the real Ollama client now lives there, never
+        in this process. Tests set `use_fake_inference` to get the in-process
+        `FakeInferenceClient` instead. Imports are local so importing `config`
+        never pulls in `httpx`/torch until a caller actually builds a client;
+        this module itself never imports `OpenAICompatClient`.
         """
         if self.use_fake_inference:
             from inference.fakes import FakeInferenceClient
 
             return FakeInferenceClient([]), self.caption_model or "fake"
-        from inference.client import OpenAICompatClient
+        from inference.remote_inference_client import RemoteInferenceClient
 
-        return OpenAICompatClient(self.inference_base_url or ""), self.caption_model
+        return RemoteInferenceClient(self.build_models_client()), self.caption_model
 
-    def build_captioner(self, client):
-        """Return a `Captioner` (design §4, §8.1) for the profile's `caption_backend`.
+    def build_models_client(self):
+        """Return a `ModelsClient` for the `models` service (design §5.1).
 
-        mac/cloud select `OllamaCaptioner` over `client` (today's caption path,
-        byte-identical); jetson selects `VLMCaptioner`, CONSTRUCTED ONLY — no
-        `.load()` here, so no torch import and no weight download. Loading is the
-        model coordinator's job, under the `INGEST_CAPTION` lease. `use_fake_inference`
-        always forces the Ollama adapter over a `FakeInferenceClient`, on every
-        profile, so the offline test path stays reachable on jetson too. Imports
-        are local so importing config never pulls in torch/transformers.
+        Import is local so importing `config` never pulls in `httpx`'s HTTP
+        machinery until a caller actually needs the client.
         """
-        if self.use_fake_inference:
-            from captioning.ollama_adapter import OllamaCaptioner
-            from inference.fakes import FakeInferenceClient
+        from inference.models_client import ModelsClient
 
-            return OllamaCaptioner(FakeInferenceClient([]), "fake")
-        if self.caption_backend == "inprocess":
-            from captioning.vlm_adapter import VLMCaptioner
-
-            return VLMCaptioner(self.caption_model_id, device=self.embed_device or "cuda")
-        from captioning.ollama_adapter import OllamaCaptioner
-
-        return OllamaCaptioner(client, self.caption_model or "fake")
+        return ModelsClient(self.models_base_url or "")
 
 
 @lru_cache

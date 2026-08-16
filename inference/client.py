@@ -205,3 +205,18 @@ class OpenAICompatClient:
             json={"model": model, "prompt": "", "keep_alive": 0, "stream": False},
             timeout=timeout,
         ).raise_for_status()
+
+    def loaded_models(self, *, timeout: float = 2.0) -> list[str]:
+        """The text models Ollama currently holds resident (native `/api/ps`).
+
+        On mac/cloud the planner/chat model runs IN Ollama, not in-process, so the
+        service's residency manager can't see it — this is how the resource bar
+        (§13) shows it alongside SigLIP. Best-effort: `[]` if the backend doesn't
+        speak `/api/ps` (e.g. vLLM) or is unreachable, so the bar never breaks.
+        """
+        try:
+            resp = self._client.get(self._native_url("/api/ps"), timeout=timeout)
+            resp.raise_for_status()
+            return [m["name"] for m in resp.json().get("models", [])]
+        except Exception:  # noqa: BLE001 - the bar is best-effort; omit Ollama models if unreadable
+            return []

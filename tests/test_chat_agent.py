@@ -22,7 +22,8 @@ def _photo(conn, pid, caption):
     add_photo(conn, photo_id=pid, content_hash=f"h{pid}", thumb_key=f"{pid}.jpg", caption=caption)
     # image vector (SigLIP space) so semantic fusion finds it...
     write_vector(conn, pid, FakeEmbedder().embed_texts([caption])[0])
-    # ...and caption vector (inference-client space) so rerank can score it.
+    # ...and caption vector (dedicated text-embed space, the client's caption model —
+    # "fake" here, nomic in prod, §4/§9) so the top-N caption ranking can score it.
     write_caption_vector(conn, pid, l2_normalize(FakeInferenceClient().embed("fake", [caption])[0]))
 
 
@@ -33,18 +34,19 @@ def _photo_no_capvec(conn, pid, caption):
 
 
 def _kw(**over):
-    base = {"dimensions": DIMS, "caption_model": "fake", "tag_score_min": 0.2,
-            "planner_model": "fake"}
+    base = {"dimensions": DIMS, "caption_embed_model": "fake",
+            "tag_score_min": 0.2, "planner_model": "fake"}
     return {**base, **over}
 
 
 def test_partial_captioning_still_returns_semantic_match(conn):
-    # The live bug: a captioned photo whose caption VECTOR is not computed yet must
-    # not be floored out of chat — its caption signal is unavailable, not weak.
+    # A captioned photo whose caption VECTOR is not computed yet must still be
+    # returned — its caption signal is unavailable, so top-N keeps it (unscored) for
+    # the agent to revalidate, never dropping it.
     _photo_no_capvec(conn, 1, "a dog on a beach")
     client = FakeInferenceClient(responses=['{"semantic": "a dog on a beach"}'])
     ids = retrieve(conn, FakeEmbedder(), client, owner_id=1, question="a dog on a beach",
-                   **_kw(k=8, floor=0.5))
+                   **_kw(k=8))
     assert ids == [1]
 
 
@@ -54,27 +56,21 @@ def test_narrow_predicate_missing_in_taxonomy_keeps_fusion_match(conn):
     _photo(conn, 1, "a dog on a beach")
     client = FakeInferenceClient(responses=['{"semantic": "a dog", "tags": {"subject": ["dog"]}}'])
     ids = retrieve(conn, FakeEmbedder(), client, owner_id=1, question="a dog",
-                   **_kw(k=8, floor=-1.0))
+                   **_kw(k=8))
     assert 1 in ids
 
 
-# --- Task 3: retriever v2 -----------------------------------------------------
+# --- Task 3: retriever v2 (top-N caption ranking, no floor — §10 / design §4) --
 
-def test_returns_only_photos_above_the_floor(conn):
+def test_ranks_the_matching_caption_first(conn):
+    # retrieve() returns the top-N candidates ranked by caption-meaning cosine — no
+    # floor gate (honest-empty is the agent's job). The exact-match caption ranks first.
     _photo(conn, 1, "a dog on a beach")
     _photo(conn, 2, "a plate of pasta")
     client = FakeInferenceClient(responses=['{"semantic": "a dog on a beach"}'])
     ids = retrieve(conn, FakeEmbedder(), client, owner_id=1, question="a dog on a beach",
-                   **_kw(k=8, floor=0.5))
-    assert ids == [1]
-
-
-def test_empty_when_nothing_clears_the_floor(conn):
-    _photo(conn, 1, "a plate of pasta")
-    client = FakeInferenceClient(responses=['{"semantic": "a dog on a beach"}'])
-    ids = retrieve(conn, FakeEmbedder(), client, owner_id=1, question="a dog on a beach",
-                   **_kw(k=8, floor=0.9))
-    assert ids == []
+                   **_kw(k=8))
+    assert ids and ids[0] == 1
 
 
 def test_planner_failure_falls_back_to_fusion(conn, monkeypatch):
@@ -83,7 +79,7 @@ def test_planner_failure_falls_back_to_fusion(conn, monkeypatch):
     monkeypatch.setattr("chat.agent.rerank",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError()))
     ids = retrieve(conn, FakeEmbedder(), client, owner_id=1, question="a dog on a beach",
-                   **_kw(k=8, floor=0.5))
+                   **_kw(k=8))
     assert 1 in ids  # degraded to chat.retrieve.retrieve, never crashes
 
 
@@ -97,7 +93,7 @@ def test_agent_verifies_a_subset_of_the_seed(conn):
         json.dumps({"action": "answer", "photo_ids": [1]}),
     ])
     ids = agent_retrieve(conn, FakeEmbedder(), client, owner_id=1, question="a dog",
-                         **_kw(k=8, floor=-1.0, max_rounds=3))
+                         **_kw(k=8, max_rounds=3))
     assert ids == [1]
 
 
@@ -109,7 +105,7 @@ def test_agent_can_expand_then_answer(conn):
         json.dumps({"action": "answer", "photo_ids": [1]}),
     ])
     ids = agent_retrieve(conn, FakeEmbedder(), client, owner_id=1, question="a dog",
-                         **_kw(k=8, floor=-1.0, max_rounds=3))
+                         **_kw(k=8, max_rounds=3))
     assert ids == [1]
 
 
@@ -120,7 +116,7 @@ def test_agent_answering_none_returns_empty(conn):
         json.dumps({"action": "answer", "photo_ids": []}),
     ])
     ids = agent_retrieve(conn, FakeEmbedder(), client, owner_id=1, question="a dog",
-                         **_kw(k=8, floor=-1.0, max_rounds=3))
+                         **_kw(k=8, max_rounds=3))
     assert ids == []
 
 

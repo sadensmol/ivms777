@@ -1,10 +1,11 @@
 import sqlite3
 from collections.abc import Callable
 
-from captioning.base import Captioner
+from embedding.caption_text import embed_caption_texts
 from embedding.store import write_caption_vector
 from embedding.vectors import l2_normalize
-from inference.client import InferenceCancelled, InferenceClient
+from inference.client import InferenceClient
+from inference.models_client import ModelsCaptionPreempted, ModelsClient
 from ingest.jobs import enqueue
 from ingest.taxonomy import reindex_fts
 from ingest.thumbs import thumb_key
@@ -13,41 +14,29 @@ from ingest.worker import Preempted, StageHandler
 from storage.base import Storage
 
 
-def _embed_caption(
-    conn: sqlite3.Connection, client: InferenceClient, embed_model: str, photo_id: int, caption: str
-) -> None:
-    """Embed the caption text and store it (§9). Best-effort: an embeddings backend
-    that is down must not fail the caption itself — the vector backfills later."""
-    if not caption:
-        return
-    try:
-        vector = client.embed(embed_model, [caption])[0]
-    except Exception:  # noqa: BLE001 - embeddings are an enhancement, not required
-        return
-    write_caption_vector(conn, photo_id, l2_normalize(vector))
-
-
 def caption_handler(
     derived: Storage,
-    captioner: Captioner,
-    embed_client: InferenceClient,
-    embed_model: str,
+    models_client: ModelsClient,
     dimensions: list[str],
     detail_px: int,
     should_preempt: Callable[[], bool] = lambda: False,
 ) -> StageHandler:
-    """The caption stage: one call per photo through the `Captioner` adapter
-    (design §4) -> caption, AI title/description, and vlm tags — and the
-    caption's own text embedding for semantic similarity (§9), computed here
-    while the caption is fresh, over `embed_client` (Ollama, unchanged even on
-    jetson). Drains last (§8). A captioner error raises so the queue retries the
-    job rather than writing half a row.
+    """The caption stage: one HTTP call per photo to the `models` service's
+    `/caption` (design §5.1, plan 15 task 3) -> caption, AI title/description, and
+    vlm tags, written straight to the DB. It does NOT embed the caption: the
+    caption-vector (§9) is a SEPARATE, batched step (`backfill_caption_vectors`,
+    pipeline group 2c) that embeds captions with the dedicated text embedder
+    (`nomic-embed-text`) — a different model/backend, so it is not interleaved with
+    the caption VLM per photo. Drains last (§8). A `models_client.caption` error
+    raises so the queue retries the job rather than writing half a row.
 
-    The captioner call is cancellable: `should_preempt` is threaded through, so
-    an interactive request (chat, memory rebuild) aborts an in-flight caption
-    within a chunk instead of waiting out the whole call (§8.1). An abort raises
-    `InferenceCancelled`, mapped here to `Preempted`, which leaves the photo's
-    job PENDING for the next pass — never a burnt retry.
+    `should_preempt` is still threaded through for the stage's own
+    between-photo yield point (`ingest.worker.drain`); aborting an in-flight
+    `/caption` call mid-VLM-call is now the service's own concern (§8.1, plan
+    15 task 5's `modelsvc.residency`). The service maps that abort to HTTP 503,
+    `models_client.caption` raises `ModelsCaptionPreempted`, and this stage
+    maps THAT to `ingest.worker.Preempted` (job stays pending, no burnt
+    retry — the plan-14 invariant, now carried over HTTP).
     """
 
     def handle(conn: sqlite3.Connection, photo_id: int) -> None:
@@ -61,34 +50,46 @@ def caption_handler(
         image_key = detail_key if derived.exists(detail_key) else row["thumb_key"]
         image = derived.read(image_key)
         try:
-            result = captioner.caption(image, dimensions, should_preempt=should_preempt)
-        except InferenceCancelled as cancelled:
-            raise Preempted() from cancelled   # yield the models; photo stays pending
+            result = models_client.caption(image, dimensions)
+        except ModelsCaptionPreempted as exc:
+            raise Preempted() from exc
 
         conn.execute(
             "UPDATE photos SET caption=?, caption_model=?, ai_title=?, ai_description=? WHERE id=?",
-            (result.caption, captioner.caption_model, result.title, result.description, photo_id),
+            (result["caption"], result["model"], result["title"], result["description"], photo_id),
         )
-        _write_vlm_tags(conn, photo_id, result.tags)
-        _embed_caption(conn, embed_client, embed_model, photo_id, result.caption)
+        _write_vlm_tags(conn, photo_id, result["tags"])
         reindex_fts(conn, photo_id)
 
     return handle
 
 
 def backfill_caption_vectors(
-    conn: sqlite3.Connection, client: InferenceClient, embed_model: str, limit: int = 50
+    conn: sqlite3.Connection, client: InferenceClient, model: str, limit: int = 50
 ) -> int:
-    """Embed captions that predate the caption-vector column (§9), a few per drain
-    so an already-captioned library gains semantic similarity without a full
-    re-caption. Returns how many were embedded."""
+    """Embed captions that have no caption-vector yet (§9) with the dedicated text
+    embedder `model` (`nomic-embed-text`, design §4) — this is the ONLY place caption
+    text is embedded (the caption stage just writes the text). Embedded in ONE batch
+    so the embedder loads once, a few per drain, so a freshly-captioned or pre-existing
+    library gains semantic similarity without a re-caption. Best-effort: an embedder
+    that is down must not fail the pass — the vectors retry next drain. Returns how
+    many were embedded."""
     rows = conn.execute(
         "SELECT id, caption FROM photos WHERE caption IS NOT NULL AND caption_vec IS NULL"
         " LIMIT ?",
         (limit,),
     ).fetchall()
-    for row in rows:
-        _embed_caption(conn, client, embed_model, row["id"], row["caption"])
+    rows = [r for r in rows if r["caption"]]
+    if not rows:
+        return 0
+    try:
+        vectors = embed_caption_texts(
+            client, model, [r["caption"] for r in rows], is_query=False
+        )
+    except Exception:  # noqa: BLE001 - embeddings are an enhancement, not required
+        return 0
+    for row, vector in zip(rows, vectors):
+        write_caption_vector(conn, row["id"], l2_normalize(vector))
     return len(rows)
 
 

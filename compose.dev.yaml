@@ -1,8 +1,8 @@
 # Development override: hot reload.
 #
 # Bind-mounts the source over the image's copy so edits on the host are visible
-# inside the container immediately. The app restarts via uvicorn --reload; the
-# worker is a plain loop, so watchfiles restarts it instead.
+# inside the container immediately. The app and models services restart via
+# uvicorn --reload; the worker is a plain loop, so watchfiles restarts it instead.
 #
 # Jinja templates and static files need no restart at all — Jinja auto-reloads
 # on mtime change and StaticFiles reads from disk per request.
@@ -50,3 +50,17 @@ services:
       - ./storage:/app/storage
       - ./web:/app/web
       - ./scripts:/app/scripts
+
+  models:
+    command: ["uv", "run", "--no-sync", "uvicorn", "modelsvc.asgi:app_factory",
+              "--factory", "--host", "0.0.0.0", "--port", "9000",
+              "--reload", "--reload-dir", "/app"]
+    environment:
+      WATCHFILES_FORCE_POLLING: "true"
+    volumes:
+      - ./config.py:/app/config.py
+      - ./vocab.yaml:/app/vocab.yaml
+      - ./modelsvc:/app/modelsvc
+      - ./embedding:/app/embedding
+      - ./captioning:/app/captioning
+      - ./inference:/app/inference

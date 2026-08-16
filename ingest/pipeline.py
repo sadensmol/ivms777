@@ -93,41 +93,39 @@ def drain_pass(context, vocab, coordinator=None, should_preempt=lambda: False) -
             )
             return
 
-    # Group 2b — caption stage, ONLY if pending. Same reasoning: queue for free,
-    # only take the INGEST_CAPTION lease when there is caption work to do.
+    # Group 2b — caption stage, ONLY if pending. Detached from the model coordinator
+    # (design §5.1, plan 15 task 3): captioning runs inside the `models` service,
+    # reached over HTTP through `models_client` — no local captioner, no
+    # INGEST_CAPTION lease, no in-worker VLM load. The stage writes caption TEXT only;
+    # its §9 vector is embedded in group 2c below.
     backfill_captions(conn)
     if stage_counts(conn, "caption")["pending"]:
         try:
-            with _lease(coordinator, "INGEST_CAPTION"):
-                # SigLIP is already released (the INGEST_EMBED lease exit above
-                # frees it), so Ollama gets the GPU for the vision captioner
-                # instead of silently falling back to CPU (§8).
-                client, _ = settings.build_inference_client()
-                # SHARED INSTANCE (design §4/§8.1): when a coordinator is present it
-                # already LOADED `coordinator.captioner` on lease entry (the
-                # INGEST_CAPTION resource) — this stage must call THAT instance, not
-                # build a second one, or the coordinator loads instance A onto the
-                # GPU while the stage calls unloaded instance B. With
-                # `coordinator=None` (the app's best-effort inline drain), there is
-                # no lease/load step, so a fresh captioner is built here instead:
-                # `OllamaCaptioner` needs no explicit load (Ollama auto-loads on the
-                # `complete` call), so mac's inline drain is unaffected; an
-                # in-process `VLMCaptioner` has no weights loaded, so `caption()`
-                # raises "before load()", the job is marked failed, and the WORKER
-                # (which always has a coordinator) re-runs it on its next pass —
-                # acceptable best-effort degradation. Do NOT lazy-load the VLM here
-                # outside a lease — that would bypass the RAM budget.
-                captioner = coordinator.captioner if coordinator is not None else settings.build_captioner(client)
-                backfill_caption_vectors(conn, client, settings.caption_embed_model)
-                drain(conn, {
-                    "caption": caption_handler(
-                        context.derived, captioner, client, settings.caption_embed_model,
-                        list(vocab.dimensions), settings.thumb_detail_px,
-                        should_preempt=should_preempt,   # abort an in-flight caption (§8.1)
-                    ),
-                }, should_preempt=should_preempt)
-        except (Preempted, LeaseBusyError):
+            models_client = settings.build_models_client()
+            drain(conn, {
+                "caption": caption_handler(
+                    context.derived, models_client,
+                    list(vocab.dimensions), settings.thumb_detail_px,
+                    should_preempt=should_preempt,
+                ),
+            }, should_preempt=should_preempt)
+        except Preempted:
             return
         except Exception:
             logger.exception("caption deferred this pass")
             return
+
+    # Group 2c — §9 caption-vector embed: one batched pass over the dedicated text
+    # embedder (`nomic-embed-text` via Ollama, design §4). It is its own step because
+    # the text embedder is a different model/backend from SigLIP and the caption VLM,
+    # so it shares no residency slot with them — a caption written in group 2b gets
+    # its vector here or on the next drain. Best-effort: `backfill_caption_vectors`
+    # swallows an embedder outage, so this never blocks the pass.
+    if conn.execute(
+        "SELECT 1 FROM photos WHERE caption IS NOT NULL AND caption_vec IS NULL LIMIT 1"
+    ).fetchone() is not None:
+        try:
+            client, _ = settings.build_inference_client()
+            backfill_caption_vectors(conn, client, settings.caption_embed_model)
+        except Exception:  # never crash the pass on the §9 enhancement
+            logger.exception("caption-vector embed deferred this pass")

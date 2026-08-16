@@ -18,6 +18,7 @@ from pathlib import Path
 
 from config import get_settings
 from db.connection import connect
+from embedding.caption_text import embed_caption_texts
 from embedding.vectors import l2_normalize
 from ingest.vocab import load_vocab
 from search.planner import plan, spec_to_params
@@ -53,7 +54,10 @@ def main(dev_path: str) -> None:
         for question, gold_list in dev.items():
             gold = set(gold_list)
             candidates = _candidates(conn, embedder, client, settings, dimensions, question)
-            query_vec = l2_normalize(client.embed(settings.caption_embed_model, [question])[0])
+            # Query embedded by the same dedicated text embedder that wrote caption_vec (§4/§9).
+            query_vec = l2_normalize(
+                embed_caption_texts(client, settings.caption_embed_model, [question], is_query=True)[0]
+            )
             got = {pid for pid, _ in rerank(conn, query_vec, candidates, floor=floor)}
             tp += len(got & gold)
             fp += len(got - gold)

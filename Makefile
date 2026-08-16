@@ -1,18 +1,20 @@
 # ivms777 — local dev on macOS.
 #
 # `make up` runs everything NATIVELY — no containers. It makes sure host Ollama
-# is running with the caption/planner models, then launches the app and the
-# worker as plain host processes against $HOME/.ivms777. SigLIP runs on the host
-# (CPU by default; set IVMS777_EMBED_DEVICE=mps for Metal); Ollama is already on
-# the host because Docker Desktop on macOS has no GPU passthrough.
+# is running with the caption/planner models, then launches the models service,
+# the worker, and the app as plain host processes against $HOME/.ivms777. SigLIP
+# runs on the host inside the models service (CPU by default; set
+# IVMS777_EMBED_DEVICE=mps for Metal); Ollama is already on the host because
+# Docker Desktop on macOS has no GPU passthrough. app/worker are thin clients
+# and reach the native models service at IVMS777_MODELS_BASE_URL (design §5.1).
 #
 # There is no `make down`: native `up` runs in the foreground and Ctrl-C stops
-# both processes. The compose.*.yaml files still describe the deployed stack for
-# jetson/cloud — just run `docker compose` directly there.
+# all three processes. The compose.*.yaml files still describe the deployed
+# stack for jetson/cloud — just run `docker compose` directly there.
 #
 # First run pulls the vision model (~6 GB) once — later runs are fast.
 
-OLLAMA_MODELS := qwen2.5vl:7b qwen2.5:3b
+OLLAMA_MODELS := qwen2.5vl:7b qwen2.5:3b nomic-embed-text
 
 # Jetson (8 GB Orin Nano, JetPack 7): fully containerised. 8 GB is shared
 # CPU+GPU, so only a 4B-class vision captioner + a 3B planner fit alongside SigLIP
@@ -25,19 +27,25 @@ JETSON_COMPOSE       := -f compose.yaml -f compose.jetson.yaml
 # (docs/design.md §3.1/§4). Only the planner is pulled into Ollama below.
 JETSON_CAPTION_MODEL ?= qwen2.5vl:3b
 JETSON_PLANNER_MODEL ?= qwen2.5:3b
-JETSON_MODELS        := $(JETSON_PLANNER_MODEL)
+# The planner + the §9 caption-meaning text embedder (nomic) are Ollama tags on jetson.
+JETSON_MODELS        := $(JETSON_PLANNER_MODEL) nomic-embed-text
 
 .DEFAULT_GOAL := help
 .PHONY: up run-jetson stop-jetson clean-jetson test lint ollama clean help
 
-up: ollama ## Ensure Ollama + models, then run app + worker NATIVELY → http://localhost:8000
+up: ollama ## Ensure Ollama + models, then run models + worker + app NATIVELY → http://localhost:8000
 	@mkdir -p "$$HOME/.ivms777"
-	@echo "  data $$HOME/.ivms777 · inference localhost:11434 · app http://localhost:8000 (Ctrl-C stops both)"
+	@echo "  syncing the models extra (torch/transformers) for the native models service…"
+	@uv sync --extra models
+	@echo "  data $$HOME/.ivms777 · inference localhost:11434 · models localhost:9000 · app http://localhost:8000 (Ctrl-C stops all)"
 	@IVMS777_PROFILE="$${IVMS777_PROFILE:-mac}" \
 	 IVMS777_DATA_DIR="$${IVMS777_DATA_DIR:-$$HOME/.ivms777}" \
-	 IVMS777_INFERENCE_BASE_URL="$${IVMS777_INFERENCE_BASE_URL:-http://localhost:11434/v1}" \
-	 bash -c 'uv run watchfiles "python -m ingest.cli" ingest embedding search inference albums storage db models web config.py vocab.yaml & W=$$!; trap "kill $$W 2>/dev/null" EXIT INT TERM; \
-	   uv run uvicorn web.app:app_factory --factory --host 0.0.0.0 --port 8000 --reload'
+	 IVMS777_MODELS_BASE_URL="$${IVMS777_MODELS_BASE_URL:-http://localhost:9000}" \
+	 bash -c 'IVMS777_INFERENCE_BASE_URL="$${IVMS777_INFERENCE_BASE_URL:-http://localhost:11434/v1}" \
+	   uv run --no-sync uvicorn modelsvc.asgi:app_factory --factory --host 0.0.0.0 --port 9000 & M=$$!; \
+	   uv run --no-sync watchfiles "python -m ingest.cli" ingest embedding search inference albums storage db models web config.py vocab.yaml & W=$$!; \
+	   trap "kill $$M $$W 2>/dev/null" EXIT INT TERM; \
+	   uv run --no-sync uvicorn web.app:app_factory --factory --host 0.0.0.0 --port 8000 --reload'
 
 run-jetson: ## Run ON THE JETSON: build + start the containerised stack, pull its (text) model → http://<jetson>:8000
 	@echo "  models     : caption=$(JETSON_CAPTION_MODEL) (in-process, Hugging Face) planner=$(JETSON_PLANNER_MODEL) (Ollama)"; \
@@ -54,12 +62,12 @@ run-jetson: ## Run ON THE JETSON: build + start the containerised stack, pull it
 	  echo "  pulling $$m…"; \
 	  docker compose $(JETSON_COMPOSE) exec -T inference ollama pull "$$m"; \
 	done
-	@gpu=$$(docker compose $(JETSON_COMPOSE) exec -T app uv run --no-sync python -c "import torch,numpy;print(torch.cuda.is_available(),numpy.__version__)" 2>/dev/null || true); \
-	 echo "  preflight   : cuda numpy = $${gpu:-<app not ready>}"; \
+	@gpu=$$(docker compose $(JETSON_COMPOSE) exec -T models uv run --no-sync python -c "import torch,numpy;print(torch.cuda.is_available(),numpy.__version__)" 2>/dev/null || true); \
+	 echo "  preflight   : cuda numpy = $${gpu:-<models not ready>}"; \
 	 case "$$gpu" in \
 	   True\ *)  echo "  preflight   : GPU OK — SigLIP will run on cuda." ;; \
 	   False\ *) echo "  ⚠️  GPU UNAVAILABLE — SigLIP/chat WILL 500. Fix the nvidia container runtime (docs/design.md §3.1), then rerun 'make run-jetson'." ;; \
-	   *)        echo "  ⚠️  could not verify GPU — check: docker compose $(JETSON_COMPOSE) logs app" ;; \
+	   *)        echo "  ⚠️  could not verify GPU — check: docker compose $(JETSON_COMPOSE) logs models" ;; \
 	 esac
 	@ip=$$(hostname -I 2>/dev/null | awk '{print $$1}'); \
 	 echo "  ivms777 (jetson) up."; \

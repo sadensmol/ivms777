@@ -96,6 +96,8 @@ def _searchable(conn, pid, caption, *, with_caption_vec=True):
     add_photo(conn, photo_id=pid, content_hash=f"h{pid}", thumb_key=f"{pid}.jpg", caption=caption)
     write_vector(conn, pid, FakeEmbedder().embed_texts([caption])[0])          # semantic fusion
     if with_caption_vec:
+        # caption_vec in the dedicated text-embed space (the client's caption model —
+        # "fake" in tests, nomic in prod, §4/§9), the same space the query uses.
         write_caption_vector(conn, pid, l2_normalize(FakeInferenceClient().embed("fake", [caption])[0]))
 
 
@@ -261,21 +263,6 @@ def test_count_question_answers_without_taking_the_model_lease(settings, monkeyp
     assert "3" in body                       # the real total, from the DB
     assert "busy" not in body.lower()         # never fell into the lease-busy path
     assert "event: done" in body
-
-
-def test_chat_releases_the_model_lease_after_the_turn(settings, monkeypatch):
-    # Build the app directly so we can read app.state.context.conn for the lease.
-    from models import lease_store as ls
-
-    settings.data_dir.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr(
-        type(settings), "build_inference_client",
-        lambda self: (FakeInferenceClient(streams=[["ok"]]), "fake"),
-    )
-    app = create_app(settings)
-    with TestClient(app) as tc:
-        tc.get("/chat/stream?q=beach")
-        assert ls.read_lease(app.state.context.conn) is None   # CHAT lease released
 
 
 def test_chat_stream_never_aborts_when_the_coordinator_lease_times_out(settings, monkeypatch):

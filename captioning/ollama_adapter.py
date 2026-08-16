@@ -10,7 +10,12 @@ from collections.abc import Callable
 from captioning.base import CaptionResult
 from inference.client import encode_image
 from inference.prompts import CAPTION_SCHEMA, caption_messages
-from models import workloads as wl
+
+# Resident-MB estimates (design §8.1, relocated from the deleted
+# `models/workloads.py`, plan 15 task 7 — this adapter is the sole remaining
+# consumer). qwen2.5vl:3b ~3.3 GB; qwen2.5vl:7b ~6 GB.
+_FOOTPRINT_MB: dict[str, int] = {"qwen2.5:3b": 2200, "qwen2.5vl:3b": 3300, "qwen2.5vl:7b": 6000}
+_FALLBACK_LLM_MB = 3000  # unknown LLM tag → conservative estimate
 
 
 class OllamaCaptioner:
@@ -46,4 +51,4 @@ class OllamaCaptioner:
     def footprint_mb(self) -> int:
         if self._footprint is not None:
             return self._footprint
-        return wl.FOOTPRINT_MB.get(self.caption_model, wl._FALLBACK_LLM_MB)
+        return _FOOTPRINT_MB.get(self.caption_model, _FALLBACK_LLM_MB)

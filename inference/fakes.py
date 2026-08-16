@@ -55,3 +55,6 @@ class FakeInferenceClient:
 
     def evict(self, model: str, *, timeout: float = 30.0) -> None:
         return None
+
+    def loaded_models(self, *, timeout: float = 2.0) -> list[str]:
+        return []

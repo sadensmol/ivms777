@@ -18,6 +18,7 @@ import sqlite3
 from dataclasses import dataclass, field
 
 from embedding.base import Embedder
+from embedding.caption_text import embed_caption_texts
 from embedding.store import knn, read_caption_vector, read_vector
 from embedding.vectors import l2_normalize
 from inference.client import InferenceClient
@@ -250,14 +251,17 @@ def _text_contributions(
     caption_model: str,
     caption_min: float,
 ) -> dict[int, list[dict]]:
-    """A text query's contributions: caption meaning vs the query (in the
-    inference-client's caption embed space, §9 two-embedding-spaces rule), the
-    fused semantic+keyword rank folded in as the visual contribution (no seed image
-    vector to compare against), and soft planner tag hints — score-only, never a
-    gate (the §10 fix this plan makes structural)."""
+    """A text query's contributions: caption meaning vs the query — the query embedded
+    by the SAME dedicated text embedder (`caption_model`, `nomic-embed-text`, design §4)
+    that wrote the caption vectors, so both sit in ONE space and the cosine is
+    meaningful — the fused semantic+keyword rank folded in as the visual contribution
+    (no seed image vector to compare against), and soft planner tag hints — score-only,
+    never a gate (the §10 fix this plan makes structural)."""
     contributions: dict[int, list[dict]] = {pid: [] for pid in ids}
 
-    query_vec = l2_normalize(client.embed(caption_model, [query.text])[0])
+    query_vec = l2_normalize(
+        embed_caption_texts(client, caption_model, [query.text], is_query=True)[0]
+    )
     for pid in ids:
         cap_vec = read_caption_vector(conn, pid)
         if cap_vec is None:

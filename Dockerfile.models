@@ -1,0 +1,33 @@
+# The `models` service (mac/cloud) — the one process that loads torch/
+# transformers (design §5.1, plan 15 task 6). app/worker are thin clients and
+# never install these; this image is the only one that does.
+FROM python:3.12-slim
+
+# libheif1: HEIC decoding (pillow-heif, used by the image embedder's input
+# path). libjpeg62-turbo/zlib1g: Pillow runtime. libsndfile1: transformers 5.x
+# eagerly imports `soundfile` from its processing utils, which dlopen()s
+# libsndfile even for a vision-only model like SigLIP; without it
+# `AutoProcessor` import crashes.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libheif1 libjpeg62-turbo zlib1g libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+WORKDIR /app
+COPY pyproject.toml uv.lock* README.md ./
+RUN uv sync --no-dev --extra models --frozen || uv sync --no-dev --extra models
+
+# Flat layout: only the modules the models service actually imports — it
+# never touches web/chat/ingest/search/storage/db/albums.
+COPY config.py vocab.yaml ./
+COPY modelsvc ./modelsvc
+COPY embedding ./embedding
+COPY captioning ./captioning
+COPY inference ./inference
+
+ENV PYTHONUNBUFFERED=1 IVMS777_DATA_DIR=/data
+EXPOSE 9000
+
+CMD ["uv", "run", "--no-sync", "uvicorn", "modelsvc.asgi:app_factory", \
+     "--factory", "--host", "0.0.0.0", "--port", "9000"]

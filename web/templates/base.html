@@ -8,7 +8,12 @@
     <script src="/static/htmx.min.js?v={{ static_v('htmx.min.js') }}"></script>
   </head>
   <body>
-    <nav class="nav">
+    {# The persistent app shell: only the four nav links are HTMX-boosted, and they
+       swap ONLY <main>. So <nav> — and the live resource bar's polling — stay in the
+       DOM across top-level navigation; the menu never re-renders and the resbar never
+       blanks. Boost is scoped to these links on purpose: photo/grid drill-downs are
+       full navigations so §13.1's bfcache-based history.back() is untouched. #}
+    <nav class="nav" hx-boost="true" hx-target="main" hx-select="main" hx-swap="outerHTML show:window:top">
       <a href="/upload">Upload</a>
       <a href="/library">Library</a>
       <a href="/chat">Chat</a>

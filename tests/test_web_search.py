@@ -53,16 +53,6 @@ def test_duplicates_filter_shows_only_multi_source_photos(client):
     assert "/thumb/1" not in body  # the beach photo has a single source
 
 
-def test_library_search_releases_the_search_lease(client):
-    # SigLIP-embed work in the library read-path is coordinated (§8.1 FIX I1):
-    # a search request takes the SEARCH lease for the query and releases it
-    # before the response is returned, never leaving SigLIP resident uncoordinated.
-    from models import lease_store as ls
-
-    client.get("/library?q=beach")
-    assert ls.read_lease(client.app.state.context.conn) is None
-
-
 def test_facet_filter_narrows_search_results(client):
     # Candidate generation now goes through search/retriever.py's candidates(), but
     # the hard EXIF-facet narrowing (_filter_where) must still apply exactly: a

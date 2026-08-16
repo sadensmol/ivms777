@@ -3,20 +3,27 @@ import json
 from pydantic import BaseModel, Field
 
 from inference.client import ChatMessage, InferenceClient
-from ingest.facets import FACET_KEYS
 
 # Facet keys the planner may emit, split by kind (§6.2). Categorical map to a
-# list of accepted values; numeric map to {gte?, lte?} bounds.
+# list of accepted values; numeric map to {gte?, lte?} bounds. These become HARD
+# EXIF gates (§6.2 ADR), so the list is deliberately curated: `aspect` and
+# `orientation` are OMITTED — a weak planner hallucinates them for any query
+# ("man in black" → orientation:any / aspect:4:3), and because a hard facet is an
+# exact cut, that empties the whole result pool before the caption rank runs. They
+# stay real *sidebar* facets (a user can still pick them), just never planner-emitted.
 CATEGORICAL_FACETS: tuple[str, ...] = (
     "camera_make", "camera_model", "lens", "software", "flash",
     "exposure_program", "metering_mode", "white_balance",
     "weekday", "time_of_day", "is_weekend",
-    "has_gps", "place_city", "place_country", "aspect", "orientation",
+    "has_gps", "place_city", "place_country",
 )
 NUMERIC_FACETS: tuple[str, ...] = (
     "iso", "aperture", "shutter_speed", "focal_length", "exposure_bias",
     "year", "month", "hour", "megapixels",
 )
+# Only these keys survive from a planned spec into hard filters — a curated allowlist,
+# so a hallucinated or non-planner facet (e.g. `aspect`) never reaches SQL as a gate.
+PLANNER_FACET_KEYS: frozenset[str] = frozenset(CATEGORICAL_FACETS) | frozenset(NUMERIC_FACETS)
 
 
 class QuerySpec(BaseModel):
@@ -38,7 +45,11 @@ def planner_messages(query: str, dimensions: list[str]) -> list[ChatMessage]:
         "keys take an object with gte/lte). "
         f"Categorical facet keys: {', '.join(CATEGORICAL_FACETS)}. "
         f"Numeric facet keys: {', '.join(NUMERIC_FACETS)}. "
-        "Use only these keys. Omit anything the query does not mention. "
+        "Facets are HARD filters — a photo that does not match is excluded — so emit a "
+        "facet ONLY when the query names that exact camera/place/time/date attribute. "
+        "For a plain visual query like 'man in black' or 'dogs on a beach', facets MUST "
+        "be an empty object {} — put the visual subject in \"semantic\" (and colours/"
+        "moods/subjects in \"tags\"), NEVER in facets. When unsure, omit. "
         "Reply with ONLY the JSON object — no prose, no markdown fences."
     )
     return [
@@ -83,7 +94,7 @@ def spec_to_params(spec: QuerySpec, *, query: str, dimensions: list[str]) -> dic
         if dimension in dimensions and labels:
             params[f"t_{dimension}"] = ",".join(labels)
     for key, value in spec.facets.items():
-        if key not in FACET_KEYS:
+        if key not in PLANNER_FACET_KEYS:
             continue
         if isinstance(value, list) and value:
             params[f"f_{key}"] = ",".join(str(v) for v in value)

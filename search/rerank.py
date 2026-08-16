@@ -15,16 +15,22 @@ def rerank(
     query_vec: list[float],
     candidate_ids: list[int],
     *,
-    floor: float,
+    floor: float | None = None,
 ) -> list[tuple[int, float]]:
-    """Rerank candidates by caption-meaning cosine (§10). `query_vec` must be a
-    vector in the caption embed space (the inference client's `caption_embed_model`);
-    it is L2-normalized here.
+    """Rank candidates by caption-meaning cosine (§10), best first — the caller takes
+    the top-k. `query_vec` must be a vector in the caption embed space — the dedicated
+    text embedder that wrote `caption_vec` (`nomic-embed-text`, design §4/§9); it is
+    L2-normalized here.
+
+    Default (`floor=None`) is a pure **top-k ranking**: every candidate with a caption
+    vector is ranked by cosine, no threshold — the right consumption for a text
+    embedder whose absolute cosines are not calibrated to a fixed cut (design §4), with
+    honest-empty left to the agent that verifies the shortlist. Passing a `floor`
+    additionally drops candidates below it (legacy gate; not used by chat anymore).
 
     A candidate WITHOUT a caption vector has an UNAVAILABLE signal, not a zero one:
     it is kept — sunk below the scored matches, in input order — so a photo whose
-    caption vector is not computed yet is never floored out of chat (the agent
-    revalidates it). Only candidates that HAVE a vector are subject to `floor`.
+    caption vector is not computed yet is never dropped (the agent revalidates it).
     Returns (photo_id, cosine) best first; kept-but-unscored candidates report 0.0.
     """
     q = l2_normalize(query_vec)
@@ -33,10 +39,10 @@ def rerank(
     for pid in candidate_ids:
         vec = read_caption_vector(conn, pid)
         if vec is None:
-            unscored.append((pid, 0.0))  # signal unavailable — keep, don't floor
+            unscored.append((pid, 0.0))  # signal unavailable — keep, don't drop
             continue
         cosine = sum(a * b for a, b in zip(q, l2_normalize(vec)))
-        if cosine >= floor:
+        if floor is None or cosine >= floor:
             scored.append((pid, cosine))
     scored.sort(key=lambda pair: -pair[1])
     return scored + unscored

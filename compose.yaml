@@ -1,5 +1,9 @@
 # Photos arrive by upload from the browser — there is no host mount. Originals
 # and derived data live on the named volume under /data.
+#
+# `app`/`worker` are thin clients (design §5.1, plan 15 task 6) — no torch, no
+# GPU, no HF cache. Every model lives in the `models` service, reached over
+# HTTP at `models:9000` (config.models_base_url default).
 services:
   app:
     build: .
@@ -8,9 +12,9 @@ services:
       IVMS777_DATA_DIR: /data
     volumes:
       - ivms777-data:/data           # uploads, db, thumbnails — Docker volume only
-      - ivms777-models:/root/.cache/huggingface  # SigLIP weights, downloaded once
     ports:
       - "8000:8000"
+    depends_on: [models]
 
   worker:
     build: .
@@ -20,7 +24,18 @@ services:
       IVMS777_DATA_DIR: /data
     volumes:
       - ivms777-data:/data
-      - ivms777-models:/root/.cache/huggingface
+    depends_on: [models]
+
+  models:
+    build:
+      context: .
+      dockerfile: Dockerfile.models
+    environment:
+      IVMS777_PROFILE: ${IVMS777_PROFILE:-mac}
+      IVMS777_DATA_DIR: /data
+    volumes:
+      - ivms777-data:/data
+      - ivms777-models:/root/.cache/huggingface  # SigLIP/caption weights, downloaded once
 
 volumes:
   ivms777-data:
