@@ -15,12 +15,19 @@ PROFILE_DEFAULTS: dict[Profile, dict[str, object]] = {
         "planner_model": "qwen2.5:3b",
         "embed_device": "cpu",
         "inference_base_url": "http://host.docker.internal:11434/v1",
+        "ram_budget_mb": 24000,
+        "caption_backend": "ollama",
     },
     "jetson": {
         "caption_model": "qwen2.5vl:3b",
         "planner_model": "qwen2.5:3b",
         "embed_device": "cuda",
         "inference_base_url": "http://inference:11434/v1",
+        "ram_budget_mb": 6000,
+        # Ollama's CUDA build runs vision on CPU on JP7 (no Orin sm_87 vision
+        # kernels), so jetson captions in-process instead (design §3.1/§4/§8.1).
+        "caption_backend": "inprocess",
+        "caption_model_id": "Qwen/Qwen2.5-VL-3B-Instruct",
     },
     "cloud": {
         # vLLM serves whatever VLLM_MODEL is set to; point these at that model.
@@ -28,6 +35,8 @@ PROFILE_DEFAULTS: dict[Profile, dict[str, object]] = {
         "planner_model": "qwen2.5:3b",
         "embed_device": "cuda",
         "inference_base_url": "http://inference:8000/v1",
+        "ram_budget_mb": 60000,
+        "caption_backend": "ollama",
     },
 }
 
@@ -45,6 +54,12 @@ class Settings(BaseSettings):
     text_embed_model: str | None = None
     embed_device: Literal["cpu", "cuda", "mps"] | None = None
     inference_base_url: str | None = None
+    # Captioner adapter selection (design §4, §8.1): "ollama" (mac/cloud, today's
+    # path) vs "inprocess" (jetson — transformers 4-bit VLM on the cu132 GPU,
+    # because Ollama's CUDA build runs vision on CPU on JP7). caption_model_id is
+    # the HF repo id used only by the inprocess backend.
+    caption_backend: Literal["ollama", "inprocess"] | None = None
+    caption_model_id: str | None = None
 
     owner_id: int = 1
     thumb_grid_px: int = 320
@@ -65,6 +80,10 @@ class Settings(BaseSettings):
     embed_model_name: str = "siglip2-so400m-patch14-384"
     use_fake_embedder: bool = False
     use_fake_inference: bool = False
+
+    # Usable RAM budget for the model coordinator (design §8.1). A workload whose
+    # model-set exceeds this is refused, not loaded. Per-profile default below.
+    ram_budget_mb: int | None = None
 
     @model_validator(mode="after")
     def _apply_profile_defaults(self) -> "Settings":
@@ -123,6 +142,30 @@ class Settings(BaseSettings):
         from inference.client import OpenAICompatClient
 
         return OpenAICompatClient(self.inference_base_url or ""), self.caption_model
+
+    def build_captioner(self, client):
+        """Return a `Captioner` (design §4, §8.1) for the profile's `caption_backend`.
+
+        mac/cloud select `OllamaCaptioner` over `client` (today's caption path,
+        byte-identical); jetson selects `VLMCaptioner`, CONSTRUCTED ONLY — no
+        `.load()` here, so no torch import and no weight download. Loading is the
+        model coordinator's job, under the `INGEST_CAPTION` lease. `use_fake_inference`
+        always forces the Ollama adapter over a `FakeInferenceClient`, on every
+        profile, so the offline test path stays reachable on jetson too. Imports
+        are local so importing config never pulls in torch/transformers.
+        """
+        if self.use_fake_inference:
+            from captioning.ollama_adapter import OllamaCaptioner
+            from inference.fakes import FakeInferenceClient
+
+            return OllamaCaptioner(FakeInferenceClient([]), "fake")
+        if self.caption_backend == "inprocess":
+            from captioning.vlm_adapter import VLMCaptioner
+
+            return VLMCaptioner(self.caption_model_id, device=self.embed_device or "cuda")
+        from captioning.ollama_adapter import OllamaCaptioner
+
+        return OllamaCaptioner(client, self.caption_model or "fake")
 
 
 @lru_cache

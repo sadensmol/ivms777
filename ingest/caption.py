@@ -1,15 +1,15 @@
-import json
 import sqlite3
+from collections.abc import Callable
 
+from captioning.base import Captioner
 from embedding.store import write_caption_vector
 from embedding.vectors import l2_normalize
-from inference.client import InferenceClient, encode_image
-from inference.prompts import CAPTION_SCHEMA, caption_messages
+from inference.client import InferenceCancelled, InferenceClient
 from ingest.jobs import enqueue
 from ingest.taxonomy import reindex_fts
 from ingest.thumbs import thumb_key
 from ingest.vocab import tag_id_map
-from ingest.worker import StageHandler
+from ingest.worker import Preempted, StageHandler
 from storage.base import Storage
 
 
@@ -29,16 +29,25 @@ def _embed_caption(
 
 def caption_handler(
     derived: Storage,
-    client: InferenceClient,
-    model: str,
+    captioner: Captioner,
+    embed_client: InferenceClient,
     embed_model: str,
     dimensions: list[str],
     detail_px: int,
+    should_preempt: Callable[[], bool] = lambda: False,
 ) -> StageHandler:
-    """The caption stage: one VLM call per photo -> caption, AI title/description,
-    and vlm tags — and the caption's own text embedding for semantic similarity
-    (§9), computed here while the caption is fresh. Drains last (§8). Invalid JSON
-    raises so the queue retries the job rather than writing half a row.
+    """The caption stage: one call per photo through the `Captioner` adapter
+    (design §4) -> caption, AI title/description, and vlm tags — and the
+    caption's own text embedding for semantic similarity (§9), computed here
+    while the caption is fresh, over `embed_client` (Ollama, unchanged even on
+    jetson). Drains last (§8). A captioner error raises so the queue retries the
+    job rather than writing half a row.
+
+    The captioner call is cancellable: `should_preempt` is threaded through, so
+    an interactive request (chat, memory rebuild) aborts an in-flight caption
+    within a chunk instead of waiting out the whole call (§8.1). An abort raises
+    `InferenceCancelled`, mapped here to `Preempted`, which leaves the photo's
+    job PENDING for the next pass — never a burnt retry.
     """
 
     def handle(conn: sqlite3.Connection, photo_id: int) -> None:
@@ -51,16 +60,17 @@ def caption_handler(
         # Prefer the detail thumbnail; fall back to the grid one the photo already has.
         image_key = detail_key if derived.exists(detail_key) else row["thumb_key"]
         image = derived.read(image_key)
-        messages = caption_messages(model, encode_image(image), dimensions)
-        obj = json.loads(client.complete(model, messages, json_schema=CAPTION_SCHEMA))
+        try:
+            result = captioner.caption(image, dimensions, should_preempt=should_preempt)
+        except InferenceCancelled as cancelled:
+            raise Preempted() from cancelled   # yield the models; photo stays pending
 
         conn.execute(
-            "UPDATE photos SET caption = ?, caption_model = ?, ai_title = ?, ai_description = ?"
-            " WHERE id = ?",
-            (obj["caption"], model, obj["title"], obj["description"], photo_id),
+            "UPDATE photos SET caption=?, caption_model=?, ai_title=?, ai_description=? WHERE id=?",
+            (result.caption, captioner.caption_model, result.title, result.description, photo_id),
         )
-        _write_vlm_tags(conn, photo_id, obj.get("tags") or {})
-        _embed_caption(conn, client, embed_model, photo_id, obj["caption"])
+        _write_vlm_tags(conn, photo_id, result.tags)
+        _embed_caption(conn, embed_client, embed_model, photo_id, result.caption)
         reindex_fts(conn, photo_id)
 
     return handle

@@ -17,6 +17,10 @@ services:
     runtime: nvidia
     environment:
       OLLAMA_HOST: 0.0.0.0
+      # The model coordinator assumes Ollama holds exactly one LLM resident at
+      # a time (warm/evict via inference/client.py); cap it so a second
+      # implicit load can't keep both in memory on the 8 GB Orin.
+      OLLAMA_MAX_LOADED_MODELS: 1
     volumes:
       - ollama-models:/root/.ollama
     ports:

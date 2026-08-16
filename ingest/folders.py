@@ -98,6 +98,27 @@ def _delete_folder(
             "SELECT 1 FROM photo_sources WHERE photo_id = ? LIMIT 1", (photo_id,)
         ).fetchone() is None:
             _delete_photo(conn, originals, derived, photo_id, grid_px, detail_px)
+    _prune_empty_memories(conn, owner_id)
+
+
+def _prune_empty_memories(conn: sqlite3.Connection, owner_id: int) -> None:
+    """Drop memory groups the delete cascade left with no photos (§3.2c, §11).
+
+    A memory built from photos that all lived in the deleted folder keeps its
+    `groups` row after its `group_photos` cascade away — an orphan that has no
+    cover and crashes the Organize/chat memory card. Remove it and its
+    `memory_fts` row so a dropped memory disappears from search in lockstep."""
+    conn.execute(
+        "DELETE FROM memory_fts WHERE rowid IN ("
+        "  SELECT g.id FROM groups g WHERE g.owner_id = ? AND g.kind = 'memory'"
+        "    AND NOT EXISTS (SELECT 1 FROM group_photos gp WHERE gp.group_id = g.id))",
+        (owner_id,),
+    )
+    conn.execute(
+        "DELETE FROM groups WHERE owner_id = ? AND kind = 'memory'"
+        "  AND NOT EXISTS (SELECT 1 FROM group_photos gp WHERE gp.group_id = groups.id)",
+        (owner_id,),
+    )
 
 
 def _delete_photo(

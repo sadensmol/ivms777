@@ -119,6 +119,17 @@ def reprocess_one(conn: sqlite3.Connection, photo_id: int, stage: str) -> None:
     )
 
 
+def requeue_running(conn: sqlite3.Connection, photo_id: int, stage: str) -> None:
+    """Return one in-flight job to 'pending' WITHOUT counting an attempt — for a
+    caption aborted mid-flight by an interactive preempt (§8.1). The photo was
+    claimed ('running'); the abort is not a failure, so it re-runs on the next pass
+    instead of being stranded 'running' until a worker restart."""
+    conn.execute(
+        "UPDATE jobs SET status = 'pending', updated_at = ? WHERE photo_id = ? AND stage = ?",
+        (_now(), photo_id, stage),
+    )
+
+
 def requeue_stalled(conn: sqlite3.Connection) -> int:
     """Return every 'running' job to 'pending' — call once at worker startup.
 

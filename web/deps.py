@@ -41,6 +41,34 @@ class AppContext:
             self._local.conn = conn
         return conn
 
+    def make_coordinator(self, client, holder: str):
+        """Build a `ModelCoordinator` per use (design §8.1), never stored: it
+        must read `self.conn` — the thread-local connection — at call time, on
+        the thread that will hold the lease."""
+        from db.connection import connect
+        from models.coordinator import ModelCoordinator
+
+        s = self.settings
+        db_path = self._db_path
+        # Built once here, not inside the coordinator, so the caption STAGE can
+        # reuse this exact instance (`coordinator.captioner`) under the
+        # INGEST_CAPTION lease — the coordinator loads it, the stage calls it;
+        # two separate instances would mean the stage's captioner is never
+        # actually loaded (design §4/§8.1, SHARED-INSTANCE requirement).
+        captioner = s.build_captioner(client)
+        coordinator = ModelCoordinator(
+            self.conn, client, holder=holder,
+            budget_mb=s.ram_budget_mb,
+            planner_model=s.planner_model or "fake",
+            caption_model=s.caption_model or "fake",
+            load_siglip=lambda: s.build_embedder(),
+            captioner=captioner,
+            # The heartbeat thread bumps liveness on its OWN connection (design
+            # §8.1) so a holder blocked in a long caption still proves it is alive.
+            heartbeat_connect=lambda: connect(db_path),
+        )
+        return coordinator
+
 
 def build_context(settings: Settings) -> AppContext:
     from db.connection import connect, migrate

@@ -40,3 +40,10 @@ def test_env_prefix_is_ivms777(monkeypatch):
     s = Settings()
     assert s.profile == "cloud"
     assert s.data_dir == Path("/tmp/other")
+
+
+def test_ram_budget_follows_profile_default(tmp_path):
+    mac = Settings(profile="mac", data_dir=tmp_path, use_fake_embedder=True, use_fake_inference=True)
+    jetson = Settings(profile="jetson", data_dir=tmp_path, use_fake_embedder=True, use_fake_inference=True)
+    assert mac.ram_budget_mb == 24000
+    assert jetson.ram_budget_mb == 6000

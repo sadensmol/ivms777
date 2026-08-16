@@ -49,14 +49,17 @@ below). Ingest is identical everywhere — photos always arrive by upload
 | Profile | Inference | Caption model | Planner / chat model | Embed device |
 |---|---|---|---|---|
 | `mac` | Ollama on the **host** | `qwen2.5vl:7b` | `qwen2.5:3b` | `cpu` |
-| `jetson` | Ollama in a container | `qwen2.5vl:3b` | `qwen2.5:3b` | `cuda` |
+| `jetson` | Ollama in a container (text only, see below) | Qwen2.5-VL-3B, 4-bit, **in-process** | `qwen2.5:3b` (Ollama) | `cuda` |
 | `cloud` | vLLM in a container, `--gpus all` | `qwen2.5vl:7b` | `qwen2.5:3b` | `cuda` |
 
-The caption model must be **vision-capable**. The tags above are the shipping
-defaults in `config.py` — real, currently-pullable Ollama models — overridable
-with `IVMS777_CAPTION_MODEL` / `IVMS777_PLANNER_MODEL`. The "Gemma 4" family named
-in the rationale below (§4) is the intended target once it is available on Ollama;
-until then Qwen2.5-VL is the working default.
+The caption model must be **vision-capable**. On `mac`/`cloud` the tags above are
+the shipping defaults in `config.py` — real, currently-pullable Ollama models —
+overridable with `IVMS777_CAPTION_MODEL` / `IVMS777_PLANNER_MODEL`. On `jetson`
+the caption model is instead a Hugging Face repo id (`caption_model_id`, default
+`Qwen/Qwen2.5-VL-3B-Instruct`), since it loads in-process rather than through
+Ollama — see below. The "Gemma 4" family named in the rationale below (§4) is the
+intended target once it is available on Ollama; until then Qwen2.5-VL is the
+working default.
 
 **Why Ollama runs on the host under `mac`.** Docker Desktop on macOS boots a
 Linux VM, and Apple exposes no GPU to Linux guests — there is no Metal in a
@@ -82,22 +85,28 @@ fit and a small (3–4B-class) model is used instead. This works only because
 **at most one workload's models are resident at a time** — SigLIP and the
 captioner are never both loaded, and neither is loaded while chat is answering.
 That invariant is enforced by the **model coordinator (§8.1)**, not by luck of
-stage ordering: every consumer (ingest, chat, memory rebuild) declares the
-workload it needs, and the coordinator loads exactly those models, evicts the
-rest, and refuses a set that would exceed the RAM budget. Expect roughly
+stage ordering: every consumer (ingest, chat, memory rebuild, library search)
+declares the workload it needs, and the coordinator loads exactly those models,
+evicts the rest, and refuses a set that would exceed the RAM budget. Expect roughly
 6-8 s/photo, so about 8-11 hours for 5,000 photos at 25 W. The coordinator is
 **profile-agnostic** — the same lease/preempt logic runs on mac and cloud; only
 the per-profile RAM budget differs (§8.1).
 
-The shipping default is `qwen2.5vl:3b` for captioning and `qwen2.5:3b` for the
-planner — the `config.py` jetson defaults, a real, currently-pullable pair that
-fits the 8 GB budget. `gemma4:e4b` is the intended captioner alternate once the
-Gemma 4 family lands on Ollama (§4). Both are overridable per-deploy via
-`IVMS777_CAPTION_MODEL` / `IVMS777_PLANNER_MODEL` (the `make run-jetson` target
-passes the chosen tags to the `app` and `worker` containers **and** pulls them
-into the in-container Ollama, so what runs matches what was pulled). Published
-benchmark scores do not settle the captioner choice on their own — the phase 1
-bake-off decides it on real photos.
+The shipping default is `qwen2.5:3b` for the planner — an **Ollama tag**, pulled
+into the in-container Ollama — and Qwen2.5-VL-3B for captioning, an **in-process**
+Hugging Face model (`config.py`'s `caption_model_id`,
+`Qwen/Qwen2.5-VL-3B-Instruct`), fetched from Hugging Face on first use and never
+an Ollama tag on jetson. Both fit the 8 GB budget. `gemma4:e4b` is the intended
+captioner alternate once the Gemma 4 family lands on Ollama with working Orin
+vision (§4); until then Qwen2.5-VL is the working default. `IVMS777_PLANNER_MODEL`
+overrides the planner tag — `make run-jetson` passes it through and pulls it into
+the in-container Ollama, so what runs matches what was pulled. `IVMS777_CAPTION_MODEL`
+still exists (`config.py`'s `caption_model`, used for the resource bar's display
+label, §8.1) but on jetson names no Ollama pull — the real in-process weights come
+from `caption_model_id`, downloaded from Hugging Face into the mounted cache the
+first time a caption runs, not by `make run-jetson`. Published benchmark scores do
+not settle the captioner choice on their own — the phase 1 bake-off decides it on
+real photos.
 
 **Jetson image.** `mac` and `cloud` build the app from the default `Dockerfile`
 (`python:3.12-slim` + `torch` from PyPI). That does **not** work on Jetson:
@@ -119,13 +128,24 @@ system Python 3.12, matching `pyproject.toml`'s `>=3.12` floor, so the image run
 the normal `uv sync` from `pyproject.toml` and then reinstalls `torch`/`torchvision`
 from the cu132 index over the CPU torch that `uv sync` brought. `numpy` stays on
 `pyproject`'s `>=2.5.2` — the cu132 wheels are built against NumPy 2.x, so no
-Jetson-specific numpy pin is needed. The captioner/planner still run in the
-separate Ollama container, exactly as the table says — but on `jetson` that
-container is **NVIDIA's JetPack-7 ollama build** (`ghcr.io/nvidia-ai-iot/ollama:*`),
-not the generic `ollama/ollama:latest`: the generic image's vision/mtmd path
-deadlocks on Orin/JP7 (text generation works, but any image request hangs at 0 %
-CPU regardless of memory, swap, or `ipc:host`), so captioning never completes. The
-NVIDIA build ships the CUDA-13 vision kernels the generic one lacks.
+Jetson-specific numpy pin is needed.
+
+**Captioning runs in-process on jetson; text stays on Ollama.** Ollama's CUDA
+build ships no Orin `sm_87` vision kernels, so on JetPack 7 a vision request
+silently falls back to running CLIP on the CPU — roughly 20x slower than the GPU
+path, and the reason captions used to stall out or hang indefinitely. Rather than
+chase a matching NVIDIA JetPack-7 Ollama build, `jetson` moves captioning
+**in-process**: `Dockerfile.jetson`'s `app`/`worker` images load
+**Qwen2.5-VL-3B in 4-bit** directly via `transformers` (`captioning.VLMCaptioner`,
+§4) onto the same cu132 GPU that already serves SigLIP, resident at roughly
+**2.7 GB** — well inside the 6 GB Jetson budget (§8.1). This needs three extra
+image dependencies, jetson-only, never installed on the mac/cloud `Dockerfile`:
+`gcc` (Triton JIT-compiles the `bitsandbytes` quantization kernels at import
+time, and the slim base ships no C compiler), `bitsandbytes` (the 4-bit
+quantization), and `accelerate` (device placement for `from_pretrained`). Text
+inference — the query planner, chat, and the caption-embedding call — is
+unaffected and keeps running on Ollama in the generic `ollama/ollama:latest`
+image; only the vision path moved off it.
 
 > **NOTE — Orin compute capability.** The generic upstream cu132 wheels may not
 > ship a prebuilt cubin for Orin's `sm_87`; kernels then JIT from PTX (correct,
@@ -220,6 +240,11 @@ from that folder, and *all* of each deleted photo's metadata — `photo_vec`,
 stored original. A photo whose identical bytes still belong to another folder is
 kept; only that folder's `photo_sources` path is dropped.
 
+A memory (§11) whose photos all lived in the deleted folder is left with no
+`group_photos`; the cascade prunes that now-empty `groups(kind='memory')` row and
+its `memory_fts` entry, so a memory the delete emptied disappears from Organize and
+chat search in lockstep — never lingering as a coverless, crash-prone orphan.
+
 **Deletion runs through an outbox + worker**, never inline. `POST
 /upload/folder/delete` records the intent in `folder_deletions` and returns
 immediately; the folder shows "deleting…". The worker drains the outbox each pass
@@ -241,9 +266,20 @@ restarts and never blocks the UI. This is the Outbox pattern.
 | Role | Model | Where it runs |
 |---|---|---|
 | Image and text embeddings, zero-shot tags | SigLIP 2 `so400m-patch14-384` | in-process in the worker (`transformers`) |
-| Captions and structured tags | Gemma 4, size per profile | inference service over HTTP |
-| Query planning, chat answers | Gemma 4 E4B | inference service over HTTP |
+| Captions and structured tags | per profile: Ollama VLM — `qwen2.5vl:7b` (mac/cloud) **or** Qwen2.5-VL-3B 4-bit (jetson); Gemma 4 is the intended target once on Ollama (§4) | mac/cloud: inference service over HTTP · jetson: in-process (`transformers`, cu132 GPU) |
+| Query planning, chat answers | `qwen2.5:3b` (Gemma 4 E4B is the intended target, §4) | inference service over HTTP |
 | Caption text embeddings (§9 similar) | the planner model, reused via `/v1/embeddings` (`text_embed_model` override) | inference service over HTTP |
+
+Captioning goes through a **`captioning.Captioner` adapter** (a `caption()` /
+`load()` / `release()` / `footprint_mb()` protocol), not a hardcoded HTTP call,
+because the two profiles use fundamentally different transports: `OllamaCaptioner`
+wraps today's OpenAI-compatible HTTP path (mac/cloud, byte-identical to before),
+and `VLMCaptioner` runs Qwen2.5-VL-3B 4-bit in-process via `transformers` on the
+Jetson's cu132 GPU (§3.1). Both return the same `CaptionResult`, so the caption
+pipeline stage (§8) and the model coordinator (§8.1) are written once against the
+protocol and never branch on profile. `config.py`'s `caption_backend` setting
+(`"ollama"` vs `"inprocess"`) selects which adapter `Settings.build_captioner()`
+constructs.
 
 The caption embedding reuses the **already-resident planner model** through the
 inference service's `/embeddings` endpoint — no extra model to pull — because a
@@ -251,8 +287,10 @@ purpose-built embedder isn't required to tell whether two captions mean the same
 thing, and a bigger generative LLM would be slower without being better at it.
 Override with `IVMS777_TEXT_EMBED_MODEL` to use a dedicated embedder.
 
-Gemma 4 is the default family on `mac` and `cloud`; the Jetson profile runs a
-4B-class model that may be Qwen3-VL. Caption and planner prompts therefore live
+Gemma 4 is the *intended* default family on `mac` and `cloud` once it lands on
+Ollama; **today all profiles run Qwen2.5** (`config.py` — captioner `qwen2.5vl`,
+planner `qwen2.5:3b`), and the Jetson profile runs a 4B-class model that may be
+Qwen3-VL. Caption and planner prompts therefore live
 in a per-model template registry in `inference/prompts.py`, keyed by model name,
 with a shared JSON schema all templates must satisfy. Adding a model means
 adding a template, not touching the pipeline.
@@ -267,19 +305,25 @@ roughly 1 s/photo, so about 1.5 hours one-time for 5,000 photos, and about 30 ms
 per search query. That one-time cost is the price of containerising the app on a
 Mac.
 
-**Model download.** Caption and planner models are pulled by the inference
-service on first use (`ollama pull`, or vLLM's Hugging Face fetch) — nothing to
-script. SigLIP is fetched from Hugging Face into a mounted cache volume by a
-startup step that checks free disk first and reports progress. Both caches
-survive container restarts.
+**Model download.** On `mac`/`cloud`, caption and planner models are pulled by
+the inference service on first use (`ollama pull`, or vLLM's Hugging Face fetch)
+— nothing to script. On `jetson`, that only covers the **planner**: the
+**caption** model is not an Ollama tag there — it is a Hugging Face repo fetched
+**in-process** by the caption adapter (`VLMCaptioner`, §3.1) on the first caption
+call, into the same mounted HF cache SigLIP uses. SigLIP itself is fetched from
+Hugging Face into a mounted cache volume by a startup step that checks free disk
+first and reports progress. All these caches survive container restarts.
 
 **Bake-off gate.** Phase 1 includes a script that runs candidate caption models
 over the same 50 real photos and reports seconds per photo, memory high-water
-mark, and side-by-side captions. On `mac` that is `gemma4:26b-a4b` against
-`gemma4:12b`; on `jetson`, `qwen3-vl:4b` against `gemma4:e4b`. Because published
-benchmarks for these pairs are either close or not directly comparable, the
-bake-off is how the default is actually chosen. The winner becomes the default
-in config, not in code.
+mark, and side-by-side captions. On `mac` the candidates are pulled by Ollama
+(`gemma4:26b-a4b` against `gemma4:12b`); on `jetson` the candidates (`qwen3-vl:4b`
+against `gemma4:e4b`) are fetched from Hugging Face and run **in-process**
+exactly like the shipping default (§3.1) — jetson's Ollama container serves the
+planner only, never the caption candidates. Because published benchmarks for
+these pairs are either close or not directly comparable, the bake-off is how the
+default is actually chosen. The winner becomes the default in config, not in
+code.
 
 ## 5. Architecture
 
@@ -299,9 +343,9 @@ flowchart TB
     end
 
     subgraph gpu["The GPU box · docker compose"]
-        app["app · FastAPI + Jinja + HTMX<br/>UI · read queries · upload receipt · /api/manifest<br/>SigLIP in-process ONLY while holding CHAT/MEMORY lease (§8.1)"]
-        worker["worker · ingest pipeline (primary writer)<br/>facets · thumbs · SigLIP (in-process) · taxonomy · caption · memories · deletions"]
-        infer["inference · Ollama | vLLM<br/>caption + planner/chat/embed models · one resident at a time<br/>(host on mac, container on jetson/cloud)"]
+        app["app · FastAPI + Jinja + HTMX<br/>UI · read queries · upload receipt · /api/manifest<br/>SigLIP in-process ONLY while holding CHAT/MEMORY/SEARCH lease (§8.1)"]
+        worker["worker · ingest pipeline (primary writer)<br/>facets · thumbs · SigLIP (in-process) · taxonomy · caption · memories · deletions<br/>caption via a Captioner adapter (§4): OllamaCaptioner (HTTP) mac/cloud, in-process VLMCaptioner jetson"]
+        infer["inference · Ollama | vLLM<br/>caption (mac/cloud only) + planner/chat/embed models (all profiles) · one resident at a time<br/>(host on mac, container on jetson/cloud)"]
         db[("SQLite WAL<br/>sqlite-vec + FTS5 · model_lease · named volume")]
         store[("Storage<br/>originals + thumbnails")]
     end
@@ -316,10 +360,10 @@ flowchart TB
     worker <-->|"owns writes"| db
     app -->|"read originals / thumbnails"| store
     worker -->|"write originals / thumbnails"| store
-    worker -->|"caption + structured tags (HTTP)"| infer
+    worker -->|"caption + structured tags (HTTP, mac/cloud only — jetson captions in-process, §3.1/§4)"| infer
     app -->|"planner · chat answers · caption embeddings (HTTP)"| infer
 
-    app <-->|"model lease: acquire CHAT/MEMORY · preempt ingest (§8.1)"| db
+    app <-->|"model lease: acquire CHAT/MEMORY/SEARCH · preempt ingest (§8.1)"| db
     worker <-->|"model lease: INGEST_* · yield on preempt (§8.1)"| db
 
     classDef store fill:#eef2ff,stroke:#8899cc,color:#111;
@@ -590,8 +634,8 @@ Sources per dimension:
   `max_per_dim`) is kept with that softmax probability as its score. Every
   dimension therefore contributes its best guess, and the stored score is a real
   0..1 confidence comparable within the dimension.
-- Gemma 4 returns a JSON object with a caption plus its own picks from the same
-  vocabulary, stored with `source='vlm'`.
+- The caption model (Qwen2.5-VL today, §4) returns a JSON object with a caption
+  plus its own picks from the same vocabulary, stored with `source='vlm'`.
 - `shot_at`, `camera`, and GPS come from EXIF with `source='exif'`.
 
 `max_per_dim` and `select_ratio` live in `vocab.yaml`. They start at permissive
@@ -630,13 +674,14 @@ stopped.
 3. **embed** — SigLIP 2 image embedding, batched, written to `photo_vec`.
 4. **taxonomy** — SigLIP zero-shot scoring against `vocab.yaml`, plus pixel
    statistics. Fast, runs immediately after embed.
-5. **caption** — Gemma 4 produces a caption sentence and a JSON tag object over
-   HTTP, and the caption text is **embedded in the same stage** (via the planner
-   model's `/embeddings`) into `photos.caption_vec` for §9 caption-meaning
-   similarity — computed while the caption is fresh. Slowest stage by two orders
-   of magnitude, runs last. A library captioned before this column existed
-   backfills its caption vectors a few per drain (`backfill_caption_vectors`), no
-   re-caption needed.
+5. **caption** — a `captioning.Captioner` adapter (§4) produces a caption
+   sentence and a JSON tag object — `OllamaCaptioner` over HTTP on mac/cloud,
+   `VLMCaptioner` in-process on jetson — and the caption text is **embedded in
+   the same stage** (via the planner model's `/embeddings`) into
+   `photos.caption_vec` for §9 caption-meaning similarity — computed while the
+   caption is fresh. Slowest stage by two orders of magnitude, runs last. A
+   library captioned before this column existed backfills its caption vectors a
+   few per drain (`backfill_caption_vectors`), no re-caption needed.
 
 **Stages are drained in order across the whole library, not per photo.** Every
 photo is embedded and scored before any photo is captioned. This is what keeps
@@ -672,8 +717,29 @@ row, not new load/unload logic):
 | Workload | Priority | Models it needs |
 |---|---|---|
 | `CHAT`, `MEMORY_REBUILD` | interactive (high) | SigLIP · planner/chat LLM (`qwen2.5:3b`) |
+| `SEARCH` (`/library` search + sort, `/photo` ordered-id paging) | interactive (high) | SigLIP |
 | `INGEST_EMBED` (embed, taxonomy) | background (low) | SigLIP |
-| `INGEST_CAPTION` (caption) | background (low) | caption LLM (`qwen2.5vl:3b`) |
+| `INGEST_CAPTION` (caption) | background (low) | the active **captioner adapter** (§4) |
+
+`SEARCH` is SigLIP-only and shares the model with `CHAT`/`MEMORY_REBUILD` under
+the same `app` holder (same-process piggyback, rule (a) below) — a library
+search fired mid-chat never contends for the lease, it just proceeds.
+
+**`INGEST_CAPTION`'s resource IS the captioner adapter.** Where every other
+workload names an LLM tag warmed/evicted on the shared Ollama client,
+`INGEST_CAPTION`'s model-set is a single sentinel, `CAPTIONER`
+(`models/workloads.py`), that resolves to `coordinator.captioner` — the
+`Captioner` instance (§4) injected at coordinator construction time from
+`Settings.build_captioner()`. `require()`'s `load()`/`release()` calls for that
+resource are therefore the **adapter's own** methods, not the coordinator's: on
+mac/cloud `OllamaCaptioner.load()`/`.release()` warm/evict the Ollama tag exactly
+as before; on jetson `VLMCaptioner.load()`/`.release()` load/free the in-process
+4-bit weights on the cu132 GPU. `footprint_mb()` is likewise asked of the adapter
+rather than looked up in the static `FOOTPRINT_MB` table, since it varies by
+backend (an in-process VLM's ~2.7 GB vs. an Ollama tag's table estimate). The
+ingest pipeline's caption stage (§8) reuses this **same instance**
+(`coordinator.captioner`) rather than constructing a second one, so what the
+coordinator loaded under the lease is exactly what runs the caption call.
 
 `require()` does three things, in order:
 
@@ -687,28 +753,85 @@ row, not new load/unload logic):
    SQLite DB, so the lease is a **row in the DB** (`model_lease`: holder, workload,
    priority, heartbeat, `preempt_requested`). Interactive priority beats
    background: a `CHAT`/`MEMORY_REBUILD` request sets `preempt_requested` on a
-   held background lease and waits (bounded) for it to clear.
+   held background lease and waits (bounded) for it to clear. Three edge rules keep
+   this safe: (a) **same-process piggyback** — if the lease is already held by *this
+   process* (two concurrent chats, or chat while a memory rebuild runs), the request
+   does not contend; `CHAT` and `MEMORY_REBUILD` declare the *same* model-set, so the
+   models it needs are already resident and it simply proceeds, taking neither a
+   second lease nor releasing the first. (b) **background yields immediately** — a
+   background (`INGEST_*`) workload that finds the lease held does *not* wait; it
+   raises at once and the worker defers that stage group to its next poll, so ingest
+   never blocks interactive work. (c) **release is unconditional** — the lease is
+   always released on exit even if a model fails to unload, so a failed eviction can
+   never strand the lease and wedge every future acquire. (d) **a dead holder is
+   reclaimed** — while a workload holds the lease a daemon **heartbeat thread** bumps
+   the row's `heartbeat` every `_HEARTBEAT_S` (5 s) on *its own* DB connection, so a
+   holder blocked in a long caption read still proves it is alive; a holder that has
+   gone silent for `_LEASE_STALE_S` (20 s) is presumed dead (crash, `kill`, the dev
+   auto-reloader, or a wedge) and any acquirer **reclaims** its lease
+   (`reclaim_stale`) instead of waiting out the whole preempt window and falsely
+   reporting "busy". This is what stops a worker that died mid-caption from wedging
+   chat forever. The reclaim runs *before* the same-process piggyback check (a), so a
+   **restarted worker never piggybacks on its own dead lease**; the worker also drops
+   any lingering `worker` row on startup (`release(conn, "worker")`) so chat need not
+   even wait out the 20 s window after a restart. Stale is deliberately far below the
+   preempt timeout, so a crashed holder is reclaimed long before the safety net. This
+   whole lease/heartbeat/reclaim layer is pure DB coordination — no Ollama
+   dependency; a profile that runs without Ollama (e.g. a future Jetson backend that
+   is not Ollama-based) is unaffected by and need not travel this eviction path.
 3. **Reconcile residency.** Unload every model not in the set, load every model
    that is. SigLIP is in-process torch, so **each process loads/releases its own**
    (`get_siglip_embedder` / `release_siglip_embedder`); the lease guarantees only
    one process holds it at a time — this is why `app` may run SigLIP in-process
    for a chat query's text-embed, even though §5 shows SigLIP as the worker's:
-   it does so **only while holding the CHAT lease**, with the worker's SigLIP
+   it does so **only while holding the CHAT, MEMORY_REBUILD, or SEARCH lease**
+   (chat, memory rebuild, and library search alike — every SigLIP-embed on the
+   read path is coordinated, never called directly), with the worker's SigLIP
    released. The LLMs live in the shared Ollama container, kept to one resident
    model (`OLLAMA_MAX_LOADED_MODELS=1`) and evicted on demand (`keep_alive=0`).
 
-**Hard preemption.** When an interactive workload preempts ingest, the worker does
-not wait for the current photo. It checks `preempt_requested` at stage/batch
-boundaries **and immediately before the slow caption call**, and on seeing it set
-it **aborts the in-flight stage, requeues that photo's job to `pending`**,
-releases its models, and drops the lease — so the interactive request waits only
-for the model swap, not for a photo, and the aborted photo is simply re-drained
-later (every stage is idempotent, §8). A true mid-CUDA-op kill isn't clean, so
-those checkpoints are the abort points; in practice the yield is sub-photo.
+**Hard preemption — chat WINS the models, fast.** When an interactive workload
+preempts ingest, the worker yields two ways. First, `drain` claims photos one at a
+time and checks `preempt_requested` immediately **before claiming each one** (embed,
+taxonomy, and caption alike). Second — and this is what makes chat win *without*
+waiting out a slow caption — the **caption call itself is cancellable**: every
+`Captioner.caption()` implementation (§4) threads a `should_preempt` callback
+through its own generation loop, so both adapters abort mid-call rather than only
+between calls; the mechanism is adapter-specific — jetson's in-process
+`VLMCaptioner` raises via a `transformers` `StoppingCriteria` that fires when
+`should_preempt()` is true (`captioning/vlm_adapter.py`), while mac/cloud's
+`OllamaCaptioner` uses the HTTP-streaming mechanism detailed next. On mac/cloud, the VLM
+completion is **streamed**, and a **watcher thread polls `should_preempt` and closes
+the stream the moment preempt fires**, even while the read is still blocked in the
+VLM's prefill before its first token (a 7B VLM captioning a full image can take tens
+of seconds to that first token — polling only *between* streamed chunks would miss
+the preempt for that whole wait, which is the bug that left chat stuck for minutes).
+So an in-flight caption is **aborted within a poll tick** rather than run to
+completion. On
+abort the caption stage raises `Preempted`; the claimed photo is returned to
+`pending` (not a failed attempt) via `requeue_running`, so it simply re-runs on the
+next pass. `drain` propagates `Preempted`; `drain_pass` catches it, and the `with
+coordinator.require(...)` exit releases the models and drops the lease. The
+interactive request therefore waits only for **one stream chunk plus the model
+swap** — not a whole caption. (The embed/taxonomy stages, whose per-photo call is
+short, still yield at the claim boundary; only the slow caption needs mid-call
+cancellation.) On mac/cloud, closing the HTTP stream disconnects Ollama, which stops
+generating — no mid-CUDA-op kill, just a clean client disconnect; on jetson, the
+raised `StoppingCriteria` exception unwinds `generate()` between decode steps,
+equally clean. The coordinator's preempt wait
+(`_PREEMPT_TIMEOUT_S`) is sized above one whole caption purely as a safety net for
+when the abort point is not reached in time; the abort makes the real wait far
+shorter.
 
-**Idle → resume.** When no interactive lease is held or waiting, the worker
-re-acquires `INGEST_*` and continues draining exactly as before. Releasing is
-still gated on there being pending work, so an idle poll never reloads a model.
+**Idle → resume.** The gate is on lease **entry**, not on release: `drain_pass`
+runs each group's (model-free) backfill to queue jobs, then checks `stage_counts`
+for that group's stages — only if something is actually `pending` does it call
+`coordinator.require(...)` at all. An idle poll (nothing pending in embed,
+taxonomy, or caption) never takes an `INGEST_*` lease, so it never loads or
+unloads a model — SigLIP and the caption LLM simply stay however they were left.
+Once there is pending work again, the worker re-acquires `INGEST_*` (unless an
+interactive lease is held or waiting, in which case it defers, per (b) above) and
+drains exactly as before.
 
 The coordinator's current holder, workload, and resident set are exposed for the
 **resource bar (§13)** so the whole mechanism is observable live.
@@ -919,7 +1042,8 @@ flowchart TB
 
 ### 9.1 Query planner
 
-Gemma 4 E4B converts a natural-language query into a `QuerySpec` in one call:
+The planner model (Qwen2.5-3B today, §4) converts a natural-language query into a
+`QuerySpec` in one call:
 
 ```
 "moody shots of the dog at the beach last summer, shot wide open at night"
@@ -1035,8 +1159,29 @@ Retrieval is **agentic RAG**, not a one-shot dump. The old path fused the top-30
 neighbours and force-fed them to the model, which then invented matches ("a dog
 on the dashboard" with no dog) because a semantic KNN always returns *k*
 neighbours — there was no "nothing matches". The path is now precise, cheapest
-layer first:
+layer first — and the deterministic questions never touch the model at all:
 
+0. **Direct-DB layer — answer everything structural before the lease.** Every
+   question the DB can answer *unambiguously* — the whole-library total, a subject
+   FTS count, the memory count, the month/year span, and **showing a memory or all
+   memories** — is answered straight from SQLite by `direct_answer`, with **no model
+   and no CHAT lease**: it replies instantly even while ingest holds the caption
+   model (§8.1), and the phrasing **never reaches the weak planner**. Each matcher is
+   **conservative** — it fires only when confident and otherwise returns `None` to
+   fall through to the agent, so an unrecognised phrasing degrades to the agent,
+   never to a confidently-wrong answer. This is the rule that kills the "all" class
+   of bug (a matcher that fired *and* answered wrong): quantifiers (`all`/`every`/
+   `my`) are never search terms, and the whole boundary is pinned by a routing
+   matrix (`tests/test_chat_routing.py`) of every class × many adversarial phrasings
+   (typos, negatives like "show me sunset pictures" that must **not** read as a
+   memory-show, relational counts that must decline). A relational count ("how many
+   *similar to this dog*?") the DB cannot compute is declined here and answered by
+   the agent — never the meaningless library total. A memory-show turn also renders
+   the matched memory (or, for a plural/all request, **every** memory) as the same
+   Organize memory card — re-derived from the question (deterministic, so history
+   reload needs no stored state), each cover linked with `ctx=chat-memory:<key>`
+   (§13.1) so opening one pages **within that memory** and "close" returns to the
+   conversation.
 1. **Plan** the question into a `QuerySpec` (§9.1): a `hard_filters` dict (EXIF
    facets + explicit date, §6.2) and `soft_tags` hints, the same split the core
    uses everywhere. "a photo with a dog" becomes a `subject: dog` tag hint, not
@@ -1077,56 +1222,34 @@ layer first:
    private fetch. It never invents a match; a candidate that does not fit is
    dropped, not narrated.
 
-   The same loop also has **fact tools** for a count, total, or organization
-   question the candidates alone cannot answer — `count(query)` (an FTS keyword
-   count over captions/tags; an empty query or `"all"` gives the real total photo
-   count), `memories()` (this owner's memories — name, date, size, from
-   `groups`/`group_photos` where `kind='memory'`), and `periods(grain)`
-   (`"month"` or `"year"` — the count of distinct calendar buckets that have
-   photos). Unlike `search`/`similar`/`nearby`, these fact tools return no
-   candidate photos — one FACT line (`chat/agent.py::_tool`), which the loop both
-   feeds back to the agent and collects. One more tool, `find_memory(query)`, is
-   the exception that returns **both**: it FTS-searches the memory index
-   (`memory_fts` over each memory's name/description, kept in lockstep with the
-   memories, §11) and returns the best-matching memory's fact line **and its cover
-   photo ids to show** — so "find the memory in Borjomi" or "show me a memory"
-   works even though a memory's place/name is in no photo caption. A specific
-   query that matches nothing returns honest-empty; an empty query ("show me a
-   memory") returns the largest. `agent_retrieve` returns
-   `(verified_ids, facts)`; the chat route appends any gathered facts to the
-   grounding context before the final answer streams, so "how many photos do I
-   have in total?" is answered from the real count (897), never by counting the
-   handful of candidate photos the model happens to see — the bug this closes.
-   Because a small planner model is unreliable at *choosing* a fact tool,
-   `agent_retrieve` also routes **deterministically**: an aggregate question
-   (`is_aggregate_question` — "how many …", "number of …") fires the matching fact
-   itself (`_auto_facts`) even if the model never calls the tool, and the chat
-   route grounds such a question **on the fact alone** (dropping the candidate
-   photos), so a weak model cannot miscount the few photos shown. A "find/show me
-   a memory" question (`is_memory_show` — mentions a memory but is not a count) is
-   likewise routed to `find_memory` before any photo retrieval (`_auto_memory`),
-   returning the matched memory's photos to show grounded on its fact line — so
-   the answer is the memory itself, not a photo search that finds nothing. The UI
-   then renders that memory as the **same Organize memory card** (mosaic cover,
-   title, story — the shared `_album_card.html`), streamed to the client as an
-   `event: memory` after the answer text and re-derived server-side on history
-   reload (deterministic, so it needs no extra stored state). Its covers link with
-   `ctx=chat-memory:<key>` (§13.1), so opening one pages **within that memory**
-   exactly like the Organize leaf, while "close" returns to the conversation.
+   The loop's tools are **only** the candidate-pullers — `search`, `similar`,
+   `nearby` — because every count / memory / period question was already answered
+   by the direct-DB layer (step 0) before the lease, so the loop only ever sees an
+   open-ended *photo* question. Tool-calls are **schema-constrained**
+   (`chat/agent.py::_TOOL_CALL_SCHEMA`, strict structured output): the model can
+   only emit a valid `expand`/`answer` object naming a tool that exists, so the
+   "malformed JSON / made-up tool" failure mode is gone on the weak planner. The
+   system prompt also forbids stating any number it did not actually count, so the
+   old "8 photos" confabulation cannot return for the rare relational count that
+   reaches the agent. `agent_retrieve` returns the **verified** id set (`<= k`), or
+   `[]` when nothing fits — no facts, no cards; those belong to step 0.
 5. **Context assembly** builds a compact block per verified photo: id, date,
    caption, top tags, and its EXIF facts — camera, lens, ISO, aperture, shutter,
    focal length, coordinates when present. ~60 tokens each. The facts let "what
    lens did I use most on that trip?" be answered from data, not captions.
-6. **Gemma 4 answers**, grounded only on those blocks, citing photos as
-   `[photo:123]`. The UI **streams** tokens over SSE and renders each citation
-   inline as a clickable thumbnail. The loop drives *retrieval* only; the answer
-   still streams — it is not produced inside the loop.
+6. **The chat model answers** (the planner model, Qwen2.5 — §4), grounded only on
+   those blocks, citing photos as `[photo:123]`. The UI **streams** tokens over SSE
+   and renders each citation inline as a clickable thumbnail. The loop drives
+   *retrieval* only; the answer still streams — it is not produced inside the loop.
 
-**Agentic RAG flow.** Cheapest layer first; every stage degrades to plain fusion.
+**Agentic RAG flow.** Direct-DB first (no model); the semantic tail degrades to
+plain fusion at every stage.
 
 ```mermaid
 flowchart TB
-    quest["User question · /chat"] --> lease["0 · require(CHAT) §8.1<br/>coordinator loads SigLIP + planner LLM · evicts captioner<br/>hard-preempts ingest · refuses if over RAM budget"]
+    quest["User question · /chat"] --> direct{"Direct-DB answerable?<br/>direct_answer — total · subject FTS · memory count · memory show/list · periods<br/>conservative: declines when unsure"}
+    direct -->|yes| dbans["Answer straight from SQLite<br/>NO model · NO CHAT lease · instant even mid-ingest (§8.1)<br/>never reaches the planner (kills the 'all'-class bug)<br/>memory-show also renders the Organize card(s) (event: memory)<br/>covers link ctx=chat-memory:key → page within the memory, close → /chat"]
+    direct -->|declines: semantic / relational| lease["0 · require(CHAT) §8.1<br/>coordinator loads SigLIP + planner LLM · evicts captioner<br/>hard-preempts ingest (aborts in-flight caption) · refuses if over RAM budget"]
     lease --> gate{"Off-topic gate<br/>one-word classifier: about the photos?"}
     gate -->|no| refuse["Short refuse: answers only about your photos<br/>· skips retrieval entirely"]
     gate -->|yes| plan["1 · Plan → QuerySpec §9.1<br/>hard_filters (EXIF+date) + soft_tags hints"]
@@ -1134,9 +1257,9 @@ flowchart TB
     core -->|hard filter empties a non-empty pool| honestfilter["Honest 'couldn't find X'<br/>· NO sources (EXIF/date fact mismatch)"]
     core -->|survivors| rerank["3 · Caption-cosine rerank + floor (search/rerank.py)<br/>NOT core's refine() — its fused rank is unconditional content,<br/>which would resurrect confabulation · NO caption vector = kept"]
     rerank -->|nothing clears the floor| honest["Honest 'couldn't find X'<br/>· NO sources"]
-    rerank -->|candidates| loop["4 · Bounded verify / refine agent loop<br/>candidate tools: search · similar · nearby (same core)<br/>fact tools: count · memories · periods (no candidates, one fact)<br/>find_memory: memory_fts match → a memory's fact + its photos to show<br/>drops non-fits, never invents"]
-    loop --> ctx["5 · Context assembly<br/>~60 tok/photo: id · date · caption · tags · EXIF facts<br/>+ any gathered count/memories/periods/find_memory facts"]
-    ctx --> ans["6 · Gemma answers, grounded ONLY on blocks + facts<br/>streams SSE · cites [photo:id] as thumbnails<br/>find_memory hit → also streams the Organize memory card (event: memory)<br/>covers link ctx=chat-memory:key → page within the memory, close → /chat"]
+    rerank -->|candidates| loop["4 · Bounded verify / refine agent loop<br/>candidate tools ONLY: search · similar · nearby (same core)<br/>schema-constrained tool-calls · drops non-fits, never invents"]
+    loop --> ctx["5 · Context assembly<br/>~60 tok/photo: id · date · caption · tags · EXIF facts"]
+    ctx --> ans["6 · Chat model answers, grounded ONLY on blocks<br/>streams SSE · cites [photo:id] as thumbnails"]
 
     plan -.->|any failure → degrade| fb["plain semantic + keyword fusion<br/>chat/retrieve.py → core candidates() §9.2 · no second pipeline"]
     core -.-> fb
@@ -1276,7 +1399,7 @@ change**. Overlap is a feature to embrace, not a conflict to resolve.
    land in many. `params` records how it was built (kind, seed, model). The swap
    is atomic (`albums/memory_store.py::replace_memories`) and, in the same
    transaction, re-indexes each memory's name/description into `memory_fts` — the
-   index chat's `find_memory` searches (§10). Rebuilding memories rebuilds that
+   index chat's memory-show searches (`find_memories`, §10). Rebuilding memories rebuilds that
    index in lockstep, so a memory is findable in chat the moment it exists and a
    dropped memory disappears from search with it.
 
@@ -1296,7 +1419,7 @@ flowchart TB
     lib --> themes["3 · Discover themes (AGENT + RAG)<br/>propose thread → retrieve candidates → curate"]
     events --> recon["4 · Reconcile (AGENT)<br/>dedupe, merge fragments, final titles/covers<br/>keeps event⇆theme overlap"]
     themes --> recon
-    recon --> persist["5 · Persist (atomic swap)<br/>groups(kind='memory') + group_photos (many-to-many)<br/>+ re-index name/description → memory_fts (chat find_memory, §10)<br/>params = signature: owner count + newest updated_at"]
+    recon --> persist["5 · Persist (atomic swap)<br/>groups(kind='memory') + group_photos (many-to-many)<br/>+ re-index name/description → memory_fts (chat memory-show, §10)<br/>params = signature: owner count + newest updated_at"]
     persist --> ui["/organize?by=memories<br/>manual background rebuild · stale flag when signature moves"]
 ```
 
@@ -1465,11 +1588,12 @@ The tool moves other people's photographs, so its defaults are paranoid.
 
 ## 13. UI
 
-- **Resource bar** — a thin strip pinned to the top of **every** page. It polls
+- **Resource bar** — live status at the **right of the nav row** on **every** page. It polls
   `GET /api/resources` (~2 s) and shows **RAM used / total**, **CPU load %**, and
   the model coordinator's **current lease**: the active workload and its resident
-  model-set (e.g. `chat · SigLIP+qwen2.5:3b · 3.1/6.0 GB`), or `idle` when nothing
-  holds it. On the unified-memory Jetson system RAM *is* the GPU pool, so
+  model-set with that set's footprint (e.g. `chat · siglip+qwen2.5:3b · 3.8 GB`), or
+  `idle` when nothing holds it. Actual RAM used/total is shown alongside, so the
+  footprint can be read against the real memory in use. On the unified-memory Jetson system RAM *is* the GPU pool, so
   used/total is the honest budget figure; a set refused for exceeding the budget
   (§8.1) shows here too. It makes the whole load/unload/preempt mechanism
   observable — you watch the captioner unload the instant chat takes the lease.

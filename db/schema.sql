@@ -138,3 +138,14 @@ CREATE TABLE IF NOT EXISTS chat_messages (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS chat_messages_session ON chat_messages(session_id, id);
+
+-- One model lease at a time across the app + worker processes (design §8.1).
+-- A single held row (id is always 1); absence of the row means "idle".
+CREATE TABLE IF NOT EXISTS model_lease (
+    id                 INTEGER PRIMARY KEY CHECK (id = 1),
+    holder             TEXT    NOT NULL,   -- process tag: 'app' | 'worker'
+    workload           TEXT    NOT NULL,
+    priority           INTEGER NOT NULL,   -- higher wins; interactive > background
+    heartbeat          TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    preempt_requested  INTEGER NOT NULL DEFAULT 0
+);

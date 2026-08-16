@@ -13,7 +13,9 @@
       <a href="/library">Library</a>
       <a href="/chat">Chat</a>
       <a href="/organize">Organize</a>
+      <span id="resbar" class="resbar" aria-live="polite"></span>
     </nav>
     <main>{% block content %}{% endblock %}</main>
+    <script src="/static/resources.js?v={{ static_v('resources.js') }}" defer></script>
   </body>
 </html>

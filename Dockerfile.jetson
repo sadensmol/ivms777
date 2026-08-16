@@ -18,6 +18,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libheif1 libjpeg62-turbo zlib1g libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
 
+# gcc: Triton needs a C compiler at import time to JIT-compile kernels for the
+# in-process captioner's 4-bit quantization (bitsandbytes), so the slim base's
+# missing toolchain would crash the first caption call, not the image build.
+RUN apt-get update && apt-get install -y --no-install-recommends gcc \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 WORKDIR /app
@@ -32,14 +38,21 @@ RUN uv sync --no-dev --frozen --no-install-project || uv sync --no-dev --no-inst
 RUN uv pip install --reinstall torch torchvision \
       --index-url https://download.pytorch.org/whl/cu132
 
+# In-process caption backend (design §3.1/§4/§8.1): Qwen2.5-VL-3B 4-bit via
+# transformers on the cu132 GPU, since Ollama's CUDA build has no Orin sm_87
+# vision kernels. Jetson-only — mac/cloud never install these.
+RUN VIRTUAL_ENV=/app/.venv uv pip install bitsandbytes accelerate
+
 # Flat layout: each top-level package lives at the repo root.
 COPY config.py vocab.yaml ./
 COPY albums ./albums
+COPY captioning ./captioning
 COPY chat ./chat
 COPY db ./db
 COPY embedding ./embedding
 COPY inference ./inference
 COPY ingest ./ingest
+COPY models ./models
 COPY search ./search
 COPY storage ./storage
 COPY web ./web

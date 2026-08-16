@@ -19,6 +19,22 @@
 - Every new module needs tests (CLAUDE.md). TDD: failing test first for each behavioural unit.
 - SQLite is shared by `app` and `worker`; the lease is the ONLY cross-process channel — no new service, socket, or file.
 
+### Testing conventions (READ FIRST — the test snippets below are corrected for these)
+
+- **DB in tests:** use the existing `conn` pytest fixture from `tests/conftest.py`
+  (it calls `db.connection.connect()` + `migrate()`, which loads the **sqlite-vec**
+  extension and creates the `vec0`/`fts5` virtual tables). **Never**
+  `sqlite3.connect(":memory:").executescript(schema.sql)` — the `vec0`/`fts5`
+  tables need the loaded extension and raw executescript will raise. Where a test
+  below shows a `_conn()` helper, use the `conn` fixture argument instead.
+- **App in tests:** build with `from web.app import create_app; app = create_app(settings)`;
+  the per-request context is `app.state.context` (has `.conn`, `.settings`, and —
+  after Task 5 — `.coordinator`). Drive it with `fastapi.testclient.TestClient(app)`.
+  Use the `settings` fixture (already `use_fake_embedder=True, use_fake_inference=True`).
+  See `tests/test_web_chat.py::chat_client` for the seeding pattern.
+- **No commits:** implement, run tests, self-review — do **not** `git add`/`git commit`
+  (the user commits). Report changed/created file paths in your report file.
+
 ---
 
 ### Task 1: `model_lease` table + `LeaseStore`
@@ -46,23 +62,11 @@ The cross-process primitive. A single-row-per-holder lease with priority + a `pr
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/test_lease_store.py
-import sqlite3
-import pathlib
-
+# tests/test_lease_store.py  — uses the `conn` fixture from tests/conftest.py
 from models import lease_store as ls
 
 
-def _conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(":memory:")
-    conn.row_factory = sqlite3.Row
-    schema = pathlib.Path("db/schema.sql").read_text()
-    conn.executescript(schema)
-    return conn
-
-
-def test_single_holder_excludes_others():
-    conn = _conn()
+def test_single_holder_excludes_others(conn):
     assert ls.try_acquire(conn, holder="app", workload="CHAT", priority=10) is True
     # a second holder cannot acquire while one is held
     assert ls.try_acquire(conn, holder="worker", workload="INGEST_EMBED", priority=1) is False
@@ -70,16 +74,14 @@ def test_single_holder_excludes_others():
     assert lease["holder"] == "app" and lease["workload"] == "CHAT"
 
 
-def test_release_frees_the_lease():
-    conn = _conn()
+def test_release_frees_the_lease(conn):
     ls.try_acquire(conn, holder="worker", workload="INGEST_CAPTION", priority=1)
     ls.release(conn, holder="worker")
     assert ls.read_lease(conn) is None
     assert ls.try_acquire(conn, holder="app", workload="CHAT", priority=10) is True
 
 
-def test_preempt_flag_roundtrip():
-    conn = _conn()
+def test_preempt_flag_roundtrip(conn):
     ls.try_acquire(conn, holder="worker", workload="INGEST_EMBED", priority=1)
     assert ls.preempt_requested(conn) is False
     ls.request_preempt(conn)
@@ -88,6 +90,13 @@ def test_preempt_flag_roundtrip():
     ls.release(conn, holder="worker")
     assert ls.preempt_requested(conn) is False
 ```
+
+> Note: `db.connection.migrate()` unconditionally re-runs the whole `schema.sql`
+> (it is idempotent — every statement is `CREATE TABLE IF NOT EXISTS`), so adding
+> the `model_lease` table to `schema.sql` is enough — it is created on every
+> `connect()`+`migrate()`, including the `conn` fixture and every existing DB. **No
+> `SCHEMA_VERSION` bump is required** (the version stamp does not gate table
+> creation here).
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -282,12 +291,28 @@ def fits(models: frozenset[str], budget_mb: int) -> bool:
 In `config.py::PROFILE_DEFAULTS`, add `"ram_budget_mb"` to each profile:
 - `mac`: `24000`, `jetson`: `6000`, `cloud`: `60000`.
 
-Add the field to `Settings` (after `embed_model_name`):
+Add the field to `Settings` (after `embed_model_name`). It MUST default to `None` —
+`_apply_profile_defaults` fills a profile key only when the field is `None`, so a
+non-None default would make the validator skip it and silently keep the same value
+on every profile:
 
 ```python
     # Usable RAM budget for the model coordinator (design §8.1). A workload whose
-    # model-set exceeds this is refused, not loaded. Per-profile default below.
-    ram_budget_mb: int = 6000
+    # model-set exceeds this is refused, not loaded. Filled per-profile by
+    # _apply_profile_defaults (must stay None here so that validator applies it).
+    ram_budget_mb: int | None = None
+```
+
+Add a test in `tests/test_workloads.py` (or a config test) proving the per-profile
+value applies — this guards the exact validator gotcha:
+
+```python
+def test_ram_budget_is_per_profile(tmp_path):
+    from config import Settings
+    mac = Settings(profile="mac", data_dir=tmp_path, use_fake_embedder=True, use_fake_inference=True)
+    jet = Settings(profile="jetson", data_dir=tmp_path, use_fake_embedder=True, use_fake_inference=True)
+    assert mac.ram_budget_mb == 24000
+    assert jet.ram_budget_mb == 6000
 ```
 
 - [ ] **Step 5: Run tests to verify they pass**
@@ -337,7 +362,8 @@ def test_evict_sends_keep_alive_zero():
 
     client = OpenAICompatClient("http://x/v1", transport=httpx.MockTransport(handler))
     client.evict("qwen2.5vl:3b")
-    assert seen["url"].endswith("/api/generate")
+    # EXACT url — httpx makes base "http://x/v1/", strip must yield "http://x/api/generate"
+    assert seen["url"] == "http://x/api/generate"
     assert seen["json"]["model"] == "qwen2.5vl:3b"
     assert seen["json"]["keep_alive"] == 0
 
@@ -346,11 +372,13 @@ def test_warm_requests_the_model_resident():
     seen = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
         seen["json"] = __import__("json").loads(request.content)
         return httpx.Response(200, json={"done": True})
 
     client = OpenAICompatClient("http://x/v1", transport=httpx.MockTransport(handler))
     client.warm("qwen2.5:3b")
+    assert seen["url"] == "http://x/api/generate"
     assert seen["json"]["model"] == "qwen2.5:3b"
 ```
 
@@ -372,9 +400,12 @@ And to `OpenAICompatClient` (note: `/api/generate` is Ollama-native, one level a
 
 ```python
     def _native_url(self, path: str) -> str:
-        base = str(self._client.base_url)
+        # httpx normalizes a base_url that has a path to a TRAILING SLASH
+        # ("http://host:11434/v1/"), so rstrip BEFORE the /v1 suffix check —
+        # otherwise the strip never fires and the POST hits /v1/api/generate (404).
+        base = str(self._client.base_url).rstrip("/")
         root = base[: -len("/v1")] if base.endswith("/v1") else base
-        return root.rstrip("/") + path
+        return root + path
 
     def warm(self, model: str, *, timeout: float = 120.0) -> None:
         # An empty prompt loads the model without generating tokens.
@@ -450,13 +481,6 @@ class FakeClient:
     def evict(self, model, *, timeout=30.0): self.evicted.append(model)
 
 
-def _conn():
-    conn = sqlite3.connect(":memory:")
-    conn.row_factory = sqlite3.Row
-    conn.executescript(pathlib.Path("db/schema.sql").read_text())
-    return conn
-
-
 def _coord(conn, client, holder="app", budget=99_999, loaded=None):
     return ModelCoordinator(
         conn, client, holder=holder, budget_mb=budget,
@@ -467,8 +491,8 @@ def _coord(conn, client, holder="app", budget=99_999, loaded=None):
     )
 
 
-def test_require_loads_declared_set_and_evicts_the_rest():
-    conn, client, loaded = _conn(), FakeClient(), []
+def test_require_loads_declared_set_and_evicts_the_rest(conn):
+    client, loaded = FakeClient(), []
     coord = _coord(conn, client, loaded=loaded)
     with coord.require("CHAT"):
         assert "siglip" in loaded          # SigLIP loaded in-process
@@ -477,8 +501,8 @@ def test_require_loads_declared_set_and_evicts_the_rest():
     assert ls.read_lease(conn) is None      # released on exit
 
 
-def test_over_budget_is_refused_not_loaded():
-    conn, client = _conn(), FakeClient()
+def test_over_budget_is_refused_not_loaded(conn):
+    client = FakeClient()
     coord = _coord(conn, client, budget=100)   # nothing fits
     with pytest.raises(RefusedError):
         with coord.require("CHAT"):
@@ -487,8 +511,8 @@ def test_over_budget_is_refused_not_loaded():
     assert ls.read_lease(conn) is None
 
 
-def test_interactive_preempts_a_background_holder():
-    conn, client = _conn(), FakeClient()
+def test_interactive_preempts_a_background_holder(conn):
+    client = FakeClient()
     # worker holds a background lease
     ls.try_acquire(conn, holder="worker", workload="INGEST_CAPTION", priority=1)
     coord = _coord(conn, client, holder="app")
@@ -519,6 +543,7 @@ Expected: FAIL — `ModuleNotFoundError: models.coordinator`.
 workload; the coordinator guards the RAM budget, takes the cross-process lease,
 loads exactly the declared model-set (evicting the rest), and releases on exit."""
 import contextlib
+import logging
 import time
 
 from embedding.siglip import get_siglip_embedder, release_siglip_embedder
@@ -526,12 +551,19 @@ from models import lease_store as ls
 from models import workloads as wl
 from models.lease_store import INTERACTIVE, WorkloadName
 
+logger = logging.getLogger("ivms777.coordinator")
+
 _PREEMPT_POLL_S = 0.25
 _PREEMPT_TIMEOUT_S = 30.0
 
 
 class RefusedError(RuntimeError):
     """A workload's model-set does not fit the RAM budget (design §8.1)."""
+
+
+class LeaseBusyError(RuntimeError):
+    """A background workload could not acquire the lease because interactive work
+    holds it (design §8.1). The caller (the worker) defers to its next pass."""
 
 
 class ModelCoordinator:
@@ -550,39 +582,51 @@ class ModelCoordinator:
         self.resident: frozenset[str] = frozenset()
 
     def _do_load_siglip(self) -> None:
-        if self._load_siglip is not None:
-            self._load_siglip()
-        else:
-            get_siglip_embedder("siglip2-so400m-patch14-384", "cuda")  # real load; device via settings in caller
+        if self._load_siglip is None:
+            raise RuntimeError("ModelCoordinator.load_siglip must be injected")
+        self._load_siglip()
 
     @contextlib.contextmanager
     def require(self, workload: WorkloadName):
         want = wl.model_set(workload, planner_model=self._planner_model, caption_model=self._caption_model)
         if not wl.fits(want, self._budget_mb):
-            raise RefusedError(
-                f"{workload} needs {wl.footprint_mb(want)}MB > budget {self._budget_mb}MB: {sorted(want)}"
+            logger.warning(
+                "refused %s: needs %dMB > budget %dMB (%s)",
+                workload, wl.footprint_mb(want), self._budget_mb, sorted(want),
             )
-        self._acquire(workload)
+            raise RefusedError(f"{workload} exceeds RAM budget {self._budget_mb}MB")
+        self._acquired = False
+        self._acquire(workload)          # sets self._acquired, or piggybacks, or raises
         try:
-            self._reconcile(want)
+            if self._acquired:
+                self._reconcile(want)    # skip when piggybacking — models already resident
             yield
         finally:
-            self._release(want)
+            if self._acquired:
+                self._release(want)      # never release a lease we only piggybacked on
 
     def _acquire(self, workload: WorkloadName) -> None:
         priority = wl.PRIORITY[workload]
         if ls.try_acquire(self._conn, self._holder, workload, priority):
+            self._acquired = True
             return
-        # Someone holds it. If we outrank them, ask them to yield and wait.
+        lease = ls.read_lease(self._conn)
+        # Same process already holds it: our workload shares the resident model-set
+        # (CHAT/MEMORY_REBUILD are identical), so piggyback — no acquire, no release.
+        if lease is not None and lease["holder"] == self._holder:
+            return
+        # Background never waits: yield the pass immediately so ingest can't block chat.
+        if workload not in INTERACTIVE:
+            raise LeaseBusyError(f"{workload}: lease held by {lease and lease['holder']}")
+        # Interactive: ask the holder to yield, then poll until we get it or time out.
         deadline = self._now() + _PREEMPT_TIMEOUT_S
-        if workload in INTERACTIVE:
-            ls.request_preempt(self._conn)
+        ls.request_preempt(self._conn)
         while self._now() < deadline:
             self._sleep(_PREEMPT_POLL_S)
             if ls.try_acquire(self._conn, self._holder, workload, priority):
+                self._acquired = True
                 return
-            if workload in INTERACTIVE:
-                ls.request_preempt(self._conn)
+            ls.request_preempt(self._conn)
         raise TimeoutError(f"could not acquire model lease for {workload} within {_PREEMPT_TIMEOUT_S}s")
 
     def _reconcile(self, want: frozenset[str]) -> None:
@@ -601,11 +645,16 @@ class ModelCoordinator:
         self.resident = want
 
     def _release(self, want: frozenset[str]) -> None:
+        # Robust: a failing unload must NEVER skip the lease release, or the lease
+        # leaks and wedges every future acquire (app + worker).
         for model in want:
-            if model == wl.SIGLIP:
-                self._release_siglip()
-            else:
-                self._client.evict(model)
+            try:
+                if model == wl.SIGLIP:
+                    self._release_siglip()
+                else:
+                    self._client.evict(model)
+            except Exception:  # noqa: BLE001 — unload is best-effort; the lease MUST still free
+                logger.exception("unload failed for %s", model)
         self.resident = frozenset()
         ls.release(self._conn, self._holder)
 ```
@@ -631,79 +680,110 @@ git commit -m "feat(models): ModelCoordinator.require — lease + residency + pr
 Wire the coordinator into the app. `chat_stream` currently builds SigLIP eagerly at the top (`web/app.py:819`) — the crashing line — and runs even for count questions that need no embedder. Move all model use inside `require(CHAT)`; the memory rebuild thread inside `require(MEMORY_REBUILD)`.
 
 **Files:**
-- Modify: `web/deps.py` (build one `ModelCoordinator` on the app/worker context — add a `coordinator` attribute)
-- Modify: `web/app.py` (`chat_stream`: wrap retrieval+stream in `with ctx.coordinator.require("CHAT")`; drop the eager `build_embedder()` at the top — build the embedder inside the block only if retrieval needs it)
+- Modify: `web/deps.py` (add a `AppContext.make_coordinator(client, holder)` factory — NOT a stored attribute; see the thread-local note below)
+- Modify: `web/app.py` (`chat_stream`: build a coordinator per request and wrap retrieval+stream in `with coordinator.require("CHAT")`; drop the eager `build_embedder()` at the top)
 - Modify: `albums/memory_store.py` (rebuild path wrapped in `require("MEMORY_REBUILD")`)
-- Test: `tests/test_web_chat.py` (extend: a count question answers with the fake embedder never crashing; assert lease released after)
+- Test: `tests/test_web_chat.py` (extend: count question streams an answer; lease released after)
 
 **Interfaces:**
 - Consumes: `ModelCoordinator` (Task 4).
-- Produces: `ctx.coordinator: ModelCoordinator` available to routes; `holder="app"` in `app`, `holder="worker"` in the worker.
+- Produces: `AppContext.make_coordinator(self, client, holder: str) -> ModelCoordinator`.
+
+> **Thread-local conn (critical):** `AppContext.conn` is a **thread-local property**
+> (each request thread / the worker loop opens its own connection to the same WAL
+> file), and `build_context`'s bootstrap conn is **closed** after migrate. So the
+> coordinator must NOT be built once and stored — build it **per use**, in the
+> thread that will hold the lease, reading `ctx.conn` at that moment. Lease rows
+> are committed (`with conn:`), so a lease written on one connection is visible to
+> the others reading the same WAL file.
 
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/test_web_chat.py  (add)
-def test_count_question_answers_and_releases_lease(client_and_ctx):
-    client, ctx = client_and_ctx                       # existing fixture (fake embedder + fake inference)
-    resp = client.get("/chat/stream", params={"q": "how many images in my library?"})
-    body = resp.text
-    assert "data:" in body                              # at least one delta streamed — not "(no answer)"
-    from models import lease_store as ls
-    assert ls.read_lease(ctx.conn) is None              # CHAT lease released after the turn
-```
+# tests/test_web_chat.py  (add) — reuse the existing `chat_client` fixture
+def test_count_question_streams_answer_not_no_answer(chat_client):
+    body = chat_client.get("/chat/stream?q=how many images in my library?").text
+    assert "data:" in body and "event: done" in body   # streamed → not "(no answer)"
 
-> If `client_and_ctx` does not exist, adapt to the file's existing fixture that builds the app with fakes; the assertion is: the stream yields ≥1 `data:` event and the lease is released.
+
+def test_chat_releases_the_model_lease_after_the_turn(settings, monkeypatch):
+    # Build the app directly so we can read app.state.context.conn for the lease.
+    from fastapi.testclient import TestClient
+    from inference.fakes import FakeInferenceClient
+    from models import lease_store as ls
+    from web.app import create_app
+
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(
+        type(settings), "build_inference_client",
+        lambda self: (FakeInferenceClient(streams=[["ok"]]), "fake"),
+    )
+    app = create_app(settings)
+    with TestClient(app) as tc:
+        tc.get("/chat/stream?q=beach")
+        assert ls.read_lease(app.state.context.conn) is None   # CHAT lease released
+```
 
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `uv run pytest tests/test_web_chat.py -k count_question -v`
 Expected: FAIL — either no `coordinator` on ctx, or the stream path unchanged.
 
-- [ ] **Step 3: Add the coordinator to the context**
+- [ ] **Step 3: Add a coordinator factory to `AppContext`**
 
-In `web/deps.py`, where the context/settings are assembled, construct and attach:
+In `web/deps.py`, add a method to `AppContext` (uses `self.conn` at call time, so the
+lease lives on the calling thread's connection):
 
 ```python
-from models.coordinator import ModelCoordinator
-
-# holder is 'app' in the web process, 'worker' in the ingest process; pass it in
-# from the caller (build_context(..., holder="app")).
-coordinator = ModelCoordinator(
-    conn, client, holder=holder,
-    budget_mb=settings.ram_budget_mb,
-    planner_model=settings.planner_model or "fake",
-    caption_model=settings.caption_model or "fake",
-    load_siglip=lambda: settings.build_embedder(),   # real SigLIP load on the configured device
-    sleep=__import__("time").sleep,
-)
+    def make_coordinator(self, client, holder: str):
+        from models.coordinator import ModelCoordinator
+        s = self.settings
+        return ModelCoordinator(
+            self.conn, client, holder=holder,
+            budget_mb=s.ram_budget_mb,
+            planner_model=s.planner_model or "fake",
+            caption_model=s.caption_model or "fake",
+            load_siglip=lambda: s.build_embedder(),   # real SigLIP on the configured device
+        )
 ```
-
-Attach it to the context object returned by `build_context` (`ctx.coordinator = coordinator`). Thread a `holder: str = "app"` parameter through `build_context`.
 
 - [ ] **Step 4: Wrap `chat_stream`**
 
-In `web/app.py::chat_stream`, remove the eager top-of-handler `embedder, _ = ctx.settings.build_embedder()` (line ~819). Inside `events()`, wrap the retrieval+stream body:
+In `web/app.py::chat_stream`, remove the eager top-of-handler `embedder, _ = ctx.settings.build_embedder()` (line ~819). `client` is already built at the top of the handler; reuse it. Inside `events()`, build the coordinator and wrap the body:
 
 ```python
         def events():
-            with ctx.coordinator.require("CHAT"):
-                embedder, _ = ctx.settings.build_embedder()   # now inside the lease
-                # ... existing gate → agent_retrieve → context → client.stream ...
+            coordinator = ctx.make_coordinator(client, "app")   # per-request; uses this thread's conn
+            with coordinator.require("CHAT"):
+                embedder, _ = ctx.settings.build_embedder()     # now inside the lease
+                # ... existing gate → agent_retrieve → context_block → client.stream ...
+                # (everything from is_photo_question(...) through the final yield _done(...))
 ```
 
-Everything from `is_photo_question(...)` through the final `yield _done(...)` moves inside the `with`. The off-topic early-return stays inside too (it still holds the lease briefly — fine).
+Everything from `is_photo_question(...)` through the final `yield _done(...)` moves inside the `with`. The off-topic early-return stays inside too (it holds the lease briefly — fine). Note the generator runs in one threadpool thread, so `ctx.conn` inside `require` is that thread's connection.
 
 - [ ] **Step 5: Wrap the memory rebuild**
 
-In `albums/memory_store.py`, the background rebuild entry (the function the `/organize/memories/rebuild` thread runs) wraps its model-using work:
+Do NOT touch `albums/memory_store.py`. The rebuild runs on a daemon thread whose
+target is the `run()` closure in `web/app.py::memories_rebuild` (~line 434). That
+closure calls `build_memories(ctx.conn, …)`, and `ctx.conn` is a thread-local
+property — it resolves to the DAEMON thread's own connection. Build the coordinator
+INSIDE `run()` (so it reads that thread's conn) and wrap the build:
 
 ```python
-    with coordinator.require("MEMORY_REBUILD"):
-        # existing pool → compose → reconcile → persist
+            def run() -> None:
+                try:
+                    coordinator = ctx.make_coordinator(client, "app")
+                    with coordinator.require("MEMORY_REBUILD"):
+                        build_memories(ctx.conn, client, model, owner_id,
+                                       force=True, progress=on_progress)
+                finally:
+                    app.state.memories_building = False
 ```
 
-Pass the coordinator into the rebuild function from the route (`web/app.py:419`).
+Holder is `"app"` (same as chat) — a chat running during a rebuild piggybacks on
+the same lease (identical model-set), no contention. `build_memories` stays
+unchanged.
 
 - [ ] **Step 6: Run the chat tests**
 
@@ -740,39 +820,30 @@ git commit -m "feat(chat,memory): run under ModelCoordinator.require; drop eager
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/test_ingest_preempt.py
-import sqlite3, pathlib
+# tests/test_ingest_preempt.py — uses the `conn` fixture from tests/conftest.py
+import pytest
+
 from ingest.worker import drain, Preempted
 from ingest import jobs
+from tests.factories import add_photo
 
 
-def _conn():
-    conn = sqlite3.connect(":memory:")
-    conn.row_factory = sqlite3.Row
-    conn.executescript(pathlib.Path("db/schema.sql").read_text())
-    return conn
-
-
-def test_drain_stops_and_requeues_on_preempt():
-    conn = _conn()
-    # seed two photos with a pending 'embed' job each (use existing jobs helpers)
-    ids = jobs.seed_two_pending_embed(conn)   # test helper; or insert rows directly per schema
+def test_drain_stops_and_requeues_on_preempt(conn):
+    # two photos, each with a pending 'embed' job (same pattern as tests/test_jobs.py)
+    for pid, h in ((1, "a"), (2, "b")):
+        add_photo(conn, photo_id=pid, content_hash=h, thumb_key=f"{h}.jpg")
+        jobs.enqueue(conn, pid, "embed")
     handled = []
 
     def handler(conn, photo_id):
         handled.append(photo_id)
 
     # preempt fires immediately → nothing handled, both jobs still pending
-    try:
+    with pytest.raises(Preempted):
         drain(conn, {"embed": handler}, should_preempt=lambda: True)
-        assert False, "expected Preempted"
-    except Preempted:
-        pass
     assert handled == []
     assert jobs.stage_counts(conn, "embed")["pending"] == 2
 ```
-
-> If a `seed_two_pending_embed` helper is inconvenient, insert two `photos` rows + two `jobs` rows (`stage='embed'`, `status='pending'`) directly per `db/schema.sql`. The assertion is: with `should_preempt` true, `drain` handles nothing, raises `Preempted`, and leaves both jobs `pending`.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -818,41 +889,47 @@ def drain(conn, handlers, stages=STAGES, *, should_preempt=lambda: False):
 
 - [ ] **Step 4: Wrap `drain_pass` groups in leases + pass the callback**
 
-In `ingest/pipeline.py::drain_pass`, add a `coordinator` parameter and a `should_preempt` callback; wrap group 2a and 2b:
+In `ingest/pipeline.py`, add imports `from ingest.worker import drain, Preempted, thumbnail_handler` (Preempted is new — Task 6 adds it) and `from models.coordinator import LeaseBusyError`. Then in `drain_pass`, add a `coordinator` parameter and a `should_preempt` callback; wrap group 2a and 2b:
 
 ```python
 def drain_pass(context, vocab, coordinator=None, should_preempt=lambda: False) -> None:
     ...
     # Group 1 (no models) unchanged.
     ...
-    # Group 2a — SigLIP stages under INGEST_EMBED.
-    try:
-        with _lease(coordinator, "INGEST_EMBED"):
-            embedder, model_name = settings.build_embedder()
-            backfill_embeds(conn); backfill_taxonomy(conn)
-            drain(conn, {"embed": embed_handler(context.originals, embedder, model_name),
-                         "taxonomy": taxonomy_handler(context.derived, embedder, vocab)},
-                  should_preempt=should_preempt)
-    except Preempted:
-        return                                          # yielded; models released by the lease exit
-    except Exception:
-        logger.exception("embed/taxonomy deferred this pass"); return
+    # Group 2a — SigLIP stages. Queue work first (no models), then take the lease
+    # ONLY if something is pending — an idle poll must never load/unload SigLIP.
+    backfill_embeds(conn); backfill_taxonomy(conn)          # queue jobs — no models
+    if stage_counts(conn, "embed")["pending"] or stage_counts(conn, "taxonomy")["pending"]:
+        try:
+            with _lease(coordinator, "INGEST_EMBED"):
+                embedder, model_name = settings.build_embedder()
+                drain(conn, {"embed": embed_handler(context.originals, embedder, model_name),
+                             "taxonomy": taxonomy_handler(context.derived, embedder, vocab)},
+                      should_preempt=should_preempt)
+        except (Preempted, LeaseBusyError):   # preempted mid-pass, OR interactive work holds the lease → defer
+            return
+        except Exception:
+            logger.exception("embed/taxonomy deferred this pass"); return
 
+    # Group 2b — caption stage. Same gate: take the INGEST_CAPTION lease only if pending.
     backfill_captions(conn)
-
-    # Group 2b — caption stage under INGEST_CAPTION (its own lease; SigLIP already released).
-    try:
-        with _lease(coordinator, "INGEST_CAPTION"):
-            client, caption_model = settings.build_inference_client()
-            backfill_caption_vectors(conn, client, settings.caption_embed_model)
-            drain(conn, {"caption": caption_handler(context.derived, client, caption_model,
-                         settings.caption_embed_model, list(vocab.dimensions), settings.thumb_detail_px)},
-                  should_preempt=should_preempt)
-    except Preempted:
-        return
-    except Exception:
-        logger.exception("caption deferred this pass"); return
+    if stage_counts(conn, "caption")["pending"]:
+        try:
+            with _lease(coordinator, "INGEST_CAPTION"):
+                client, caption_model = settings.build_inference_client()
+                backfill_caption_vectors(conn, client, settings.caption_embed_model)
+                drain(conn, {"caption": caption_handler(context.derived, client, caption_model,
+                             settings.caption_embed_model, list(vocab.dimensions), settings.thumb_detail_px)},
+                      should_preempt=should_preempt)
+        except (Preempted, LeaseBusyError):
+            return
+        except Exception:
+            logger.exception("caption deferred this pass"); return
 ```
+
+`stage_counts` comes back into the import list (`from ingest.jobs import stage_counts`).
+Gating lease entry on pending counts keeps the design's §8.1 "an idle poll never
+takes a model lease" true — no SigLIP load/unload churn on an idle worker.
 
 Add a small helper so `drain_pass` still works with `coordinator=None` (tests, mac inline drain that doesn't contend):
 
@@ -870,34 +947,37 @@ def _lease(coordinator, workload):
 
 Remove the now-redundant manual `release_siglip_embedder()` block — the `INGEST_EMBED` lease exit releases SigLIP.
 
-- [ ] **Step 5: Pass the callback from the worker loop**
+- [ ] **Step 5: Build the worker coordinator + pass the callback**
 
-In `ingest/cli.py`, build a worker-holder coordinator and pass the preempt check:
+In `ingest/cli.py`, build a worker-holder coordinator (its own inference client for
+warm/evict) and pass the preempt check. `build_context` keeps its single-arg
+signature — the holder is set on `make_coordinator`, not `build_context`:
 
 ```python
 from models.lease_store import preempt_requested
 ...
-    context = build_context(get_settings(), holder="worker")
-    ...
+    context = build_context(get_settings())
+    vocab = load_vocab(VOCAB_PATH)
+    seed_tags(context.conn, vocab)
+    requeue_stalled(context.conn)
+    client, _ = context.settings.build_inference_client()
+    coordinator = context.make_coordinator(client, "worker")
     while True:
-        drain_pass(context, vocab, context.coordinator,
+        drain_pass(context, vocab, coordinator,
                    should_preempt=lambda: preempt_requested(context.conn))
         time.sleep(POLL_SECONDS)
 ```
 
-- [ ] **Step 6: Add `jobs.requeue` (used by self-healing / clarity)**
+**App inline drain** (the best-effort `drain_pass` call in `web/app.py` after an
+upload) keeps calling `drain_pass(context, vocab)` with `coordinator=None` — no
+lease, no preemption. It stays best-effort: if SigLIP can't build it defers to the
+worker (which holds a proper lease), exactly as today (§8).
 
-In `ingest/jobs.py`:
+- [ ] **Step 6: (dropped — no `jobs.requeue`)**
 
-```python
-def requeue(conn: sqlite3.Connection, photo_id: int, stage: str) -> None:
-    """Reset a job to pending so a later pass re-drains it (design §8.1 preemption)."""
-    with conn:
-        conn.execute(
-            "UPDATE jobs SET status = 'pending' WHERE photo_id = ? AND stage = ?",
-            (photo_id, stage),
-        )
-```
+YAGNI: with check-before-claim, `drain` never aborts an already-claimed photo, so
+nothing needs requeuing; crash recovery is already covered by `requeue_stalled`. Do
+NOT add a `requeue` helper (it would be dead, untested code).
 
 - [ ] **Step 7: Run the ingest tests**
 
@@ -935,9 +1015,17 @@ The observability layer: a psutil snapshot + the current lease, an endpoint, and
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/test_resources_api.py
-def test_resources_endpoint_reports_ram_cpu_and_idle_lease(app_client):
-    resp = app_client.get("/api/resources")
+# tests/test_resources_api.py — build the app directly from the `settings` fixture
+from fastapi.testclient import TestClient
+
+from web.app import create_app
+
+
+def test_resources_endpoint_reports_ram_cpu_and_idle_lease(settings):
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    app = create_app(settings)
+    with TestClient(app) as tc:
+        resp = tc.get("/api/resources")
     assert resp.status_code == 200
     data = resp.json()
     assert data["ram_total_mb"] > 0
@@ -945,12 +1033,16 @@ def test_resources_endpoint_reports_ram_cpu_and_idle_lease(app_client):
     assert data["workload"] is None          # idle: no lease held in a fresh app
 
 
-def test_resources_reflects_a_held_lease(app_client, ctx):
+def test_resources_reflects_a_held_lease(settings):
     from models import lease_store as ls
-    ls.try_acquire(ctx.conn, holder="worker", workload="INGEST_CAPTION", priority=1)
-    data = app_client.get("/api/resources").json()
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    app = create_app(settings)
+    # write a lease on the app's own conn; the route reads the same DB file (WAL)
+    ls.try_acquire(app.state.context.conn, holder="worker", workload="INGEST_CAPTION", priority=1)
+    with TestClient(app) as tc:
+        data = tc.get("/api/resources").json()
     assert data["workload"] == "INGEST_CAPTION"
-    assert "qwen2.5vl:3b" in data["models"] or data["models"]  # caption model listed
+    assert data["models"]                     # the caption model is listed
 ```
 
 - [ ] **Step 2: Run test to verify it fails**

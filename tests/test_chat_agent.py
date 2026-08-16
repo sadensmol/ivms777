@@ -1,6 +1,14 @@
 import json
 
-from chat.agent import agent_retrieve, count_periods, count_photos, list_memories, retrieve
+from chat.agent import (
+    agent_retrieve,
+    count_periods,
+    count_photos,
+    direct_answer,
+    list_memories,
+    memories_for_show,
+    retrieve,
+)
 from embedding.fakes import FakeEmbedder
 from embedding.store import write_caption_vector, write_vector
 from embedding.vectors import l2_normalize
@@ -88,10 +96,9 @@ def test_agent_verifies_a_subset_of_the_seed(conn):
         '{"semantic": "a dog"}',
         json.dumps({"action": "answer", "photo_ids": [1]}),
     ])
-    ids, facts = agent_retrieve(conn, FakeEmbedder(), client, owner_id=1, question="a dog",
-                                **_kw(k=8, floor=-1.0, max_rounds=3))
+    ids = agent_retrieve(conn, FakeEmbedder(), client, owner_id=1, question="a dog",
+                         **_kw(k=8, floor=-1.0, max_rounds=3))
     assert ids == [1]
-    assert facts == []
 
 
 def test_agent_can_expand_then_answer(conn):
@@ -101,10 +108,9 @@ def test_agent_can_expand_then_answer(conn):
         json.dumps({"action": "expand", "tool": "search", "query": "dog"}),
         json.dumps({"action": "answer", "photo_ids": [1]}),
     ])
-    ids, facts = agent_retrieve(conn, FakeEmbedder(), client, owner_id=1, question="a dog",
-                                **_kw(k=8, floor=-1.0, max_rounds=3))
+    ids = agent_retrieve(conn, FakeEmbedder(), client, owner_id=1, question="a dog",
+                         **_kw(k=8, floor=-1.0, max_rounds=3))
     assert ids == [1]
-    assert facts == []
 
 
 def test_agent_answering_none_returns_empty(conn):
@@ -113,28 +119,12 @@ def test_agent_answering_none_returns_empty(conn):
         '{"semantic": "a dog"}',
         json.dumps({"action": "answer", "photo_ids": []}),
     ])
-    ids, facts = agent_retrieve(conn, FakeEmbedder(), client, owner_id=1, question="a dog",
-                                **_kw(k=8, floor=-1.0, max_rounds=3))
+    ids = agent_retrieve(conn, FakeEmbedder(), client, owner_id=1, question="a dog",
+                         **_kw(k=8, floor=-1.0, max_rounds=3))
     assert ids == []
-    assert facts == []
 
 
-# --- Aggregate tools: count / memories / periods (§10, the "8 photos" bug fix) --
-
-def test_agent_auto_counts_total_even_when_model_never_calls_the_tool(conn):
-    # A weak model that just plans then answers (NO count tool-call) must still get
-    # the real total via deterministic intent routing — the "8 photos" fix.
-    for pid in range(1, 6):
-        _photo(conn, pid, f"photo number {pid}")
-    client = FakeInferenceClient(responses=[
-        '{"semantic": "photos"}',
-        json.dumps({"action": "answer", "photo_ids": [1]}),
-    ])
-    _ids, facts = agent_retrieve(conn, FakeEmbedder(), client, owner_id=1,
-                                 question="how many photos do I have in total?",
-                                 **_kw(k=8, floor=-1.0))
-    assert any("5 photo" in f for f in facts)  # real total (5), not the retrieved count
-
+# --- Direct-DB tools: count / memories / periods (§10) ------------------------
 
 def test_count_photos_total_when_query_is_empty_or_all(conn):
     for pid in range(1, 4):
@@ -171,6 +161,33 @@ def test_list_memories_returns_name_date_and_size(conn):
     ]
 
 
+def _seed_two_memories(conn):
+    from albums.memory_store import Memory, replace_memories
+
+    for pid in range(1, 6):
+        add_photo(conn, photo_id=pid, content_hash=f"h{pid}", thumb_key=f"{pid}.jpg",
+                  shot_at=f"2024-01-0{pid}T00:00:00")
+    replace_memories(conn, 1, [
+        Memory("A day at Borjomi", "Walk in Borjomi park.", [1, 2], "sig"),      # size 2
+        Memory("Tbilisi evening", "Old town at night.", [3, 4, 5], "sig"),       # size 3
+    ])
+
+
+def test_memories_for_show_all_returns_every_memory(conn):
+    # "show me all my memories" is a plural/all request — it must show EVERY
+    # memory, not confabulate "no memory matches 'all'" (§10).
+    _seed_two_memories(conn)
+    names = {m["name"] for m in memories_for_show(conn, 1, "show me all my memories")}
+    assert names == {"A day at Borjomi", "Tbilisi evening"}
+
+
+def test_memories_for_show_specific_returns_one(conn):
+    # A narrowing request still returns just the matched memory.
+    _seed_two_memories(conn)
+    mems = memories_for_show(conn, 1, "show me my borjomi memory")
+    assert [m["name"] for m in mems] == ["A day at Borjomi"]
+
+
 def test_count_periods_counts_distinct_months_and_years(conn):
     for pid, when in enumerate((
         "2024-01-01T00:00:00", "2024-01-15T00:00:00",
@@ -183,20 +200,21 @@ def test_count_periods_counts_distinct_months_and_years(conn):
     assert (n_years, years) == (2, ["2024", "2025"])
 
 
-def test_agent_calls_count_tool_and_threads_the_real_total_into_facts(conn):
-    # The visible bug: "how many photos in total" must ground on the REAL total
-    # via the count tool, never on the handful of seed candidates (here, 5).
+def test_direct_answer_counts_the_real_total_without_a_model(conn):
+    # A total-count question is answered straight from the DB — no client passed,
+    # so it cannot use the model (and, in chat_stream, takes no CHAT lease, §8.1).
+    # The number is the REAL total, never the handful of candidates a loop would see.
     for pid in range(1, 6):
-        _photo(conn, pid, f"photo number {pid}")
-    client = FakeInferenceClient(responses=[
-        '{"semantic": "photos"}',
-        json.dumps({"action": "expand", "tool": "count", "query": ""}),
-        json.dumps({"action": "answer", "photo_ids": [1]}),
-    ])
-    ids, facts = agent_retrieve(
-        conn, FakeEmbedder(), client, owner_id=1,
-        question="how many photos do I have in total?",
-        **_kw(k=8, floor=-1.0, max_rounds=3),
-    )
-    assert ids == [1]
-    assert any("5" in fact for fact in facts)
+        _photo(conn, pid, f"photo {pid}")
+    answer = direct_answer(conn, owner_id=1, question="how many images i have in my libray?")
+    assert answer is not None and "5" in answer
+
+
+def test_direct_answer_declines_a_relational_count(conn):
+    # "how many similar to this dog" needs embedding similarity, not a keyword count.
+    # direct_answer must DECLINE (return None) so the turn reaches the agent, never
+    # confabulate the whole-library total (§10, the conservative-decline rule).
+    for pid in range(1, 6):
+        _photo(conn, pid, f"photo {pid}")
+    q = "how many similar photos to this dog one you found we have?"
+    assert direct_answer(conn, owner_id=1, question=q) is None

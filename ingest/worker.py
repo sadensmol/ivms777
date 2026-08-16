@@ -1,8 +1,9 @@
 import sqlite3
+from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
 
-from ingest.jobs import STAGES, claim_next, complete, fail
+from ingest.jobs import STAGES, claim_next, complete, fail, requeue_running
 from ingest.thumbs import make_thumbnails
 from storage.base import Storage
 
@@ -11,10 +12,16 @@ class StageHandler(Protocol):
     def __call__(self, conn: sqlite3.Connection, photo_id: int) -> None: ...
 
 
+class Preempted(Exception):
+    """An interactive workload asked ingest to yield the models (design §8.1)."""
+
+
 def drain(
     conn: sqlite3.Connection,
     handlers: dict[str, StageHandler],
     stages: tuple[str, ...] = STAGES,
+    *,
+    should_preempt: Callable[[], bool] = lambda: False,
 ) -> dict[str, int]:
     completed: dict[str, int] = {}
     for stage in stages:
@@ -23,10 +30,20 @@ def drain(
             continue
         done = 0
         attempted: set[int] = set()
-        while (photo_id := claim_next(conn, stage, exclude=attempted)) is not None:
+        while True:
+            if should_preempt():
+                raise Preempted()  # yield BEFORE claiming another photo (§8.1)
+            photo_id = claim_next(conn, stage, exclude=attempted)
+            if photo_id is None:
+                break
             attempted.add(photo_id)
             try:
                 handler(conn, photo_id)
+            except Preempted:
+                # A mid-photo yield (§8.1): revert the claimed job to pending (not a
+                # failed attempt) so it re-runs next pass, then propagate the yield.
+                requeue_running(conn, photo_id, stage)
+                raise
             except Exception as error:  # noqa: BLE001 - one bad file must never stall the queue
                 fail(conn, photo_id, stage, str(error))
             else:

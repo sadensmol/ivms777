@@ -1,8 +1,14 @@
 * { box-sizing: border-box; }
 body { margin: 0; font: 15px/1.45 system-ui, sans-serif; background: #111; color: #eee; }
 
-.nav { display: flex; gap: 1.25rem; padding: 0.85rem 1.5rem; background: #1c1c1c;
-  position: sticky; top: 0; z-index: 10; border-bottom: 1px solid #262626; }
+/* ---- Resource bar (§13) ---- live RAM/CPU + the coordinator's lease, sitting
+   at the RIGHT of the nav row on every page. Muted monospace since it's ambient
+   status, not navigation; `margin-left:auto` pushes it past the nav links. */
+.resbar { margin-left: auto; font: 12px/1.6 ui-monospace, monospace; color: #888;
+  white-space: nowrap; }
+
+.nav { display: flex; align-items: center; gap: 1.25rem; padding: 0.85rem 1.5rem;
+  background: #1c1c1c; position: sticky; top: 0; z-index: 10; border-bottom: 1px solid #262626; }
 .nav a { color: #bbb; text-decoration: none; font-weight: 500; }
 .nav a:hover { color: #fff; }
 

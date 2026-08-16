@@ -13,11 +13,13 @@ RUN uv sync --no-dev --frozen --no-install-project || uv sync --no-dev --no-inst
 # Flat layout: each top-level package lives at the repo root.
 COPY config.py vocab.yaml ./
 COPY albums ./albums
+COPY captioning ./captioning
 COPY chat ./chat
 COPY db ./db
 COPY embedding ./embedding
 COPY inference ./inference
 COPY ingest ./ingest
+COPY models ./models
 COPY search ./search
 COPY storage ./storage
 COPY web ./web

@@ -1,3 +1,4 @@
+from albums.memory_store import Memory, read_memories, replace_memories
 from embedding.fakes import FakeEmbedder
 from embedding.store import read_caption_vector, write_caption_vector, write_vector
 from ingest.folders import (
@@ -71,6 +72,29 @@ def test_delete_folder_keeps_a_photo_shared_with_another_folder(conn, tmp_path):
     assert remaining == ["B/x.jpg"]                          # only B's path kept
     assert conn.execute("SELECT 1 FROM uploads WHERE id = ?", (up_a,)).fetchone() is None
     assert conn.execute("SELECT 1 FROM uploads WHERE id = ?", (up_b,)).fetchone() is not None
+
+
+def test_delete_folder_prunes_a_memory_left_empty_and_keeps_a_surviving_one(conn, tmp_path):
+    originals, derived = _storages(tmp_path)
+    up_trip = add_upload(conn, root_label="Trip")
+    up_keep = add_upload(conn, root_label="Keep")
+    trip = [add_photo(conn, content_hash=f"a{i}" * 32, sources=(f"Trip/{i}.jpg",),
+                      upload_id=up_trip, thumb_key=thumb_key(f"a{i}" * 32, 320)) for i in range(2)]
+    keep = add_photo(conn, content_hash="bb" * 32, sources=("Keep/k.jpg",),
+                     upload_id=up_keep, thumb_key=thumb_key("bb" * 32, 320))
+    replace_memories(conn, 1, [
+        Memory("Trip only", "gone", trip, "sig"),          # every photo from Trip -> empties
+        Memory("Mixed", "stays", [keep, *trip], "sig"),    # keeps one surviving photo
+    ])
+
+    enqueue_folder_deletion(conn, 1, "Trip")
+    process_folder_deletions(conn, originals, derived, 1, 320, 1600)
+
+    titles = {m.title: m for m in read_memories(conn, 1)}
+    assert "Trip only" not in titles                       # empty memory pruned
+    assert titles["Mixed"].photo_ids == [keep]             # survivor kept, dead ids dropped
+    fts = conn.execute("SELECT name FROM memory_fts").fetchall()
+    assert {r["name"] for r in fts} == {"Mixed"}           # fts rebuilt in lockstep
 
 
 def test_list_folders_reports_counts_and_deleting_flag(conn):

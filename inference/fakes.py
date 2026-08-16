@@ -1,6 +1,7 @@
 import hashlib
+from collections.abc import Callable
 
-from inference.client import ChatMessage
+from inference.client import ChatMessage, InferenceCancelled
 
 
 def _fake_text_vector(text: str, dim: int = 16) -> list[float]:
@@ -33,7 +34,10 @@ class FakeInferenceClient:
         *,
         json_schema: dict | None = None,
         timeout: float = 120.0,
+        should_stop: Callable[[], bool] | None = None,
     ) -> str:
+        if should_stop is not None and should_stop():
+            raise InferenceCancelled(model)   # mirrors the cancellable client path
         self.calls.append((model, messages))
         assert self._responses, "FakeInferenceClient ran out of queued responses"
         return self._responses.pop(0)
@@ -45,3 +49,9 @@ class FakeInferenceClient:
 
     def embed(self, model: str, texts: list[str], *, timeout: float = 60.0) -> list[list[float]]:
         return [_fake_text_vector(t) for t in texts]
+
+    def warm(self, model: str, *, timeout: float = 120.0) -> None:
+        return None
+
+    def evict(self, model: str, *, timeout: float = 30.0) -> None:
+        return None

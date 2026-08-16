@@ -12,27 +12,46 @@ from search.rerank import RERANK_FLOOR, rerank
 from search.retriever import Query, _hard_filter, candidates
 from search.semantic import search_photos, similar_photos
 
+# The agent only handles the SEMANTIC tail — open-ended photo search. Counts,
+# memories, and periods are answered deterministically by `direct_answer` BEFORE
+# the lease (§10), so the loop needs no fact/memory tools; its whole job is to pull
+# and verify candidate photos. Tool-calls are schema-constrained (see
+# `_TOOL_CALL_SCHEMA`), so the model can only emit a valid action naming a real
+# tool — the "malformed JSON / made-up tool" failure mode is gone.
 _AGENT_SYSTEM = (
     "You find the photos in a personal library that answer the user's question. "
     "You are given candidate photos (id, date, caption, tags). Return ONLY the ids "
     "whose caption/tags actually match the question — verify each one; never invent "
-    "a match. Reply with ONLY a JSON object. To pull more candidates first, use "
-    '{"action":"expand","tool":"search|similar|nearby","query":"...","photo_id":<id>}. '
-    "For a count or total question, use "
-    '{"action":"expand","tool":"count","query":"..."} — the number of photos '
-    'matching `query` (an empty query or "all" gives the total photo count). For '
-    "the library's memories, use "
-    '{"action":"expand","tool":"memories"} — each memory\'s name, date, and size. '
-    "To find or show a SPECIFIC memory — by place, occasion, or name — use "
-    '{"action":"expand","tool":"find_memory","query":"..."}; it returns that '
-    "memory and its photos to show. "
-    "For how many months or years have photos, use "
-    '{"action":"expand","tool":"periods","grain":"month"} (or "year") — the '
-    "distinct bucket count. These tools return a FACT, not more candidate photos — "
-    "use it in your final answer; never guess a count from the few candidates "
-    'shown. When ready, answer with {"action":"answer","photo_ids":[...]}. '
-    "If none match, answer with an empty photo_ids list."
+    "a match. Reply with ONLY a JSON object.\n"
+    "To pull more candidates, expand with a tool:\n"
+    '- {"action":"expand","tool":"search","query":"..."} — more photos matching a phrase.\n'
+    '- {"action":"expand","tool":"similar","photo_id":<id>} — photos that look like that one.\n'
+    '- {"action":"expand","tool":"nearby","photo_id":<id>} — photos taken around the same time.\n'
+    'When ready, answer with {"action":"answer","photo_ids":[...]} — the ids you verified, '
+    "or an empty list if none match.\n"
+    "Never state a count or total you did not actually count; speak only about the "
+    "photos shown to you.\n"
+    "Examples:\n"
+    'Q: dogs on a beach → {"action":"expand","tool":"search","query":"dog on a beach"}\n'
+    'then → {"action":"answer","photo_ids":[12,40]}\n'
+    'Q: nothing fits → {"action":"answer","photo_ids":[]}'
 )
+
+# Strict tool-call shape (OpenAI structured-output compatible: every key required,
+# optionals made nullable). The keystone of the hybrid — the weak planner cannot
+# emit invalid JSON or a tool that does not exist.
+_TOOL_CALL_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "action": {"type": "string", "enum": ["expand", "answer"]},
+        "tool": {"type": ["string", "null"], "enum": ["search", "similar", "nearby", None]},
+        "query": {"type": ["string", "null"]},
+        "photo_id": {"type": ["integer", "null"]},
+        "photo_ids": {"type": "array", "items": {"type": "integer"}},
+    },
+    "required": ["action", "tool", "query", "photo_id", "photo_ids"],
+}
 
 
 def retrieve(
@@ -102,65 +121,42 @@ def agent_retrieve(
     k: int = 8,
     floor: float = RERANK_FLOOR,
     max_rounds: int = 3,
-) -> tuple[list[int], list[str]]:
-    """Bounded verify/refine loop over the retriever's candidates (§10, §9.1
-    exception). Read-only tools, capped rounds, verify-before-answer. Returns
-    (verified ids (<= k), gathered facts). `facts` collects every `count` /
-    `memories` / `periods` tool result the agent pulled, in call order — the
-    caller threads these into the final answer's grounding context so a count or
-    total question is answered from a real number, never by counting the handful
-    of candidate photos shown (the "8 photos" bug). Any loop failure degrades to
-    the plain retriever, with no facts."""
-    # Deterministic aggregate routing: a small planner model is unreliable at
-    # CHOOSING the count/memories/periods tool, so when the question is clearly a
-    # count/aggregate we compute the fact ourselves and seed it — the same tool
-    # functions, fired by intent instead of the model's tool-call. This is what
-    # makes "how many photos in total" answer the REAL total on a weak model.
-    gathered: list[str] = _auto_facts(conn, owner_id, question)
-    # A "find/show me a memory" question is answered by the memory index, not photo
-    # retrieval: the seed photo search finds nothing for a memory's place/name (it
-    # is not in any caption), so route it deterministically to `find_memory` and
-    # return the memory's own photos to show (§10, §11).
-    mem = _auto_memory(conn, owner_id, question)
-    if mem is not None:
-        fact, mem_ids = mem
-        return mem_ids[:k], [fact]
+) -> list[int]:
+    """Bounded verify/refine loop over the retriever's candidates for the SEMANTIC
+    tail of chat (§10, §9.1 exception). Counts, memories, and periods are answered
+    by `direct_answer` before the lease, so this loop only ever sees open-ended
+    photo questions: it pulls candidates (`search`/`similar`/`nearby`), verifies
+    them, and returns the ids the model stood behind (<= k), or [] when none match.
+    Any loop failure degrades to the seed candidates."""
     seed = retrieve(
         conn, embedder, client, owner_id=owner_id, question=question,
         dimensions=dimensions, caption_model=caption_model, tag_score_min=tag_score_min,
         planner_model=planner_model, k=max(k, 30), floor=floor,
     )
     if not seed:
-        return [], gathered  # a count/aggregate answer needs no photos, only the fact
+        return []
     known = set(seed)
     messages = [
         {"role": "system", "content": _AGENT_SYSTEM},
         {"role": "user", "content": f"Question: {question}\n{_summarise(conn, owner_id, seed)}"},
     ]
-    if gathered:  # hand the deterministic facts to the agent too, so it can use them
-        messages.append({"role": "user", "content": "Known facts:\n" + "\n".join(gathered)})
     try:
         for round_no in range(max_rounds + 1):
             force = round_no == max_rounds
             turn = _turn(client, planner_model, messages, force)
             if turn is None:
-                return seed[:k], gathered
+                return seed[:k]
             if turn.get("action") == "expand" and not force:
-                extra, fact = _tool(conn, embedder, owner_id, turn)
+                extra = _tool(conn, embedder, owner_id, turn)
                 known.update(extra)
                 messages.append({"role": "assistant", "content": json.dumps(turn)})
-                if fact is not None:
-                    if fact not in gathered:
-                        gathered.append(fact)
-                    messages.append({"role": "user", "content": fact})
-                else:
-                    messages.append({"role": "user", "content": _summarise(conn, owner_id, extra)})
+                messages.append({"role": "user", "content": _summarise(conn, owner_id, extra)})
                 continue
             verified = [pid for pid in (turn.get("photo_ids") or []) if pid in known]
-            return verified[:k], gathered
-    except Exception:  # noqa: BLE001 — degrade to the seed candidates, keep the facts
-        return seed[:k], gathered
-    return seed[:k], gathered
+            return verified[:k]
+    except Exception:  # noqa: BLE001 — degrade to the seed candidates
+        return seed[:k]
+    return seed[:k]
 
 
 def _summarise(conn: sqlite3.Connection, owner_id: int, photo_ids: list[int]) -> str:
@@ -186,19 +182,15 @@ def _summarise(conn: sqlite3.Connection, owner_id: int, photo_ids: list[int]) ->
 
 def _tool(
     conn: sqlite3.Connection, embedder: Embedder, owner_id: int, turn: dict
-) -> tuple[list[int], str | None]:
-    """Run one read-only tool; returns (candidate ids, fact text) — never raises.
-
-    `search`/`similar`/`nearby` pull more CANDIDATE photos (a fact of None).
-    `count`/`memories`/`periods` compute a FACT — a real number the model cannot
-    get by counting the few candidates it has been shown (§10) — and return no
-    ids.
-    """
+) -> list[int]:
+    """Run one read-only candidate tool; returns more candidate photo ids — never
+    raises. `search`/`similar`/`nearby` are the only tools: the agent's job is to
+    widen the candidate pool, not to compute facts (those are `direct_answer`'s)."""
     tool, query, photo_id = turn.get("tool"), turn.get("query"), turn.get("photo_id")
     if tool == "search" and isinstance(query, str):
-        return search_photos(conn, embedder, owner_id, query, k=10), None
+        return search_photos(conn, embedder, owner_id, query, k=10)
     if tool == "similar" and isinstance(photo_id, int):
-        return [r["id"] for r in similar_photos(conn, owner_id, photo_id, k=5)], None
+        return [r["id"] for r in similar_photos(conn, owner_id, photo_id, k=5)]
     if tool == "nearby" and isinstance(photo_id, int):
         return [
             r["id"] for r in conn.execute(
@@ -206,20 +198,8 @@ def _tool(
                 " WHERE p1.id = ? AND p2.id != p1.id AND p2.shot_at IS NOT NULL"
                 " AND abs(julianday(p2.shot_at) - julianday(p1.shot_at)) < 0.25"
                 " ORDER BY p2.shot_at LIMIT 5", (photo_id,))
-        ], None
-    if tool == "count":
-        return [], _count_fact(conn, owner_id, query if isinstance(query, str) else "")
-    if tool == "memories":
-        return [], _memories_fact(conn, owner_id)
-    if tool == "find_memory" and isinstance(query, str):
-        mems = find_memories(conn, owner_id, query, k=1)
-        if not mems:
-            return [], f'no memory matches "{query}".'
-        return mems[0]["photo_ids"], _memory_fact(mems[0])
-    if tool == "periods":
-        grain = turn.get("grain")
-        return [], _periods_fact(conn, owner_id, grain if grain in ("month", "year") else "month")
-    return [], None
+        ]
+    return []
 
 
 # --- Aggregate tools: real numbers, never inferred from the shown candidates ---
@@ -229,6 +209,28 @@ _COUNT_INTENT = re.compile(r"\b(how many|how much|number of|count of|total numbe
 _COUNT_SUBJECT = re.compile(
     r"\b(?:with|of|containing|showing|that (?:have|contain|show)|tagged)\s+(.+?)[?.!]*\s*$", re.IGNORECASE
 )
+# Words in a bare "how many photos …" total question that are NOT a narrowing subject.
+_PHOTO_WORD = re.compile(r"\b(?:photos?|images?|pictures?|pics?|photographs?|shots?)\b", re.IGNORECASE)
+_TOTAL_FILLER = re.compile(
+    r"\b(?:do|does|did|i|we|you|my|our|us|the|a|an|there|are|is|be|been|have|has|had|"
+    r"got|hold|holding|currently|now|right|stored|saved|in|of|total|altogether|all|together)\b",
+    re.IGNORECASE,
+)
+
+
+def _plain_total(question: str) -> bool:
+    """True when a "how many …" question is the plain whole-library total —
+    answerable straight from the DB. False when it narrows to a referent the DB
+    cannot count deterministically ("how many similar to this dog" needs embedding
+    similarity, not a keyword count): those decline here and reach the model path
+    (§10), so chat never confabulates the library total for a relational count.
+
+    Removes the count phrase, photo words, and generic filler; if only library
+    words (incl. the common "libray" typo class) or nothing remain, it is the whole
+    library — any other leftover word means it narrows to something else."""
+    rest = _TOTAL_FILLER.sub(" ", _PHOTO_WORD.sub(" ", _COUNT_INTENT.sub(" ", question)))
+    leftovers = (token.strip("?.!,'\"“”") for token in rest.split())
+    return all(not token or token.lower().startswith("libr") for token in leftovers)
 
 
 def is_aggregate_question(question: str) -> bool:
@@ -238,26 +240,72 @@ def is_aggregate_question(question: str) -> bool:
     return bool(_COUNT_INTENT.search(question))
 
 
-def _auto_facts(conn: sqlite3.Connection, owner_id: int, question: str) -> list[str]:
-    """Deterministically answer count/aggregate questions (§10), so a weak planner
-    model that never emits a tool-call still gets the real number. Same tool
-    functions as `_tool`, chosen here by intent: memories, months/years, a
-    subject count, or the plain total."""
+# The counted noun right after "how many" / "number of" — the reliable signal for
+# WHICH thing is being counted (photos vs memories vs months/years). Reading it
+# fixes "how many photos are in my Borjomi memory" (counted noun = photos, not a
+# memory count) and "how many photos this year" (photos, not a periods span).
+_COUNTED = re.compile(r"\b(?:how many|number of|count of)\s+([a-z]+)", re.IGNORECASE)
+
+
+def _count_subject(question: str) -> str:
+    """The clean subject of a subject-count ("...with dogs" -> "dogs", "number of
+    beach photos" -> "beach"), or "" when there is none. Photo words and leading
+    determiners are stripped so the residue is a real FTS term, never the word
+    "photos" itself."""
+    match = _COUNT_SUBJECT.search(question)
+    if not match:
+        return ""
+    subject = _PHOTO_WORD.sub(" ", match.group(1))
+    subject = re.sub(r"^\s*(?:my|the|a|an|any|some)\s+", "", subject, flags=re.IGNORECASE)
+    return " ".join(subject.split()).strip(" ?.!,'\"“”")
+
+
+def _memory_show_answer(conn: sqlite3.Connection, owner_id: int, question: str) -> str:
+    """The no-model text for a "show/find a memory" question — the memory itself is
+    rendered as a card by the web layer (re-derived from the same question). A
+    plural/all request names the count; a single hit names the memory; a miss is
+    an honest "couldn't find it", never a trip to the planner."""
+    memories = memories_for_show(conn, owner_id, question)
+    if not memories:
+        terms = _memory_terms(question)
+        return (f'I could not find a memory matching "{terms}".' if terms
+                else "You do not have any memories yet.")
+    if len(memories) == 1:
+        m = memories[0]
+        return f'Here is your "{m["name"]}" memory — {m["size"]} photo(s).'
+    return f"Here are your {len(memories)} memories."
+
+
+def direct_answer(conn: sqlite3.Connection, owner_id: int, question: str) -> str | None:
+    """Answer any DB-answerable question straight from SQLite — NO model, NO CHAT
+    lease (§8.1, §10) — so the weak planner never sees it. Returns None to DECLINE
+    (semantic / relational / ambiguous), so the question falls through to the agent
+    loop. Every matcher is conservative: it fires only when confident and NEVER
+    returns a confidently-wrong answer — a decline is always safe, a wrong answer is
+    the bug that "all" was. See the routing matrix in tests/test_chat_routing.py."""
+    # Memory show/list — deterministic from the question, not a count.
+    if is_memory_show(question):
+        return _memory_show_answer(conn, owner_id, question)
     q = question.lower()
     if not _COUNT_INTENT.search(q):
-        return []
-    if "memor" in q:
-        # A "how many memories" answer is the COUNT alone — the per-memory sizes in
-        # the full list confuse a weak model into echoing a member size (e.g. 24).
-        return [f"count: {len(list_memories(conn, owner_id))} memory(ies) in total."]
-    if "month" in q or "year" in q:
-        return [_periods_fact(conn, owner_id, "year" if "year" in q else "month")]
-    match = _COUNT_SUBJECT.search(question)
-    subject = match.group(1).strip() if match else ""
-    # A subject that is just "photos"/"the library"/"total" means the whole library.
-    if subject and not re.search(r"\b(photo|image|picture|librar|total)\b", subject, re.IGNORECASE):
-        return [_count_fact(conn, owner_id, subject)]
-    return [_count_fact(conn, owner_id, "")]
+        return None
+    counted = _COUNTED.search(q)
+    noun = counted.group(1) if counted else ""
+    if noun.startswith("memor"):
+        n = len(list_memories(conn, owner_id))
+        return f"You have {n} " + ("memory" if n == 1 else "memories") + " in your library."
+    if noun in ("month", "months", "year", "years"):
+        grain = "year" if noun.startswith("year") else "month"
+        n, _ = count_periods(conn, owner_id, grain)
+        return f"Your photos span {n} {grain if n == 1 else grain + 's'}."
+    subject = _count_subject(question)
+    if subject and not re.search(r"\b(photo|image|picture|librar|total|memor)\b", subject, re.IGNORECASE):
+        n = count_photos(conn, owner_id, subject)
+        return f"You have {n} photo(s) matching “{subject}”."
+    if not _plain_total(question):
+        return None  # a narrowing / relational count we cannot compute deterministically → agent
+    n = count_photos(conn, owner_id, "")
+    return f"You have {n} photo(s) in your library."
 
 
 def count_photos(conn: sqlite3.Connection, owner_id: int, query: str) -> int:
@@ -288,12 +336,19 @@ def list_memories(conn: sqlite3.Connection, owner_id: int) -> list[dict]:
 
 _MEMORY_INTENT = re.compile(r"\bmemor(?:y|ies)\b", re.IGNORECASE)
 # Words to drop when turning "find memory in borjomi" into the FTS term "borjomi".
+# `all/every/each/list` are quantifiers, never a memory's name — dropping them is
+# what keeps "show me ALL my memories" from FTS-searching for a memory called
+# "all" (which matches nothing) and confabulating "no memory matches 'all'".
 _MEMORY_STOP = re.compile(
-    r"\b(find|show|open|display|give|get|see|me|us|my|any|some|one|of|the|a|an|"
-    r"please|in|on|at|from|about|with|memory|memories|which|what|where|is|are|"
-    r"do|does|i|have|there)\b",
+    r"\b(find|show|open|display|give|get|see|list|me|us|my|any|some|one|all|every|"
+    r"each|of|the|a|an|please|in|on|at|from|about|with|memory|memories|which|what|"
+    r"where|is|are|do|does|i|have|there)\b",
     re.IGNORECASE,
 )
+# A plural / "all" memory request — show EVERY memory, not one. Plural "memories"
+# alone counts (bare "show me my memories"), as do the quantifiers "all/every/each"
+# and "list". A specific narrowing term (non-empty `_memory_terms`) overrides this.
+_ALL_MEMORIES = re.compile(r"\b(all|every|each|list)\b|\bmemories\b", re.IGNORECASE)
 
 
 def is_memory_show(question: str) -> bool:
@@ -360,42 +415,28 @@ _MEMORY_SELECT = (
 )
 
 
-def _memory_fact(memory: dict) -> str:
-    return (
-        f'memory "{memory["name"]}" — {memory["size"]} photo(s), earliest '
-        f'{memory["date"] or "no date"}. Open: /organize?by=memories'
-    )
-
-
-def _auto_memory(
+def memories_for_show(
     conn: sqlite3.Connection, owner_id: int, question: str
-) -> tuple[str, list[int]] | None:
-    """Deterministic memory routing (§10): for a "find/show a memory" question
-    return (fact, photo_ids) — the matched memory's fact line and its cover photos
-    to show. None when the question is not about showing a memory."""
+) -> list[dict]:
+    """The memories a "find/show me … memory/memories" question refers to (§10).
+
+    Returns the full memory dicts — id, name, description, photo_ids — so the chat
+    UI can render each as its own Organize memory card and link into its grid:
+
+    - a narrowing term ("… borjomi") → the one best-matching memory (or [] on a miss);
+    - a plural / "all" request ("show me all my memories", "list my memories") → EVERY
+      memory, largest first;
+    - a bare singular "show me a memory" → the largest one.
+
+    Empty list when the question is not about showing a memory, or matches none."""
     if not is_memory_show(question):
-        return None
+        return []
     terms = _memory_terms(question)
-    memories = find_memories(conn, owner_id, terms, k=1)
-    if not memories:
-        return (f'no memory matches "{terms}".' if terms else "memories: 0 total.", [])
-    return _memory_fact(memories[0]), memories[0]["photo_ids"]
-
-
-def memory_for_show(
-    conn: sqlite3.Connection, owner_id: int, question: str
-) -> dict | None:
-    """The memory a "find/show me a memory" question refers to, or None.
-
-    Same deterministic route `_auto_memory` uses (`is_memory_show` + `find_memories`
-    over the memory index), but returns the full memory dict — id, name,
-    description, photo_ids — so the chat UI can render it as the Organize memory
-    card and link into that memory's grid (§10). A miss ("antarctica") returns
-    None; a bare "show me a memory" returns the largest."""
-    if not is_memory_show(question):
-        return None
-    memories = find_memories(conn, owner_id, _memory_terms(question), k=1)
-    return memories[0] if memories else None
+    if terms:
+        return find_memories(conn, owner_id, terms, k=1)
+    if _ALL_MEMORIES.search(question):
+        return find_memories(conn, owner_id, "", k=1_000)
+    return find_memories(conn, owner_id, "", k=1)
 
 
 def count_periods(conn: sqlite3.Connection, owner_id: int, grain: str) -> tuple[int, list[str]]:
@@ -411,38 +452,22 @@ def count_periods(conn: sqlite3.Connection, owner_id: int, grain: str) -> tuple[
     return len(buckets), buckets
 
 
-def _count_fact(conn: sqlite3.Connection, owner_id: int, query: str) -> str:
-    n = count_photos(conn, owner_id, query)
-    label = "in total" if not query.strip() or query.strip().lower() == "all" else f'matching "{query}"'
-    return f"count: {n} photo(s) {label}."
-
-
-def _memories_fact(conn: sqlite3.Connection, owner_id: int) -> str:
-    memories = list_memories(conn, owner_id)
-    if not memories:
-        return "memories: 0 total."
-    lines = [
-        f"- {m['name']}: {m['size']} photo(s), earliest {m['date'] or 'no date'}"
-        for m in memories
-    ]
-    return f"memories: {len(memories)} total:\n" + "\n".join(lines)
-
-
-def _periods_fact(conn: sqlite3.Connection, owner_id: int, grain: str) -> str:
-    n, buckets = count_periods(conn, owner_id, grain)
-    if not buckets:
-        return f"{grain}s with photos: 0."
-    return f"{grain}s with photos: {n} ({', '.join(buckets)})."
-
-
 def _turn(
     client: InferenceClient, model: str, messages: list[dict], force: bool
 ) -> dict | None:
-    """One model turn -> parsed JSON dict, or None if the output is unusable."""
+    """One model turn -> parsed JSON dict, or None if the output is unusable.
+
+    The tool-call is schema-constrained (`_TOOL_CALL_SCHEMA`) so the model cannot
+    emit malformed JSON or a tool that does not exist. A backend that rejects the
+    schema falls back to a plain call — the `{...}` extraction below still guards
+    output either way, so the loop degrades rather than breaks."""
     turn_messages = messages
     if force:
         turn_messages = [*messages, {"role": "user", "content": "Answer now (action=answer)."}]
-    raw = client.complete(model, turn_messages, timeout=60.0)
+    try:
+        raw = client.complete(model, turn_messages, timeout=60.0, json_schema=_TOOL_CALL_SCHEMA)
+    except Exception:  # noqa: BLE001 — backend without structured output → plain call
+        raw = client.complete(model, turn_messages, timeout=60.0)
     start, end = raw.find("{"), raw.rfind("}")
     if start == -1 or end <= start:
         return None

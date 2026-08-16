@@ -142,33 +142,23 @@ def test_chat_reports_nothing_found_when_floor_rejects_all(settings, monkeypatch
         assert "/thumb/1" not in tc.get("/chat").text
 
 
-def test_chat_total_count_question_grounds_on_the_real_total_not_shown_photos(settings, monkeypatch):
+def test_chat_total_count_question_answers_the_real_total_not_shown_photos(settings, monkeypatch):
     # The visible bug (§10): "how many photos in total" answered "8" (the
-    # retrieved-candidate count) instead of the real total. The agent must call
-    # the `count` tool and thread its fact into the context the final answer sees.
+    # retrieved-candidate count) instead of the real total. Total-count questions
+    # are now answered straight from the DB (§8.1), so the answer IS the real total
+    # (12) by construction — no model, no retrieved-subset to miscount.
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     question = "how many photos do I have in total?"
-    fake = FakeInferenceClient(
-        responses=[
-            "yes",
-            '{"semantic": "photos"}',
-            json.dumps({"action": "expand", "tool": "count", "query": ""}),
-            json.dumps({"action": "answer", "photo_ids": [1]}),
-        ],
-        streams=[["You have 12 photos in total."]],
-    )
+    fake = FakeInferenceClient()  # must never be called for a count question
     monkeypatch.setattr(Settings, "build_inference_client", lambda self: (fake, "fake"))
     app = create_app(settings)
     conn = app.state.context.conn
-    _searchable(conn, 1, question)  # guarantees a caption-cosine match clears the floor
-    for pid in range(2, 13):
-        _searchable(conn, pid, f"photo number {pid}")
+    for pid in range(1, 13):
+        add_photo(conn, photo_id=pid, content_hash=f"h{pid}", thumb_key=f"{pid}.jpg")
     with TestClient(app) as tc:
-        tc.get("/chat/stream", params={"q": question})
-    # The final streaming call's grounding context must carry the real total (12),
-    # not just the one cited photo.
-    grounding = fake.calls[-1][1][-1]["content"]
-    assert "12" in grounding
+        body = tc.get("/chat/stream", params={"q": question}).text
+    assert "12" in body           # the real total
+    assert fake.calls == []        # answered deterministically, the model untouched
 
 
 def test_normal_answer_streams_no_memory_card(chat_client):
@@ -202,6 +192,29 @@ def test_memory_show_streams_the_memory_card_with_chat_memory_links(settings, mo
     assert "ctx=chat-memory:memory-0" in body            # covers link into the memory grid
 
 
+def test_show_all_memories_streams_a_card_per_memory(settings, monkeypatch):
+    # "show me all my memories" is a plural/all request: the stream carries a card
+    # for EVERY memory, never a confabulated "no memory matches 'all'" (§10).
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    fake = FakeInferenceClient(responses=["yes"], streams=[["Here are your memories."]])
+    monkeypatch.setattr(Settings, "build_inference_client", lambda self: (fake, "fake"))
+    app = create_app(settings)
+    from albums.memory_store import Memory, replace_memories
+    conn = app.state.context.conn
+    for pid in range(1, 5):
+        add_photo(conn, photo_id=pid, content_hash=f"h{pid}", thumb_key=f"{pid}.jpg",
+                  shot_at=f"2023-12-0{pid}T10:00:00")
+    replace_memories(conn, 1, [
+        Memory("Trip to Borjomi", "A day in Borjomi park.", [1, 2], "sig"),
+        Memory("Tbilisi evening", "Old town at night.", [3, 4], "sig"),
+    ])
+    with TestClient(app) as tc:
+        body = tc.get("/chat/stream", params={"q": "show me all my memories"}).text
+    assert "event: memory" in body
+    assert "Trip to Borjomi" in body and "Tbilisi evening" in body   # a card each
+    assert 'no memory matches' not in body                           # no confabulation
+
+
 def test_memory_card_survives_reload_in_history(settings, monkeypatch):
     # The card re-renders from the persisted turn (deterministic, no extra stored
     # state), so it survives navigation and restart like the answer text does.
@@ -216,6 +229,79 @@ def test_memory_card_survives_reload_in_history(settings, monkeypatch):
     assert "Trip to Borjomi" in page
     assert "ctx=chat-memory:memory-0" in page
     assert 'class="msg-memory"' in page
+
+
+def test_count_question_streams_answer_not_no_answer(chat_client):
+    body = chat_client.get("/chat/stream?q=how many images in my library?").text
+    assert "data:" in body and "event: done" in body   # streamed → not "(no answer)"
+
+
+def test_count_question_answers_without_taking_the_model_lease(settings, monkeypatch):
+    # A count/aggregate question is answered straight from the DB (§8.1) — it must
+    # NOT take the CHAT lease, so "how many photos?" answers instantly even while
+    # ingest holds the caption model. The coordinator here refuses to hand over the
+    # lease; the count must still come back (not "busy").
+    from web.deps import AppContext
+
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+
+    class _NeverGivesLease:
+        def require(self, workload):
+            raise AssertionError("a count question must not require the model lease")
+
+    monkeypatch.setattr(
+        AppContext, "make_coordinator", lambda self, client, holder: _NeverGivesLease()
+    )
+    app = create_app(settings)
+    conn = app.state.context.conn
+    for pid in range(1, 4):
+        add_photo(conn, photo_id=pid, content_hash=f"h{pid}", thumb_key=f"{pid}.jpg")
+    with TestClient(app) as tc:
+        body = tc.get("/chat/stream", params={"q": "how many photos do I have?"}).text
+    assert "3" in body                       # the real total, from the DB
+    assert "busy" not in body.lower()         # never fell into the lease-busy path
+    assert "event: done" in body
+
+
+def test_chat_releases_the_model_lease_after_the_turn(settings, monkeypatch):
+    # Build the app directly so we can read app.state.context.conn for the lease.
+    from models import lease_store as ls
+
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(
+        type(settings), "build_inference_client",
+        lambda self: (FakeInferenceClient(streams=[["ok"]]), "fake"),
+    )
+    app = create_app(settings)
+    with TestClient(app) as tc:
+        tc.get("/chat/stream?q=beach")
+        assert ls.read_lease(app.state.context.conn) is None   # CHAT lease released
+
+
+def test_chat_stream_never_aborts_when_the_coordinator_lease_times_out(settings, monkeypatch):
+    # §8.1 FIX I2: coordinator.require("CHAT") can raise TimeoutError (or
+    # RefusedError / LeaseBusyError) BEFORE any yield — a background workload
+    # that won't yield the lease within 30s, or an over-budget model-set. Without
+    # a guard the SSE stream aborts with zero output — the "(no answer)" bug.
+    # This must never recur: the stream always emits >=1 `data:` + `event: done`.
+    from web.deps import AppContext
+
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+
+    class _TimeoutCoordinator:
+        def require(self, workload):
+            raise TimeoutError(f"could not acquire model lease for {workload} within 30.0s")
+
+    monkeypatch.setattr(
+        AppContext, "make_coordinator",
+        lambda self, client, holder: _TimeoutCoordinator(),
+    )
+    app = create_app(settings)
+    with TestClient(app) as tc:
+        body = tc.get("/chat/stream?q=beach").text
+    assert "data:" in body
+    assert "busy" in body.lower()
+    assert "event: done" in body
 
 
 def test_off_topic_question_is_refused_without_retrieval(settings, monkeypatch):

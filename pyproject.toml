@@ -19,6 +19,7 @@ dependencies = [
     "numpy>=2.5.2",
     "reverse-geocoder>=1.5.1",
     "pycountry>=26.2.16",
+    "psutil>=7.2.2",
 ]
 
 [dependency-groups]
@@ -35,7 +36,7 @@ build-backend = "hatchling.build"
 # Flat layout: the source lives at the repo root (no package folder), so ship
 # each top-level package plus the config module explicitly.
 [tool.hatch.build.targets.wheel]
-only-include = ["config.py", "albums", "chat", "db", "embedding", "inference", "ingest", "search", "storage", "web"]
+only-include = ["config.py", "albums", "captioning", "chat", "db", "embedding", "inference", "ingest", "models", "search", "storage", "web"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

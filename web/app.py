@@ -7,6 +7,7 @@ from urllib.parse import urlencode
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import (
     HTMLResponse,
+    JSONResponse,
     RedirectResponse,
     Response,
     StreamingResponse,
@@ -23,7 +24,7 @@ from albums.memory_store import (
     stored_signature,
 )
 from albums.registry import ORGANIZERS, get_organizer
-from chat.agent import agent_retrieve, is_aggregate_question, memory_for_show
+from chat.agent import agent_retrieve, direct_answer, memories_for_show
 from chat.context import build_context as build_chat_context
 from chat.history import (
     add_message,
@@ -47,6 +48,8 @@ from ingest.jobs import (
 from ingest.pipeline import drain_pass
 from ingest.thumbs import thumb_key
 from ingest.vocab import load_vocab, seed_tags
+from models.coordinator import LeaseBusyError, RefusedError
+from models.resources import snapshot
 from search.dates import date_where
 from search.facets import (
     SIDEBAR_GROUPS,
@@ -188,8 +191,14 @@ def create_app(settings: Settings) -> FastAPI:
 
     def _search_page(ctx: AppContext, params: dict[str, str], query: str, offset: int) -> list:
         # Candidate generation via the retriever core (§9.2); facet/tag filters narrow the survivors.
-        embedder, _ = ctx.settings.build_embedder()
-        fused = candidates(ctx.conn, embedder, ctx.settings.owner_id, Query(text=query, k=200))
+        # SigLIP is coordinated (§8.1): the SEARCH lease is SigLIP-only and shares
+        # the model with CHAT under the same "app" holder, so a search during a
+        # chat piggybacks rather than fighting it for residency.
+        client, _ = ctx.settings.build_inference_client()
+        coordinator = ctx.make_coordinator(client, "app")
+        with coordinator.require("SEARCH"):
+            embedder, _ = ctx.settings.build_embedder()
+            fused = candidates(ctx.conn, embedder, ctx.settings.owner_id, Query(text=query, k=200))
         if not fused:
             return []
         where, where_params = _filter_where(ctx, params)
@@ -287,6 +296,15 @@ def create_app(settings: Settings) -> FastAPI:
     @app.get("/")
     def root() -> RedirectResponse:
         return RedirectResponse("/library")
+
+    @app.get("/api/resources")
+    def resources() -> JSONResponse:
+        ctx = context()
+        return JSONResponse(snapshot(
+            ctx.conn,
+            planner_model=ctx.settings.planner_model or "fake",
+            caption_model=ctx.settings.caption_model or "fake",
+        ))
 
     @app.get("/library", response_class=HTMLResponse)
     def library(request: Request):
@@ -432,9 +450,14 @@ def create_app(settings: Settings) -> FastAPI:
                 app.state.memories_progress = {"done": done, "total": total}
 
             def run() -> None:
+                # ctx.conn is thread-local (§5): the coordinator must be built
+                # here, on the daemon thread that will hold the lease, not on
+                # the request thread above.
                 try:
-                    build_memories(ctx.conn, client, model, owner_id,
-                                   force=True, progress=on_progress)
+                    coordinator = ctx.make_coordinator(client, "app")
+                    with coordinator.require("MEMORY_REBUILD"):
+                        build_memories(ctx.conn, client, model, owner_id,
+                                       force=True, progress=on_progress)
                 finally:
                     app.state.memories_building = False
 
@@ -481,8 +504,11 @@ def create_app(settings: Settings) -> FastAPI:
         owner = ctx.settings.owner_id
         query = params.get("q", "").strip()
         if query:
-            embedder, _ = ctx.settings.build_embedder()
-            fused = candidates(ctx.conn, embedder, owner, Query(text=query, k=200))
+            client, _ = ctx.settings.build_inference_client()
+            coordinator = ctx.make_coordinator(client, "app")
+            with coordinator.require("SEARCH"):
+                embedder, _ = ctx.settings.build_embedder()
+                fused = candidates(ctx.conn, embedder, owner, Query(text=query, k=200))
             where, where_params = _filter_where(ctx, params)
             if where and fused:
                 placeholders = ", ".join("?" for _ in fused)
@@ -760,28 +786,36 @@ def create_app(settings: Settings) -> FastAPI:
         "I can only answer questions about your photos — try asking what's in "
         "them, or when and where they were taken."
     )
+    BUSY_REPLY = (
+        "The library is busy processing photos right now — please try again "
+        "in a moment."
+    )
 
     def _memory_card_html(question: str) -> str | None:
-        # The Organize memory card for a "show me a memory" question, rendered as
-        # HTML so chat shows the memory ITSELF (mosaic + title + story), not just
-        # prose. Reuses the shared `_album_card.html` and links carry
-        # ctx=chat-memory:<key>, so drilling in pages within the memory and "close"
-        # returns to the conversation (§10, §13.1). Re-derived from the question
-        # (deterministic) — no extra stored state, and history re-renders it.
+        # The Organize memory card(s) for a "show me a memory / all my memories"
+        # question, rendered as HTML so chat shows the memory ITSELF (mosaic + title
+        # + story), not just prose. A plural/all request renders EVERY memory's card
+        # in order; a specific/singular one renders just its card. Reuses the shared
+        # `_album_card.html` and links carry ctx=chat-memory:<key>, so drilling in
+        # pages within the memory and "close" returns to the conversation (§10,
+        # §13.1). Re-derived from the question (deterministic) — no extra stored
+        # state, and history re-renders it.
         ctx = context()
         owner = ctx.settings.owner_id
-        memory = memory_for_show(ctx.conn, owner, question)
-        if memory is None:
+        memories = memories_for_show(ctx.conn, owner, question)
+        if not memories:
             return None
-        key = album_key_for_group(ctx.conn, owner, memory["id"])
-        if key is None:
-            return None
-        for album in get_organizer(MemoriesOrganizer.name).organize(ctx.conn, owner):
-            if album.key == key:
-                return templates.env.get_template("_album_card.html").render(
-                    album=album, ctx=f"ctx=chat-memory:{key}"
-                )
-        return None
+        albums = {a.key: a for a in get_organizer(MemoriesOrganizer.name).organize(ctx.conn, owner)}
+        cards: list[str] = []
+        for memory in memories:
+            key = album_key_for_group(ctx.conn, owner, memory["id"])
+            album = albums.get(key) if key else None
+            if album is None:
+                continue
+            cards.append(templates.env.get_template("_album_card.html").render(
+                album=album, ctx=f"ctx=chat-memory:{key}"
+            ))
+        return "\n".join(cards) if cards else None
 
     @app.get("/chat", response_class=HTMLResponse)
     def chat_page(request: Request) -> HTMLResponse:
@@ -816,7 +850,6 @@ def create_app(settings: Settings) -> FastAPI:
         # a one-photo answer. The finished turn is persisted.
         ctx = context()
         owner_id = ctx.settings.owner_id
-        embedder, _ = ctx.settings.build_embedder()
         client, _ = ctx.settings.build_inference_client()
         model = ctx.settings.planner_model or "fake"
         session_id = current_session(ctx.conn, owner_id)
@@ -827,57 +860,79 @@ def create_app(settings: Settings) -> FastAPI:
             return "event: done\ndata: " + json.dumps({"model": model, **stats}) + "\n\n"
 
         def events():
-            if not is_photo_question(client, model, q):
-                yield f"data: {json.dumps({'delta': OFF_TOPIC_REPLY})}\n\n"
-                add_message(ctx.conn, session_id, q, OFF_TOPIC_REPLY, [])
+            # The direct-DB layer (§10): every question the DB can answer
+            # unambiguously — counts, memory show/list, periods — is answered
+            # straight from SQLite with NO model, so it takes NO CHAT lease and
+            # replies instantly even while ingest holds the caption model (§8.1),
+            # and NEVER reaches the weak planner (so a phrasing like "all" can't
+            # break it there). A "show me a memory" turn also streams the memory
+            # card, re-derived from the same question. Only when direct_answer
+            # DECLINES (returns None — semantic / relational) do we take the lease.
+            quick = direct_answer(ctx.conn, owner_id, q)
+            if quick is not None:
+                yield f"data: {json.dumps({'delta': quick})}\n\n"
+                add_message(ctx.conn, session_id, q, quick, [])
+                card = _memory_card_html(q)
+                if card is not None:
+                    yield "event: memory\ndata: " + json.dumps({"html": card}) + "\n\n"
                 yield _done()
                 return
-            # Agentic RAG (§10): plan -> fuse -> narrow -> rerank -> floor -> a
-            # bounded verify/refine loop. Grounds only on verified matches; when
-            # none clear the floor build_chat_context([]) yields the no-match
-            # sentinel and the model is told to say so — never a 30-photo dump.
-            # The loop may also call count/memories/periods fact tools (never a
-            # candidate dump) for a count/total/memory question; their results
-            # are threaded into the grounding context so the answer is grounded
-            # on a real number, never on the count of photos merely shown (§10).
-            ids, facts = agent_retrieve(
-                ctx.conn, embedder, client,
-                owner_id=owner_id, question=q, dimensions=list(vocab.dimensions),
-                caption_model=ctx.settings.caption_embed_model,
-                tag_score_min=ctx.settings.tag_score_min,
-                planner_model=model,
-            )
-            # A count/aggregate question is answered from the deterministic facts
-            # ALONE — never alongside the retrieved photos, or a weak model counts
-            # the handful shown and confabulates a total ("8 photos", §10).
-            if facts and is_aggregate_question(q):
-                context_block = "\n".join(facts)
-            else:
-                context_block = build_chat_context(ctx.conn, ids)
-                if facts:
-                    context_block = context_block + "\n\n" + "\n".join(facts)
-            messages = chat_messages(q, context_block)
-            parts: list[str] = []
-            started_at = None
-            for delta in client.stream(model, messages):
-                if started_at is None:  # clock starts at the first token, not the wait before it
-                    started_at = time.monotonic()
-                parts.append(delta)
-                yield f"data: {json.dumps({'delta': delta})}\n\n"
-            # Chunk count is a close proxy for tokens with an OpenAI-style stream
-            # (one token per chunk); good enough for a live decode-speed readout.
-            elapsed = (time.monotonic() - started_at) if started_at else 0.0
-            tok_per_sec = round(len(parts) / elapsed, 1) if elapsed > 0 else None
-            answer = "".join(parts)
-            add_message(ctx.conn, session_id, q, answer, cited_ids(answer))
-            # A "show me a memory" turn also streams the memory card itself, so the
-            # answer isn't only prose — the memory renders below it, drillable and
-            # paged exactly like the Organize view (§10, §13.1). Only for memory-show
-            # questions; a normal answer never carries one.
-            card = _memory_card_html(q)
-            if card is not None:
-                yield "event: memory\ndata: " + json.dumps({"html": card}) + "\n\n"
-            yield _done(tok_per_sec=tok_per_sec, tokens=len(parts))
+            # Per-request coordinator (§8.1): SigLIP (and the planner) load only
+            # for the lifetime of this turn, under the CHAT lease, on this
+            # generator's own thread/connection — never built eagerly up front,
+            # which used to crash chat on the Jetson before a question was even
+            # classified.
+            coordinator = ctx.make_coordinator(client, "app")
+            try:
+                with coordinator.require("CHAT"):
+                    embedder, _ = ctx.settings.build_embedder()
+                    if not is_photo_question(client, model, q):
+                        yield f"data: {json.dumps({'delta': OFF_TOPIC_REPLY})}\n\n"
+                        add_message(ctx.conn, session_id, q, OFF_TOPIC_REPLY, [])
+                        yield _done()
+                        return
+                    # Agentic RAG (§10), semantic tail only: plan -> fuse -> narrow ->
+                    # rerank -> floor -> a bounded verify/refine loop over candidate
+                    # photos (search/similar/nearby). Grounds only on verified matches;
+                    # when none clear the floor build_chat_context([]) yields the no-match
+                    # sentinel and the model is told to say so — never a 30-photo dump.
+                    # Counts/memories/periods never reach here — direct_answer handled
+                    # them above, so the "8 photos" confabulation cannot happen.
+                    ids = agent_retrieve(
+                        ctx.conn, embedder, client,
+                        owner_id=owner_id, question=q, dimensions=list(vocab.dimensions),
+                        caption_model=ctx.settings.caption_embed_model,
+                        tag_score_min=ctx.settings.tag_score_min,
+                        planner_model=model,
+                    )
+                    context_block = build_chat_context(ctx.conn, ids)
+                    messages = chat_messages(q, context_block)
+                    parts: list[str] = []
+                    started_at = None
+                    for delta in client.stream(model, messages):
+                        if started_at is None:  # clock starts at the first token, not the wait before it
+                            started_at = time.monotonic()
+                        parts.append(delta)
+                        yield f"data: {json.dumps({'delta': delta})}\n\n"
+                    # Chunk count is a close proxy for tokens with an OpenAI-style stream
+                    # (one token per chunk); good enough for a live decode-speed readout.
+                    elapsed = (time.monotonic() - started_at) if started_at else 0.0
+                    tok_per_sec = round(len(parts) / elapsed, 1) if elapsed > 0 else None
+                    answer = "".join(parts)
+                    add_message(ctx.conn, session_id, q, answer, cited_ids(answer))
+                    # No memory card here: a "show me a memory" turn is a direct-DB
+                    # question, answered above the lease — the semantic tail never
+                    # carries one (§10).
+                    yield _done(tok_per_sec=tok_per_sec, tokens=len(parts))
+            except (TimeoutError, RefusedError, LeaseBusyError):
+                # The coordinator can raise BEFORE any yield (over-budget model-set,
+                # or a background holder that still won't yield within the preempt
+                # window even after the caption abort) — without this, the SSE stream
+                # aborts with zero output and the UI shows nothing at all ("(no
+                # answer)", the bug this guards against). A coordinator failure still
+                # emits a graceful reply + done, same as every other turn.
+                yield f"data: {json.dumps({'delta': BUSY_REPLY})}\n\n"
+                yield _done()
 
         return StreamingResponse(events(), media_type="text/event-stream")
 

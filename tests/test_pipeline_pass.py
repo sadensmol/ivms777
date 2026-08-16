@@ -71,20 +71,42 @@ def test_full_pass_processes_when_the_embedder_is_available(ctx):
 
 def test_siglip_is_released_before_the_caption_stage(ctx, monkeypatch):
     # On the real-embedder path, drain_pass must free SigLIP *before* captioning so
-    # the Ollama vision model gets the GPU (design §8). Flip use_fake_embedder off to
-    # exercise the release gate; stub the caption handler to record ordering (the
-    # fake inference client can't answer real caption calls).
+    # the Ollama vision model gets the GPU (design §8.1). This is now the
+    # INGEST_EMBED lease's exit doing the releasing (Task 6), so exercise it with a
+    # real coordinator — the worker (ingest/cli.py) always passes one; only the
+    # app's best-effort inline drain runs with coordinator=None (no such guarantee,
+    # see test_thumbnail_stage_runs_even_when_the_embedder_is_down and friends
+    # above, which intentionally keep the 2-arg call).
     from config import Settings
     from embedding.fakes import FakeEmbedder
     from ingest import pipeline
+    from models.coordinator import ModelCoordinator
 
     pid = _uploaded_photo(ctx)
     ctx.settings.use_fake_embedder = False
     monkeypatch.setattr(Settings, "build_embedder", lambda self: (FakeEmbedder(), "fake"))
 
     order: list[str] = []
-    monkeypatch.setattr(
-        "embedding.siglip.release_siglip_embedder", lambda: order.append("release")
+
+    class FakeInferenceClient:
+        def warm(self, model, *, timeout=120.0): pass
+        def evict(self, model, *, timeout=30.0): pass
+
+    class FakeCaptioner:
+        # INGEST_CAPTION now resolves to the injected captioner adapter (design
+        # §4/§8.1), not a raw LLM tag — the real caption call is stubbed out below
+        # via `caption_handler`, so load/release just need to be no-ops here.
+        name = caption_model = "fake"
+        def load(self): pass
+        def release(self): pass
+        def footprint_mb(self): return 0
+
+    coordinator = ModelCoordinator(
+        ctx.conn, FakeInferenceClient(), holder="worker", budget_mb=99_999,
+        planner_model="fake", caption_model="fake",
+        load_siglip=lambda: None,
+        release_siglip=lambda: order.append("release"),
+        captioner=FakeCaptioner(),
     )
 
     def fake_caption_handler(*_args, **_kwargs):
@@ -94,7 +116,7 @@ def test_siglip_is_released_before_the_caption_stage(ctx, monkeypatch):
 
     monkeypatch.setattr(pipeline, "caption_handler", fake_caption_handler)
 
-    drain_pass(ctx, load_vocab(VOCAB_PATH))
+    drain_pass(ctx, load_vocab(VOCAB_PATH), coordinator)
 
     assert "release" in order and "caption" in order
     assert order.index("release") < order.index("caption")  # freed before captioning
@@ -104,16 +126,16 @@ def test_siglip_is_released_before_the_caption_stage(ctx, monkeypatch):
     assert caption["status"] == "done"
 
 
-def test_siglip_is_not_released_when_no_caption_work_is_pending(ctx, monkeypatch):
-    # An idle poll (nothing to caption) must not reload SigLIP needlessly.
+def test_siglip_is_not_released_with_no_coordinator(ctx, monkeypatch):
+    # The app's best-effort inline drain (coordinator=None, see module docstring)
+    # takes no model lease at all, so it never releases SigLIP between groups —
+    # only the worker's coordinator-backed pass does (see test above).
     from config import Settings
     from embedding.fakes import FakeEmbedder
 
     _uploaded_photo(ctx)
     ctx.settings.use_fake_embedder = False
     monkeypatch.setattr(Settings, "build_embedder", lambda self: (FakeEmbedder(), "fake"))
-    # Pre-caption everything so backfill_captions queues nothing.
-    ctx.conn.execute("UPDATE photos SET caption = 'x' WHERE caption IS NULL")
     released: list[bool] = []
     monkeypatch.setattr(
         "embedding.siglip.release_siglip_embedder", lambda: released.append(True)
@@ -121,4 +143,24 @@ def test_siglip_is_not_released_when_no_caption_work_is_pending(ctx, monkeypatch
 
     drain_pass(ctx, load_vocab(VOCAB_PATH))
 
-    assert released == []  # nothing to caption → SigLIP stays resident
+    assert released == []  # no coordinator → no lease → nothing released
+
+
+def test_idle_pass_never_takes_a_model_lease(ctx):
+    # No photos at all → nothing pending in embed/taxonomy/caption → drain_pass
+    # must not call coordinator.require(...) for either workload (§8.1 "Idle →
+    # resume": the gate is on lease ENTRY, so an idle poll never loads a model).
+    import contextlib
+
+    seen: list[str] = []
+
+    class SpyCoordinator:
+        @contextlib.contextmanager
+        def require(self, workload):
+            seen.append(workload)
+            raise AssertionError(f"idle pass must not take the {workload} lease")
+            yield  # pragma: no cover
+
+    drain_pass(ctx, load_vocab(VOCAB_PATH), SpyCoordinator())
+
+    assert seen == []

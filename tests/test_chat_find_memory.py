@@ -1,10 +1,6 @@
 from albums.memory_store import Memory, replace_memories
-from chat.agent import agent_retrieve, find_memories, is_memory_show
-from embedding.fakes import FakeEmbedder
-from inference.fakes import FakeInferenceClient
+from chat.agent import find_memories, is_memory_show
 from tests.factories import add_photo
-
-DIMS = ["subject", "setting", "vibe"]
 
 
 def _photo(conn, pid):
@@ -19,12 +15,6 @@ def _seed_memories(conn):
         Memory("Trip to Borjomi", "Hiking in Borjomi park, Georgia.", [1, 2], "sig"),
         Memory("Family night in Ontario", "A cozy evening at home.", [3, 4, 5], "sig"),
     ])
-
-
-def _kw(**over):
-    base = {"dimensions": DIMS, "caption_model": "fake", "tag_score_min": 0.2,
-            "planner_model": "fake"}
-    return {**base, **over}
 
 
 def test_is_memory_show_distinguishes_show_from_count():
@@ -59,30 +49,3 @@ def test_find_memories_is_owner_scoped(conn):
     replace_memories(conn, 2, [Memory("Borjomi theirs", "Borjomi.", [2], "s")])
     hits = find_memories(conn, 1, "borjomi")
     assert [h["name"] for h in hits] == ["Borjomi mine"]
-
-
-def test_agent_retrieve_finds_a_memory_by_place_without_a_model_call(conn):
-    # Deterministic routing: the memory's place ("borjomi") is not in any photo
-    # caption, so photo retrieval would find nothing — the memory index answers it,
-    # returning the memory's own photos to show. The model is never consulted.
-    _seed_memories(conn)
-    ids, facts = agent_retrieve(conn, FakeEmbedder(), FakeInferenceClient(),
-                                owner_id=1, question="find memory in borjomi", **_kw())
-    assert ids == [1, 2]
-    assert any("Borjomi" in f for f in facts)
-
-
-def test_agent_retrieve_shows_any_memory(conn):
-    _seed_memories(conn)
-    ids, facts = agent_retrieve(conn, FakeEmbedder(), FakeInferenceClient(),
-                                owner_id=1, question="show me any of the memory", **_kw())
-    assert ids == [3, 4, 5]  # the largest memory
-    assert any("Ontario" in f for f in facts)
-
-
-def test_agent_retrieve_memory_miss_is_honest(conn):
-    _seed_memories(conn)
-    ids, facts = agent_retrieve(conn, FakeEmbedder(), FakeInferenceClient(),
-                                owner_id=1, question="find memory in antarctica", **_kw())
-    assert ids == []
-    assert any("no memory matches" in f for f in facts)

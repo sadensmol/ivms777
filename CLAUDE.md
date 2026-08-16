@@ -103,6 +103,27 @@ before touching any navigation. The non-negotiable core:
 This layering *is* the "never lose the user's place" rule applied to structure:
 one action up always returns to the grid with its state and scroll intact.
 
+## One model process — NEVER load a model, LLM, or AI library twice (HARD RULE)
+
+**Exactly ONE process loads and runs models.** Every model, LLM, embedder, and
+heavy AI library (torch, transformers, bitsandbytes, SigLIP, the caption VLM, …)
+is imported and held resident in a **single inference service** and nowhere else.
+Every other process — `app`, `worker`, the CLI — is a **thin client** that reaches
+it over an API (HTTP/IPC). They MUST NOT `import torch`/`transformers`, build an
+embedder, or load any model in-process.
+
+- **Never load the same model or AI library in two processes.** On the 8 GB Jetson
+  a duplicated SigLIP + two torch CUDA contexts is what blows the memory budget.
+  One process, one copy, coordinated in-process.
+- A model that has no ready server (SigLIP image embeddings, the in-process caption
+  VLM) is wrapped by **our** inference service and exposed as an endpoint — it is
+  never loaded inline in `app`/`worker`.
+- Text generation already lives in its own service (Ollama/vLLM); that counts as
+  the one model process for those models. The rule extends it to *all* models.
+
+This is non-negotiable for every feature, current and future. If a change would
+import an AI library or load a model outside the inference service, it is wrong.
+
 ## Source folders are sacred — the app NEVER touches them
 
 The folders on the user's disk are **sources**. The cloud app only ever holds an
