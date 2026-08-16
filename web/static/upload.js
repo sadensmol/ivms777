@@ -75,7 +75,12 @@ clearButton.addEventListener('click', () => {
 
 function hashAll(entries) {
   return new Promise((resolve) => {
-    const worker = new Worker('/static/hash-worker.js');
+    // Use the mtime-versioned URL the template supplies, so a rebuilt worker is
+    // never served stale from cache (the hardcoded URL bypassed static_v).
+    const workerSrc =
+      document.querySelector('.upload-shell')?.dataset.hashWorker ||
+      '/static/hash-worker.js';
+    const worker = new Worker(workerSrc);
     const hashes = new Array(entries.length).fill(null);
     let done = 0;
     worker.onmessage = (event) => {

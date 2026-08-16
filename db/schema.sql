@@ -118,6 +118,10 @@ CREATE TABLE IF NOT EXISTS group_photos (
 
 CREATE VIRTUAL TABLE IF NOT EXISTS photo_fts USING fts5(caption, tags_text);
 
+-- Memories are searchable in chat by their name/description (§10, §11). rowid =
+-- groups.id; rebuilt in lockstep with the memories in albums/memory_store.py.
+CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(name, description);
+
 CREATE TABLE IF NOT EXISTS chat_sessions (
   id         INTEGER PRIMARY KEY,
   owner_id   INTEGER NOT NULL,

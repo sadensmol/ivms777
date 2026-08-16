@@ -1,0 +1,23 @@
+{# One memory/album card: mosaic cover, title, description, ×N count. Shared by
+   /organize (the album grid) and /chat (a memory shown in a conversation) so both
+   render identically and drill into the same leaf. The caller sets `album` (with
+   .photo_ids / .cover_id / .title / .description / .size) and `ctx` — the full
+   "ctx=..." query each cover links with, so the two callers point the same card at
+   different grids (album vs chat-memory) without duplicating the markup (§13.1). #}
+<section class="album">
+  {% set covers = album.photo_ids[:4] %}
+  <div class="album-mosaic {{ 'grid-4' if covers|length >= 4 else 'grid-1' }}">
+    {% if covers|length >= 4 %}
+      {% for pid in covers %}
+        <a href="/photo/{{ pid }}?{{ ctx }}"><img src="/thumb/{{ pid }}" loading="lazy" alt=""></a>
+      {% endfor %}
+    {% else %}
+      <a href="/photo/{{ album.cover_id }}?{{ ctx }}"><img src="/thumb/{{ album.cover_id }}" loading="lazy" alt=""></a>
+    {% endif %}
+    <span class="album-count">{{ album.size }}</span>
+  </div>
+  <div class="album-info">
+    <h2>{{ album.title }}</h2>
+    <p class="album-desc">{{ album.description }}</p>
+  </div>
+</section>

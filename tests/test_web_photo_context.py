@@ -75,6 +75,53 @@ def test_photo_in_a_memory_shows_a_collage_of_all_its_members(client):
     assert 'href="/photo/1?ctx=album%3Amemories%3A%3Amemory-0"' in body
 
 
+def test_memory_shown_in_chat_pages_within_it_but_closes_to_chat(client):
+    # A memory opened from chat is the SAME grid as in Organize — it pages within
+    # the memory's photos and shows the whole-memory collage — but "close" returns
+    # UP to the conversation, not to /organize (§10, §13.1).
+    body = client.get("/photo/2?ctx=chat-memory:memory-0").text
+    assert "Beach day" in body                          # the memory identity, shown first
+    assert "2 / 3" in body                              # position within the memory
+    assert 'href="/photo/1?ctx=chat-memory%3Amemory-0"' in body  # prev stays in the memory
+    assert 'href="/photo/3?ctx=chat-memory%3Amemory-0"' in body  # next stays in the memory
+    assert 'class="photo-close" href="/chat"' in body   # close goes back to the conversation
+    assert 'class="collection-collage"' in body         # bounded set → whole-memory collage
+
+
+def test_memory_shown_in_chat_excludes_members_from_similar(settings):
+    # Same member-exclusion as the Organize memory leaf: a photo already in the
+    # collage is not repeated in the "similar" strip (§13).
+    from embedding.fakes import FakeEmbedder
+    from embedding.store import write_vector
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    app = create_app(settings)
+    conn = app.state.context.conn
+    for pid in (1, 2, 3, 4):
+        add_photo(conn, photo_id=pid, content_hash=f"h{pid}", thumb_key=f"{pid}.jpg", caption="x")
+    write_vector(conn, 1, FakeEmbedder().embed_texts(["dog"])[0])
+    conn.execute("INSERT OR IGNORE INTO tags(dimension, label) VALUES ('subject', 'dog')")
+    tid = conn.execute(
+        "SELECT id FROM tags WHERE dimension = 'subject' AND label = 'dog'"
+    ).fetchone()["id"]
+    for pid in (1, 2, 4):
+        conn.execute(
+            "INSERT INTO photo_tags(photo_id, tag_id, score, source) VALUES (?, ?, 1.0, 'vlm')",
+            (pid, tid),
+        )
+    replace_memories(conn, 1, [Memory("Beach day", "desc", [1, 2, 3], "sig")])
+    with TestClient(app) as tc:
+        body = tc.get("/photo/1/similar?ctx=chat-memory:memory-0").text
+    assert 'href="/photo/4?ctx=similar:1"' in body      # non-member similar stays
+    assert 'href="/photo/2?ctx=similar:1"' not in body  # member is not repeated
+
+
+def test_stale_chat_memory_ctx_falls_back_to_the_library(client):
+    # If the memory no longer exists (rebuilt away), the leaf degrades to the
+    # library rather than 500ing (§13.1 fallback).
+    body = client.get("/photo/2?ctx=chat-memory:memory-99").text
+    assert "In</span> <strong>Library</strong>" in body
+
+
 def test_library_photo_has_no_member_collage(client):
     # The library/search collection is unbounded, so no whole-collection collage.
     body = client.get("/photo/2?ctx=library").text

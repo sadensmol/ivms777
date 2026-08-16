@@ -23,6 +23,9 @@ _AGENT_SYSTEM = (
     'matching `query` (an empty query or "all" gives the total photo count). For '
     "the library's memories, use "
     '{"action":"expand","tool":"memories"} — each memory\'s name, date, and size. '
+    "To find or show a SPECIFIC memory — by place, occasion, or name — use "
+    '{"action":"expand","tool":"find_memory","query":"..."}; it returns that '
+    "memory and its photos to show. "
     "For how many months or years have photos, use "
     '{"action":"expand","tool":"periods","grain":"month"} (or "year") — the '
     "distinct bucket count. These tools return a FACT, not more candidate photos — "
@@ -114,6 +117,14 @@ def agent_retrieve(
     # functions, fired by intent instead of the model's tool-call. This is what
     # makes "how many photos in total" answer the REAL total on a weak model.
     gathered: list[str] = _auto_facts(conn, owner_id, question)
+    # A "find/show me a memory" question is answered by the memory index, not photo
+    # retrieval: the seed photo search finds nothing for a memory's place/name (it
+    # is not in any caption), so route it deterministically to `find_memory` and
+    # return the memory's own photos to show (§10, §11).
+    mem = _auto_memory(conn, owner_id, question)
+    if mem is not None:
+        fact, mem_ids = mem
+        return mem_ids[:k], [fact]
     seed = retrieve(
         conn, embedder, client, owner_id=owner_id, question=question,
         dimensions=dimensions, caption_model=caption_model, tag_score_min=tag_score_min,
@@ -200,6 +211,11 @@ def _tool(
         return [], _count_fact(conn, owner_id, query if isinstance(query, str) else "")
     if tool == "memories":
         return [], _memories_fact(conn, owner_id)
+    if tool == "find_memory" and isinstance(query, str):
+        mems = find_memories(conn, owner_id, query, k=1)
+        if not mems:
+            return [], f'no memory matches "{query}".'
+        return mems[0]["photo_ids"], _memory_fact(mems[0])
     if tool == "periods":
         grain = turn.get("grain")
         return [], _periods_fact(conn, owner_id, grain if grain in ("month", "year") else "month")
@@ -268,6 +284,118 @@ def list_memories(conn: sqlite3.Connection, owner_id: int) -> list[dict]:
         (owner_id,),
     ).fetchall()
     return [{"name": r["name"], "date": r["date"], "size": r["size"]} for r in rows]
+
+
+_MEMORY_INTENT = re.compile(r"\bmemor(?:y|ies)\b", re.IGNORECASE)
+# Words to drop when turning "find memory in borjomi" into the FTS term "borjomi".
+_MEMORY_STOP = re.compile(
+    r"\b(find|show|open|display|give|get|see|me|us|my|any|some|one|of|the|a|an|"
+    r"please|in|on|at|from|about|with|memory|memories|which|what|where|is|are|"
+    r"do|does|i|have|there)\b",
+    re.IGNORECASE,
+)
+
+
+def is_memory_show(question: str) -> bool:
+    """True for "find/show me a memory" questions — a memory to display, not a
+    count. "How many memories" is a count and stays with the aggregate facts."""
+    return bool(_MEMORY_INTENT.search(question)) and not is_aggregate_question(question)
+
+
+def _memory_terms(question: str) -> str:
+    """The searchable remainder of a memory question — "find memory in borjomi" ->
+    "borjomi". Empty means a generic "show me a memory" (no place/name given)."""
+    return " ".join(_MEMORY_STOP.sub(" ", question).split())
+
+
+def find_memories(
+    conn: sqlite3.Connection, owner_id: int, query: str, k: int = 3
+) -> list[dict]:
+    """This owner's memories best-matching `query` by FTS over name/description,
+    best first, each with its cover photo ids to show (§10, §11).
+
+    A non-empty `query` that matches nothing returns [] — an honest "no such
+    memory", never an unrelated one. An empty `query` ("show me a memory") returns
+    the largest memories so the request always yields something."""
+    text = query.strip()
+    if text:
+        match = '"' + text.replace('"', '""') + '"'  # phrase-wrap: punctuation never breaks MATCH
+        try:
+            rows = conn.execute(
+                _MEMORY_SELECT
+                + " JOIN memory_fts f ON f.rowid = g.id"
+                " WHERE memory_fts MATCH ? AND g.owner_id = ? AND g.kind = 'memory'"
+                " ORDER BY bm25(memory_fts) LIMIT ?",
+                (match, owner_id, k),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            rows = []
+    else:
+        rows = conn.execute(
+            _MEMORY_SELECT
+            + " WHERE g.owner_id = ? AND g.kind = 'memory' ORDER BY size DESC, g.id LIMIT ?",
+            (owner_id, k),
+        ).fetchall()
+    memories: list[dict] = []
+    for r in rows:
+        photo_ids = [
+            row["photo_id"] for row in conn.execute(
+                "SELECT photo_id FROM group_photos WHERE group_id = ? ORDER BY rank LIMIT 12",
+                (r["id"],),
+            )
+        ]
+        memories.append({
+            "id": r["id"], "name": r["name"], "description": r["description"] or "",
+            "date": r["date"], "size": r["size"], "photo_ids": photo_ids,
+        })
+    return memories
+
+
+_MEMORY_SELECT = (
+    "SELECT g.id AS id, g.name AS name, g.description AS description,"
+    " (SELECT MIN(p.shot_at) FROM group_photos gp JOIN photos p ON p.id = gp.photo_id"
+    "  WHERE gp.group_id = g.id) AS date,"
+    " (SELECT COUNT(*) FROM group_photos gp WHERE gp.group_id = g.id) AS size"
+    " FROM groups g"
+)
+
+
+def _memory_fact(memory: dict) -> str:
+    return (
+        f'memory "{memory["name"]}" — {memory["size"]} photo(s), earliest '
+        f'{memory["date"] or "no date"}. Open: /organize?by=memories'
+    )
+
+
+def _auto_memory(
+    conn: sqlite3.Connection, owner_id: int, question: str
+) -> tuple[str, list[int]] | None:
+    """Deterministic memory routing (§10): for a "find/show a memory" question
+    return (fact, photo_ids) — the matched memory's fact line and its cover photos
+    to show. None when the question is not about showing a memory."""
+    if not is_memory_show(question):
+        return None
+    terms = _memory_terms(question)
+    memories = find_memories(conn, owner_id, terms, k=1)
+    if not memories:
+        return (f'no memory matches "{terms}".' if terms else "memories: 0 total.", [])
+    return _memory_fact(memories[0]), memories[0]["photo_ids"]
+
+
+def memory_for_show(
+    conn: sqlite3.Connection, owner_id: int, question: str
+) -> dict | None:
+    """The memory a "find/show me a memory" question refers to, or None.
+
+    Same deterministic route `_auto_memory` uses (`is_memory_show` + `find_memories`
+    over the memory index), but returns the full memory dict — id, name,
+    description, photo_ids — so the chat UI can render it as the Organize memory
+    card and link into that memory's grid (§10). A miss ("antarctica") returns
+    None; a bare "show me a memory" returns the largest."""
+    if not is_memory_show(question):
+        return None
+    memories = find_memories(conn, owner_id, _memory_terms(question), k=1)
+    return memories[0] if memories else None
 
 
 def count_periods(conn: sqlite3.Connection, owner_id: int, grain: str) -> tuple[int, list[str]]:

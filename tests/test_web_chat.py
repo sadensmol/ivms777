@@ -171,6 +171,53 @@ def test_chat_total_count_question_grounds_on_the_real_total_not_shown_photos(se
     assert "12" in grounding
 
 
+def test_normal_answer_streams_no_memory_card(chat_client):
+    # A non-memory question never carries a memory card — the event is exclusive to
+    # "show me a memory" turns.
+    body = chat_client.get("/chat/stream?q=beach").text
+    assert "event: memory" not in body
+
+
+def _seed_one_memory(conn):
+    from albums.memory_store import Memory, replace_memories
+    for pid in (1, 2):
+        add_photo(conn, photo_id=pid, content_hash=f"h{pid}", thumb_key=f"{pid}.jpg",
+                  shot_at=f"2023-12-0{pid}T10:00:00")
+    replace_memories(conn, 1, [Memory("Trip to Borjomi", "A day in Borjomi park.", [1, 2], "sig")])
+
+
+def test_memory_show_streams_the_memory_card_with_chat_memory_links(settings, monkeypatch):
+    # "show me my memory in borjomi" answers with the memory ITSELF: the stream
+    # carries an `event: memory` with the Organize card, whose covers link into
+    # ctx=chat-memory so drilling in pages within the memory (§10, §13.1).
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    fake = FakeInferenceClient(responses=["yes"], streams=[["Here is your Borjomi memory."]])
+    monkeypatch.setattr(Settings, "build_inference_client", lambda self: (fake, "fake"))
+    app = create_app(settings)
+    _seed_one_memory(app.state.context.conn)
+    with TestClient(app) as tc:
+        body = tc.get("/chat/stream", params={"q": "show me my memory in borjomi"}).text
+    assert "event: memory" in body
+    assert "Trip to Borjomi" in body                     # the card's title
+    assert "ctx=chat-memory:memory-0" in body            # covers link into the memory grid
+
+
+def test_memory_card_survives_reload_in_history(settings, monkeypatch):
+    # The card re-renders from the persisted turn (deterministic, no extra stored
+    # state), so it survives navigation and restart like the answer text does.
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    fake = FakeInferenceClient(responses=["yes"], streams=[["Here is your Borjomi memory."]])
+    monkeypatch.setattr(Settings, "build_inference_client", lambda self: (fake, "fake"))
+    app = create_app(settings)
+    _seed_one_memory(app.state.context.conn)
+    with TestClient(app) as tc:
+        tc.get("/chat/stream", params={"q": "show me my memory in borjomi"})
+        page = tc.get("/chat").text
+    assert "Trip to Borjomi" in page
+    assert "ctx=chat-memory:memory-0" in page
+    assert 'class="msg-memory"' in page
+
+
 def test_off_topic_question_is_refused_without_retrieval(settings, monkeypatch):
     # The classifier says "no" -> canned refusal, no photos retrieved, still persisted.
     settings.data_dir.mkdir(parents=True, exist_ok=True)

@@ -7,14 +7,14 @@ cascade is reliable across restarts and never blocks the UI.
 """
 
 import sqlite3
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 from ingest.thumbs import thumb_key
 from storage.base import Storage
 
 
 def _now() -> str:
-    return datetime.now(UTC).isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 def list_folders(conn: sqlite3.Connection, owner_id: int) -> list[dict]:

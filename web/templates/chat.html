@@ -18,6 +18,7 @@
       <div class="msg user"><div class="bubble">{{ m.question }}</div></div>
       <div class="msg assistant">
         <div class="bubble">{{ m.answer_html|safe }}</div>
+        {% if m.memory_html %}<div class="msg-memory">{{ m.memory_html|safe }}</div>{% endif %}
       </div>
     {% endfor %}
   </div>

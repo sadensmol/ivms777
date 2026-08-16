@@ -1,5 +1,5 @@
 import sqlite3
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 STAGES: tuple[str, ...] = ("thumbnail", "embed", "taxonomy", "caption")
 MAX_ATTEMPTS = 3
@@ -7,7 +7,7 @@ STATUSES = ("pending", "running", "done", "failed")
 
 
 def _now() -> str:
-    return datetime.now(UTC).isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 def enqueue(conn: sqlite3.Connection, photo_id: int, stage: str) -> None:

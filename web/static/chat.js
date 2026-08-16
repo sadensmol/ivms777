@@ -70,7 +70,7 @@ function addTurn(question) {
   assistant.appendChild(bubble);
   log.appendChild(assistant);
   scrollToBottom();
-  return { bubble };
+  return { bubble, assistant };
 }
 
 function setBusy(busy) {
@@ -103,6 +103,19 @@ function askLibrary(event) {
     turn.bubble.innerHTML = answerHtml(buffer);
     scrollToBottom();
   };
+
+  // A "show me a memory" answer streams the memory card (server-rendered, trusted
+  // HTML) after the prose — the same Organize card, drillable and paged within the
+  // memory (§10). Appended once, below the answer bubble.
+  source.addEventListener("memory", (e) => {
+    try {
+      const html = JSON.parse(e.data || "{}").html;
+      if (!html) return;
+      const card = el("msg-memory", html);
+      turn.assistant.appendChild(card);
+      scrollToBottom();
+    } catch (_) { /* card is best-effort */ }
+  });
 
   const finish = () => {
     if (!started) turn.bubble.textContent = "(no answer)";

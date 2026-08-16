@@ -8,7 +8,7 @@
        [grid, photo] and back() lands on the grid with scroll intact; origin_url
        is the deep-link fallback. #}
     <a class="photo-close" href="{{ origin_url }}" title="Back"
-       onclick="if(history.length>1){history.back();return false;}">✕</a>
+       onclick="return ivmsClose(event);">✕</a>
     {# Paging replaces the history entry so it never buries the grid, and stays
        within this collection by carrying the ctx query forward. #}
     {% if prev_id %}<a class="photo-nav prev" href="/photo/{{ prev_id }}{{ q }}" title="Previous (←)"
@@ -127,7 +127,18 @@
   <p class="hint">Finding similar photos…</p>
 </div>
 <script>
-  // Desktop keyboard paging: ← newer, → older. Mirrors the ‹/› buttons.
+  // Close the leaf: go UP to the grid. Prefer history.back() so the grid restores
+  // its scroll + filters via bfcache (§13.1); if there's nothing to go back to
+  // (deep link, opened in a new tab), fall back to the computed grid URL so close
+  // and Esc NEVER silently do nothing — the "Esc stopped working" bug.
+  var ivmsOrigin = {{ origin_url|tojson }};
+  function ivmsClose(e) {
+    if (e) e.preventDefault();
+    if (history.length > 1) history.back();
+    else window.location.href = ivmsOrigin;
+    return false;
+  }
+  // Desktop keyboard paging: ← newer, → older (mirrors the ‹/› buttons); Esc closes.
   (function () {
     var prev = {{ prev_id or 'null' }}, next = {{ next_id or 'null' }};
     var q = "{{ ('?' + ctx_query) if ctx_query else '' }}";
@@ -136,7 +147,7 @@
       // of photos paged through; q keeps paging inside the same collection.
       if (e.key === "ArrowLeft" && prev) { location.replace("/photo/" + prev + q); }
       else if (e.key === "ArrowRight" && next) { location.replace("/photo/" + next + q); }
-      else if (e.key === "Escape" && history.length > 1) { history.back(); }
+      else if (e.key === "Escape") { ivmsClose(); }
     });
   })();
 </script>

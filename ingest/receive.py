@@ -4,7 +4,7 @@ import json
 import sqlite3
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import PurePosixPath
 
 from PIL import Image, UnidentifiedImageError
@@ -33,7 +33,7 @@ class ReceiveResult:
 
 
 def _now() -> str:
-    return datetime.now(UTC).isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 def known_hashes(conn: sqlite3.Connection, owner_id: int, hashes: Iterable[str]) -> set[str]:

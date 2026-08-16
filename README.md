@@ -56,14 +56,54 @@ memories* and a background agent groups the library into named, described albums
 model present first, and re-opening the tab is instant. Agentic RAG + reranking for
 chat retrieval is the next planned phase — see `docs/plans/10-chat-agentic-rerank.md`.
 
-## Run on a Jetson Orin Nano
+## Run on a Jetson Orin Nano (8 GB)
 
-Fully containerised — JetPack ships the NVIDIA container runtime.
+Fully containerised — the NVIDIA container runtime hands the Orin iGPU to
+containers, so the image builds and the GPU is reached **on the Jetson** (you
+cannot build the aarch64 image on a Mac). Requires **JetPack 7** (L4T r39,
+CUDA 13.2): the `app`/`worker` build from `Dockerfile.jetson`, which is
+`python:3.12-slim` with `torch`/`torchvision` from the CUDA-13.2 index
+(`cu132`) so SigLIP runs on the GPU — no jetson-containers, no `autotag`, no
+manual pinning. `make run-jetson` builds and starts all three containers. Two
+steps: get the code onto the Jetson, then start it there.
+
+**1. Get the code onto the Jetson.** Either clone it:
 
 ```bash
-docker compose -f compose.yaml -f compose.jetson.yaml up --build -d
-docker compose exec inference ollama pull qwen3-vl:4b
+ssh jetson
+git clone <your-repo> ivms777 && cd ivms777
 ```
+
+…or, to test uncommitted local changes, `rsync` your working tree from your Mac:
+
+```bash
+rsync -av --exclude .venv --exclude .git --exclude __pycache__ \
+  ~/work/sadensmol/ivms777/ jetson:~/ivms777/
+```
+
+**2. Start it (on the Jetson).**
+
+```bash
+make run-jetson   # build + start the stack, pull the caption + planner models → http://<jetson>:8000
+```
+
+Then open `http://<jetson>:8000/upload`.
+
+`make run-jetson` builds and starts the containerised `inference` (Ollama),
+`app`, and `worker`, waits for Ollama, then pulls the models. The **first** build
+compiles the CUDA image and is slow (tens of minutes) — later runs are cached.
+8 GB is shared
+between CPU and GPU, so the models default to a small vision captioner
+(`qwen2.5vl:3b`) and a 3B planner (`qwen2.5:3b`) — the `config.py` jetson
+defaults. Override either on the command line:
+
+```bash
+make run-jetson JETSON_CAPTION_MODEL=gemma4:e4b
+```
+
+The chosen tags are passed to the `app`/`worker` containers **and** pulled into
+the in-container Ollama, so what runs matches what was pulled. Watch progress:
+`docker compose -f compose.yaml -f compose.jetson.yaml logs -f worker`.
 
 ## Run on a cloud GPU box
 

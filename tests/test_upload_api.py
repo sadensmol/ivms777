@@ -126,6 +126,27 @@ def test_counters_add_up_across_an_upload(client, conn):
     ).fetchone()[0] is not None
 
 
+def test_finish_returns_the_receipt_even_when_the_inline_drain_fails(client, conn, monkeypatch):
+    # The upload RECEIPT is complete once the bytes are stored (§5, §8); the inline
+    # drain is a best-effort convenience and the worker container does the real
+    # processing. So a drain failure — e.g. the app container cannot init CUDA on
+    # jetson (RuntimeError 801) — must NOT fail the upload. Regression for the
+    # reported "upload failed: /api/upload/finish returned 500".
+    from config import Settings
+    upload_id = start(client)
+    send(client, upload_id, "a.jpg", jpeg_bytes())
+
+    def boom(self):
+        raise RuntimeError("Unexpected error from cudaGetDeviceCount ... Error 801")
+
+    monkeypatch.setattr(Settings, "build_embedder", boom)
+    summary = client.post("/api/upload/finish", json={"upload_id": upload_id}).json()
+    assert summary == {"offered": 0, "sent": 1, "failed": 0}  # the receipt still returns
+    assert conn.execute(
+        "SELECT finished_at FROM uploads WHERE id = ?", (upload_id,)
+    ).fetchone()[0] is not None                                # the upload is marked finished
+
+
 def test_an_unknown_upload_id_is_rejected(client):
     data = jpeg_bytes()
     response = send(client, 999, "a.jpg", data)

@@ -39,9 +39,11 @@ API.
 
 ### 3.1 Deploy profiles
 
-The same code and the same `docker-compose.yml` run in three places. The only
-differences are which inference service is active and which model name is in
-config. Ingest is identical everywhere — photos always arrive by upload
+The same code runs in three places, selected by a base `compose.yaml` plus one
+per-profile overlay (`compose.mac.yaml` / `compose.jetson.yaml` / `compose.cloud.yaml`).
+The differences are which inference service is active, which model name is in
+config, and — on `jetson` only — which app image is built (see "Jetson image"
+below). Ingest is identical everywhere — photos always arrive by upload
 (section 3.2b), so no profile depends on a host bind mount.
 
 | Profile | Inference | Caption model | Planner / chat model | Embed device |
@@ -76,15 +78,61 @@ concurrent users.
 
 **Jetson sizing.** The Orin Nano Super has 8 GB shared between CPU and GPU at
 102 GB/s. After the OS, roughly 6 GB is usable, so the 26B A4B model does not
-fit and a 4B-class model is used instead. This works only because pipeline
-stages are sequential — SigLIP and the captioner are never resident at the same
-time (see section 8). Expect roughly 6-8 s/photo, so about 8-11 hours for 5,000
-photos at 25 W.
+fit and a small (3–4B-class) model is used instead. This works only because
+**at most one workload's models are resident at a time** — SigLIP and the
+captioner are never both loaded, and neither is loaded while chat is answering.
+That invariant is enforced by the **model coordinator (§8.1)**, not by luck of
+stage ordering: every consumer (ingest, chat, memory rebuild) declares the
+workload it needs, and the coordinator loads exactly those models, evicts the
+rest, and refuses a set that would exceed the RAM budget. Expect roughly
+6-8 s/photo, so about 8-11 hours for 5,000 photos at 25 W. The coordinator is
+**profile-agnostic** — the same lease/preempt logic runs on mac and cloud; only
+the per-profile RAM budget differs (§8.1).
 
-The default is `qwen3-vl:4b`, with `gemma4:e4b` as the alternate. Published
-scores do not settle the choice: Qwen3-VL 4B's 67.4 is MMMU while Gemma 4 E4B's
-52.6 is MMMU-Pro, a harder benchmark, so the two numbers are not comparable.
-The phase 1 bake-off decides it on real photos.
+The shipping default is `qwen2.5vl:3b` for captioning and `qwen2.5:3b` for the
+planner — the `config.py` jetson defaults, a real, currently-pullable pair that
+fits the 8 GB budget. `gemma4:e4b` is the intended captioner alternate once the
+Gemma 4 family lands on Ollama (§4). Both are overridable per-deploy via
+`IVMS777_CAPTION_MODEL` / `IVMS777_PLANNER_MODEL` (the `make run-jetson` target
+passes the chosen tags to the `app` and `worker` containers **and** pulls them
+into the in-container Ollama, so what runs matches what was pulled). Published
+benchmark scores do not settle the captioner choice on their own — the phase 1
+bake-off decides it on real photos.
+
+**Jetson image.** `mac` and `cloud` build the app from the default `Dockerfile`
+(`python:3.12-slim` + `torch` from PyPI). That does **not** work on Jetson:
+SigLIP runs in-process in `app`/`worker` with `embed_device=cuda`, but the only
+aarch64 `torch` on PyPI is CPU-only, so CUDA would be unavailable. `jetson`
+therefore builds from a dedicated **`Dockerfile.jetson`** — which, on **JetPack 7**
+(L4T r39, CUDA 13.2), is the *same* `python:3.12-slim` image as the default with
+**one change: `torch` + `torchvision` come from the CUDA-13.2 index**
+(`https://download.pytorch.org/whl/cu132`) instead of the CPU PyPI wheel. JetPack 7
+exposes the Orin as **SBSA**, so those upstream CUDA-13.2 wheels run on the iGPU
+directly, and the NVIDIA container runtime (`runtime: nvidia`) hands that iGPU to
+all three containers — inference (Ollama), `app`, and `worker`. The `app`/`worker`
+containers must also declare `NVIDIA_VISIBLE_DEVICES=all` +
+`NVIDIA_DRIVER_CAPABILITIES=all`: unlike the Ollama image, the `python:3.12-slim`
+base does not set them, and without them the runtime injects no driver libs, so
+`libcuda` is absent and `torch.cuda.is_available()` is `False`. There is **no
+jetson-containers, no dusty-nv base image, and no `autotag`**: JetPack 7 ships
+system Python 3.12, matching `pyproject.toml`'s `>=3.12` floor, so the image runs
+the normal `uv sync` from `pyproject.toml` and then reinstalls `torch`/`torchvision`
+from the cu132 index over the CPU torch that `uv sync` brought. `numpy` stays on
+`pyproject`'s `>=2.5.2` — the cu132 wheels are built against NumPy 2.x, so no
+Jetson-specific numpy pin is needed. The captioner/planner still run in the
+separate Ollama container, exactly as the table says — but on `jetson` that
+container is **NVIDIA's JetPack-7 ollama build** (`ghcr.io/nvidia-ai-iot/ollama:*`),
+not the generic `ollama/ollama:latest`: the generic image's vision/mtmd path
+deadlocks on Orin/JP7 (text generation works, but any image request hangs at 0 %
+CPU regardless of memory, swap, or `ipc:host`), so captioning never completes. The
+NVIDIA build ships the CUDA-13 vision kernels the generic one lacks.
+
+> **NOTE — Orin compute capability.** The generic upstream cu132 wheels may not
+> ship a prebuilt cubin for Orin's `sm_87`; kernels then JIT from PTX (correct,
+> possibly slower for SigLIP). If SigLIP throughput is a problem, swap the cu132
+> index in `Dockerfile.jetson` for a JetPack-7 Orin-specific wheel index that
+> carries `sm_87` cubins. Because the base is now Python 3.12 everywhere, the
+> source no longer has a Python-3.10 compatibility constraint.
 
 ### 3.2 Multi-tenancy
 
@@ -119,6 +167,11 @@ drag-and-drop selection, and runs in three steps:
    time, off the main thread. WebCrypto has no incremental digest, so a file is
    read whole — handling them one at a time bounds memory to the largest single
    photo rather than the size of the selection. Nothing is sent yet.
+   `crypto.subtle` exists only in a *secure context* (HTTPS or `localhost`), but
+   the app is normally reached over plain HTTP on the LAN (`http://<jetson>:8000`)
+   where it is `undefined`; so the worker falls back to a pure-JS SHA-256 there.
+   The fallback digest is byte-identical to the server's `hashlib.sha256`, which
+   step 2's probe and step 3's server-side verification both depend on.
 2. **Ask what is new.** The client POSTs each hash *with the path it came from*
    to `/api/upload/probe`, which answers with the subset whose bytes the server
    has never seen. Paths for content it already holds are recorded on the spot —
@@ -246,10 +299,10 @@ flowchart TB
     end
 
     subgraph gpu["The GPU box · docker compose"]
-        app["app · FastAPI + Jinja + HTMX<br/>UI · read queries · upload receipt · /api/manifest"]
+        app["app · FastAPI + Jinja + HTMX<br/>UI · read queries · upload receipt · /api/manifest<br/>SigLIP in-process ONLY while holding CHAT/MEMORY lease (§8.1)"]
         worker["worker · ingest pipeline (primary writer)<br/>facets · thumbs · SigLIP (in-process) · taxonomy · caption · memories · deletions"]
-        infer["inference · Ollama | vLLM<br/>caption + planner/chat/embed models<br/>(host on mac, container on jetson/cloud)"]
-        db[("SQLite WAL<br/>sqlite-vec + FTS5 · named volume")]
+        infer["inference · Ollama | vLLM<br/>caption + planner/chat/embed models · one resident at a time<br/>(host on mac, container on jetson/cloud)"]
+        db[("SQLite WAL<br/>sqlite-vec + FTS5 · model_lease · named volume")]
         store[("Storage<br/>originals + thumbnails")]
     end
 
@@ -266,6 +319,9 @@ flowchart TB
     worker -->|"caption + structured tags (HTTP)"| infer
     app -->|"planner · chat answers · caption embeddings (HTTP)"| infer
 
+    app <-->|"model lease: acquire CHAT/MEMORY · preempt ingest (§8.1)"| db
+    worker <-->|"model lease: INGEST_* · yield on preempt (§8.1)"| db
+
     classDef store fill:#eef2ff,stroke:#8899cc,color:#111;
     class db,store,disk store;
 ```
@@ -277,6 +333,13 @@ time, and `app`'s writes are small and short (recording a received upload,
 accepting a group, editing vocabulary), so contention stays negligible at this
 scale. If public traffic ever makes that false, the fix is Postgres, and the
 repository layer is the only thing that changes.
+
+The same shared DB carries the **model lease** (`model_lease`) that lets `app`
+and `worker` agree on who may hold the GPU: interactive work in `app` (chat,
+memory rebuild) preempts the `worker`'s ingest, which yields its models and
+resumes when the box is idle again. This is the cross-process half of the model
+coordinator (§8.1); it needs no new component precisely because the two
+processes already share this file.
 
 `ivms777-sync` is not part of the deployment. It talks to `app` over HTTP,
 reads one endpoint, and is the only component that ever writes to your disk.
@@ -577,13 +640,96 @@ stopped.
 
 **Stages are drained in order across the whole library, not per photo.** Every
 photo is embedded and scored before any photo is captioned. This is what keeps
-the Jetson profile viable: SigLIP is unloaded before the captioner is ever
-asked for anything, so 8 GB never has to hold both. It also means search and
-"show similar" work across the entire collection within minutes of the upload
-finishing, while captions fill in over the following hours.
+the Jetson profile viable: the SigLIP-using stages (`embed`, `taxonomy`) run
+under the `INGEST_EMBED` workload, and the `caption` stage under `INGEST_CAPTION`
+— two distinct workloads that **never hold the GPU at once**, so 8 GB never has to
+hold both SigLIP and the captioner. Draining embed/taxonomy first means search
+and "show similar" work across the entire collection within minutes of the upload
+finishing, while captions fill in over the following hours. Which model is
+resident when is no longer a property of *this* loop's ordering — it is decided by
+the **model coordinator (§8.1)**, the single place that loads and unloads models.
+
+### 8.1 Model coordinator — one workload owns the models
+
+On a unified-memory box the shared RAM is one pool, and a still-resident model
+pins it: a loaded SigLIP pins torch's CUDA allocator so Ollama reports almost no
+free memory and silently offloads the vision captioner to the CPU (≈20× slower);
+two 3–4B models at once simply don't fit 8 GB. The rule that prevents this is
+blunt: **at any instant, only the models the current work needs are loaded.**
+
+That rule lives in one component — `models/coordinator.py::ModelCoordinator` — the
+**single decision point**. A consumer never loads a model directly; it declares
+the *workload* it is about to run and the coordinator does the rest:
+
+```python
+with coordinator.require(Workload.CHAT):
+    ...            # SigLIP + planner LLM are resident; captioner is not
+```
+
+**Workloads and their model-sets** (the declaration — adding a workload is a table
+row, not new load/unload logic):
+
+| Workload | Priority | Models it needs |
+|---|---|---|
+| `CHAT`, `MEMORY_REBUILD` | interactive (high) | SigLIP · planner/chat LLM (`qwen2.5:3b`) |
+| `INGEST_EMBED` (embed, taxonomy) | background (low) | SigLIP |
+| `INGEST_CAPTION` (caption) | background (low) | caption LLM (`qwen2.5vl:3b`) |
+
+`require()` does three things, in order:
+
+1. **RAM guard.** Sum the declared set's footprints against the profile's budget
+   (`ram_budget_mb`, ≈6 GB on jetson, larger on mac/cloud). A set that would
+   exceed it is **refused and logged** — never loaded blindly. This is the
+   "reselect the models" signal: a workload that cannot fit is a config problem,
+   surfaced loudly, not a runtime OOM.
+2. **Acquire the lease.** `app` (chat, memory rebuild) and `worker` (ingest) are
+   **separate processes**, and Ollama is a third; their only shared truth is the
+   SQLite DB, so the lease is a **row in the DB** (`model_lease`: holder, workload,
+   priority, heartbeat, `preempt_requested`). Interactive priority beats
+   background: a `CHAT`/`MEMORY_REBUILD` request sets `preempt_requested` on a
+   held background lease and waits (bounded) for it to clear.
+3. **Reconcile residency.** Unload every model not in the set, load every model
+   that is. SigLIP is in-process torch, so **each process loads/releases its own**
+   (`get_siglip_embedder` / `release_siglip_embedder`); the lease guarantees only
+   one process holds it at a time — this is why `app` may run SigLIP in-process
+   for a chat query's text-embed, even though §5 shows SigLIP as the worker's:
+   it does so **only while holding the CHAT lease**, with the worker's SigLIP
+   released. The LLMs live in the shared Ollama container, kept to one resident
+   model (`OLLAMA_MAX_LOADED_MODELS=1`) and evicted on demand (`keep_alive=0`).
+
+**Hard preemption.** When an interactive workload preempts ingest, the worker does
+not wait for the current photo. It checks `preempt_requested` at stage/batch
+boundaries **and immediately before the slow caption call**, and on seeing it set
+it **aborts the in-flight stage, requeues that photo's job to `pending`**,
+releases its models, and drops the lease — so the interactive request waits only
+for the model swap, not for a photo, and the aborted photo is simply re-drained
+later (every stage is idempotent, §8). A true mid-CUDA-op kill isn't clean, so
+those checkpoints are the abort points; in practice the yield is sub-photo.
+
+**Idle → resume.** When no interactive lease is held or waiting, the worker
+re-acquires `INGEST_*` and continues draining exactly as before. Releasing is
+still gated on there being pending work, so an idle poll never reloads a model.
+
+The coordinator's current holder, workload, and resident set are exposed for the
+**resource bar (§13)** so the whole mechanism is observable live.
 
 Failed jobs retry up to 3 times with the error recorded, then stay `failed` and
 are listed in the UI. One bad file never stalls the queue.
+
+**A backend outage never blocks the GPU-free stages, and never fails an upload.**
+A drain pass (`ingest/pipeline.py::drain_pass`, shared by the `worker` loop and the
+app's inline drain) runs in two groups: first the **GPU/inference-free** stages —
+thumbnail, EXIF place facets, folder deletions — then the **embedder/inference**
+stages (embed, taxonomy, caption). The embedder is built **inside the pass**, not
+eagerly at process start; if it can't be built — e.g. the container can't init
+CUDA (the observed jetson `RuntimeError 801`) — the model group is skipped for that
+pass and retried on the next, while thumbnails still run. So an uploaded photo
+**appears in the library** (the grid shows photos with a `thumb_key`) even while the
+GPU is down, and the `worker` keeps looping instead of crashing on startup. For the
+same reason the **upload receipt is decoupled from processing**: `/api/upload/finish`
+records the upload and returns even if its best-effort inline drain fails — the
+bytes are stored, the jobs are queued, and the `worker` drains them regardless
+(§5). The receipt succeeding is not a claim that processing is done.
 
 A file rejected at **receive** — hash mismatch, unreadable image, unsupported
 format — never becomes a `photos` row. It is counted in `uploads.files_failed`
@@ -931,15 +1077,22 @@ layer first:
    private fetch. It never invents a match; a candidate that does not fit is
    dropped, not narrated.
 
-   The same loop also has three **fact tools** for a count, total, or
-   organization question the candidates alone cannot answer — `count(query)` (an
-   FTS keyword count over captions/tags; an empty query or `"all"` gives the real
-   total photo count), `memories()` (this owner's memories — name, date, size,
-   from `groups`/`group_photos` where `kind='memory'`), and `periods(grain)`
+   The same loop also has **fact tools** for a count, total, or organization
+   question the candidates alone cannot answer — `count(query)` (an FTS keyword
+   count over captions/tags; an empty query or `"all"` gives the real total photo
+   count), `memories()` (this owner's memories — name, date, size, from
+   `groups`/`group_photos` where `kind='memory'`), and `periods(grain)`
    (`"month"` or `"year"` — the count of distinct calendar buckets that have
-   photos). Unlike `search`/`similar`/`nearby`, a fact tool returns no candidate
-   photos — it returns one FACT line (`chat/agent.py::_tool`), which the loop
-   both feeds back to the agent and collects. `agent_retrieve` returns
+   photos). Unlike `search`/`similar`/`nearby`, these fact tools return no
+   candidate photos — one FACT line (`chat/agent.py::_tool`), which the loop both
+   feeds back to the agent and collects. One more tool, `find_memory(query)`, is
+   the exception that returns **both**: it FTS-searches the memory index
+   (`memory_fts` over each memory's name/description, kept in lockstep with the
+   memories, §11) and returns the best-matching memory's fact line **and its cover
+   photo ids to show** — so "find the memory in Borjomi" or "show me a memory"
+   works even though a memory's place/name is in no photo caption. A specific
+   query that matches nothing returns honest-empty; an empty query ("show me a
+   memory") returns the largest. `agent_retrieve` returns
    `(verified_ids, facts)`; the chat route appends any gathered facts to the
    grounding context before the final answer streams, so "how many photos do I
    have in total?" is answered from the real count (897), never by counting the
@@ -949,7 +1102,17 @@ layer first:
    (`is_aggregate_question` — "how many …", "number of …") fires the matching fact
    itself (`_auto_facts`) even if the model never calls the tool, and the chat
    route grounds such a question **on the fact alone** (dropping the candidate
-   photos), so a weak model cannot miscount the few photos shown.
+   photos), so a weak model cannot miscount the few photos shown. A "find/show me
+   a memory" question (`is_memory_show` — mentions a memory but is not a count) is
+   likewise routed to `find_memory` before any photo retrieval (`_auto_memory`),
+   returning the matched memory's photos to show grounded on its fact line — so
+   the answer is the memory itself, not a photo search that finds nothing. The UI
+   then renders that memory as the **same Organize memory card** (mosaic cover,
+   title, story — the shared `_album_card.html`), streamed to the client as an
+   `event: memory` after the answer text and re-derived server-side on history
+   reload (deterministic, so it needs no extra stored state). Its covers link with
+   `ctx=chat-memory:<key>` (§13.1), so opening one pages **within that memory**
+   exactly like the Organize leaf, while "close" returns to the conversation.
 5. **Context assembly** builds a compact block per verified photo: id, date,
    caption, top tags, and its EXIF facts — camera, lens, ISO, aperture, shutter,
    focal length, coordinates when present. ~60 tokens each. The facts let "what
@@ -963,16 +1126,17 @@ layer first:
 
 ```mermaid
 flowchart TB
-    quest["User question · /chat"] --> gate{"Off-topic gate<br/>one-word classifier: about the photos?"}
+    quest["User question · /chat"] --> lease["0 · require(CHAT) §8.1<br/>coordinator loads SigLIP + planner LLM · evicts captioner<br/>hard-preempts ingest · refuses if over RAM budget"]
+    lease --> gate{"Off-topic gate<br/>one-word classifier: about the photos?"}
     gate -->|no| refuse["Short refuse: answers only about your photos<br/>· skips retrieval entirely"]
     gate -->|yes| plan["1 · Plan → QuerySpec §9.1<br/>hard_filters (EXIF+date) + soft_tags hints"]
     plan --> core["2 · Core §9.2: candidates() + _hard_filter<br/>same fusion as /library · EXACT EXIF/date cut"]
     core -->|hard filter empties a non-empty pool| honestfilter["Honest 'couldn't find X'<br/>· NO sources (EXIF/date fact mismatch)"]
     core -->|survivors| rerank["3 · Caption-cosine rerank + floor (search/rerank.py)<br/>NOT core's refine() — its fused rank is unconditional content,<br/>which would resurrect confabulation · NO caption vector = kept"]
     rerank -->|nothing clears the floor| honest["Honest 'couldn't find X'<br/>· NO sources"]
-    rerank -->|candidates| loop["4 · Bounded verify / refine agent loop<br/>candidate tools: search · similar · nearby (same core)<br/>fact tools: count · memories · periods (no candidates, one fact)<br/>drops non-fits, never invents"]
-    loop --> ctx["5 · Context assembly<br/>~60 tok/photo: id · date · caption · tags · EXIF facts<br/>+ any gathered count/memories/periods facts"]
-    ctx --> ans["6 · Gemma answers, grounded ONLY on blocks + facts<br/>streams SSE · cites [photo:id] as thumbnails"]
+    rerank -->|candidates| loop["4 · Bounded verify / refine agent loop<br/>candidate tools: search · similar · nearby (same core)<br/>fact tools: count · memories · periods (no candidates, one fact)<br/>find_memory: memory_fts match → a memory's fact + its photos to show<br/>drops non-fits, never invents"]
+    loop --> ctx["5 · Context assembly<br/>~60 tok/photo: id · date · caption · tags · EXIF facts<br/>+ any gathered count/memories/periods/find_memory facts"]
+    ctx --> ans["6 · Gemma answers, grounded ONLY on blocks + facts<br/>streams SSE · cites [photo:id] as thumbnails<br/>find_memory hit → also streams the Organize memory card (event: memory)<br/>covers link ctx=chat-memory:key → page within the memory, close → /chat"]
 
     plan -.->|any failure → degrade| fb["plain semantic + keyword fusion<br/>chat/retrieve.py → core candidates() §9.2 · no second pipeline"]
     core -.-> fb
@@ -1109,7 +1273,12 @@ change**. Overlap is a feature to embrace, not a conflict to resolve.
    fragments the pooling split, and writes final titles/covers. It merges
    *memories*, never collapses the overlap between an event and a theme.
 5. **Persist.** Each memory → `groups(kind='memory')` + `group_photos`; a photo may
-   land in many. `params` records how it was built (kind, seed, model).
+   land in many. `params` records how it was built (kind, seed, model). The swap
+   is atomic (`albums/memory_store.py::replace_memories`) and, in the same
+   transaction, re-indexes each memory's name/description into `memory_fts` — the
+   index chat's `find_memory` searches (§10). Rebuilding memories rebuilds that
+   index in lockstep, so a memory is findable in chat the moment it exists and a
+   dropped memory disappears from search with it.
 
 The event-composition agent's `similar` expand tool (`albums/compose.py`) now
 goes through the one retriever core — `similar_photos` is a core wrapper (§9.2)
@@ -1121,12 +1290,13 @@ bound context. Runs only over processed photos.
 
 ```mermaid
 flowchart TB
+    lease["require(MEMORY_REBUILD) §8.1<br/>loads SigLIP + planner LLM · hard-preempts ingest"] --> lib
     lib["Owner's PROCESSED photos<br/>caption + embedding present"] --> pool["1 · Pool (cheap, NO decisions)<br/>coarse sessions by time + ~50 km region<br/>— only to bound context"]
     pool --> events["2 · Compose events (AGENT, per session)<br/>reads summaries, decides the carve<br/>tools: similar · facets · nearby-in-time · same-subject"]
     lib --> themes["3 · Discover themes (AGENT + RAG)<br/>propose thread → retrieve candidates → curate"]
     events --> recon["4 · Reconcile (AGENT)<br/>dedupe, merge fragments, final titles/covers<br/>keeps event⇆theme overlap"]
     themes --> recon
-    recon --> persist["5 · Persist<br/>groups(kind='memory') + group_photos (many-to-many)<br/>params = signature: owner count + newest updated_at"]
+    recon --> persist["5 · Persist (atomic swap)<br/>groups(kind='memory') + group_photos (many-to-many)<br/>+ re-index name/description → memory_fts (chat find_memory, §10)<br/>params = signature: owner count + newest updated_at"]
     persist --> ui["/organize?by=memories<br/>manual background rebuild · stale flag when signature moves"]
 ```
 
@@ -1295,6 +1465,16 @@ The tool moves other people's photographs, so its defaults are paranoid.
 
 ## 13. UI
 
+- **Resource bar** — a thin strip pinned to the top of **every** page. It polls
+  `GET /api/resources` (~2 s) and shows **RAM used / total**, **CPU load %**, and
+  the model coordinator's **current lease**: the active workload and its resident
+  model-set (e.g. `chat · SigLIP+qwen2.5:3b · 3.1/6.0 GB`), or `idle` when nothing
+  holds it. On the unified-memory Jetson system RAM *is* the GPU pool, so
+  used/total is the honest budget figure; a set refused for exceeding the budget
+  (§8.1) shows here too. It makes the whole load/unload/preempt mechanism
+  observable — you watch the captioner unload the instant chat takes the lease.
+  Backed by `psutil`; profile-agnostic. (GPU-specific `tegrastats` metrics are
+  future work — §18.)
 - `/upload` — leads with the **folder list**: every folder in the library
   (§3.2c) with its photo count and a confirm-guarded **Delete from library**
   button (a folder mid-deletion shows "deleting…"). Below it, a **directory-only**
@@ -1385,7 +1565,10 @@ The tool moves other people's photographs, so its defaults are paranoid.
   independently — retrieval runs per question, and the persisted history is the
   transcript, not multi-turn model memory. A cited thumbnail opens the photo as a
   **leaf of the chat grid** (`ctx=chat`, §13.1), so closing it returns to the
-  conversation, not the library.
+  conversation, not the library. A **"show me a memory"** answer additionally
+  renders that memory as the **same Organize memory card** below the reply; opening
+  a photo from it pages **within the memory** (`ctx=chat-memory:<key>`) and closes
+  back to the conversation (§10, §13.1).
 
 The nav order is **Upload → Library → Chat → Organize**: bring photos in, browse
 and search them, ask about them to understand the collection, then — last, once
@@ -1412,6 +1595,12 @@ drill-down follows them exactly.
    - `ctx=chat` → the grid is the **conversation**; close returns to `/chat`. A
      cited thumbnail carries this ctx, and it pages within the photos the current
      chat session cited (its evidence set), never the wider library.
+   - `ctx=chat-memory:<key>` → a **memory shown in chat**. The grid is that memory
+     (resolved by the Organize album `<key>`), so it pages within the memory's
+     photos and shows the whole-memory collage exactly like the Organize leaf — but
+     close returns UP to `/chat`, the conversation it was surfaced in, not to
+     `/organize`. It is the one ctx whose grid (a memory) and close-target (the
+     chat) differ, because the memory is browsed *through* the conversation.
 
 3. **History invariant: `[grid, leaf]` — depth two, always.** Grid→leaf (clicking
    a photo in a grid) is the ONE `push`. Every move at the leaf level —

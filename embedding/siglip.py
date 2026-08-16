@@ -1,3 +1,4 @@
+import gc
 from functools import lru_cache
 
 import numpy as np
@@ -58,3 +59,21 @@ def get_siglip_embedder(model_name: str, device: str) -> SiglipEmbedder:
     photo click no longer reloads it.
     """
     return SiglipEmbedder(model_name, device)
+
+
+def release_siglip_embedder() -> None:
+    """Drop the cached SigLIP model and return its GPU allocation to the driver.
+
+    On a unified-memory Jetson (8 GB shared CPU+GPU) SigLIP and the Ollama vision
+    captioner cannot both be resident: a loaded SigLIP pins torch's CUDA caching
+    allocator, so CUDA reports almost no free memory and Ollama silently offloads
+    the captioner to the CPU (≈20× slower). The worker calls this after the
+    embed/taxonomy stages and before the caption stage, so the captioner gets the
+    GPU (design §8). `empty_cache()` is what actually hands the freed blocks back
+    to the driver — clearing the cache only drops Python references.
+    """
+    get_siglip_embedder.cache_clear()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()

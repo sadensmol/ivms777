@@ -222,3 +222,35 @@ img.cite { height: 40px; width: 40px; object-fit: cover; border-radius: 4px;
 .chat-input button:hover { background: #3a6bec; }
 .chat-input button:active { transform: translateY(1px); }
 .chat-input button:disabled { background: #2a2a2a; color: #777; cursor: default; }
+
+/* A memory shown in chat: the shared Organize album card, sized to sit under the
+   answer bubble. Reuses .album / .album-* styles verbatim (§10, §13.1). */
+.msg-memory { margin-top: 8px; width: 300px; max-width: 100%; }
+
+/* ---- Small screens / mobile ---- */
+@media (max-width: 760px) {
+  main { padding: 1rem; }
+  .nav { gap: 1rem; padding: 0.7rem 1rem; overflow-x: auto; }
+
+  /* /photo: stack the panel UNDER the photo so the image fits the width and the
+     text reads top-to-bottom — photo, then title/caption/story, then tags, then
+     EXIF/files last — instead of a tall letterboxed image beside a squished,
+     vertically-wrapping sidebar. Desktop keeps the side-by-side layout. */
+  .photo-view { flex-direction: column; height: auto; gap: 1rem; }
+  .photo-stage { flex: none; width: 100%; height: auto; min-height: 40vh; max-height: 72vh; }
+  .photo-full { max-height: 72vh; }
+  .photo-panel { flex: none; width: 100%; max-height: none; overflow: visible; padding-right: 0; }
+
+  /* Denser galleries so a memory's / similar photos aren't one giant tile per row. */
+  .collection-collage, .similar-strip {
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 0.5rem; }
+  .collage-item img, .similar-item img { height: 150px; }
+
+  /* Library / organize / album grids get smaller minimums so they don't overflow. */
+  .grid { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); }
+  .albums { grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
+
+  /* Chat: use more of the narrow width. */
+  .msg { max-width: 92%; }
+  .msg-memory { width: 100%; }
+}

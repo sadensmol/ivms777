@@ -4,7 +4,7 @@ from pathlib import Path
 import sqlite_vec
 
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 class SchemaTooOldError(RuntimeError):
@@ -64,7 +64,20 @@ def migrate(conn: sqlite3.Connection) -> None:
     # of the stamped version: create any missing tables, add any missing columns.
     conn.executescript(SCHEMA_PATH.read_text())
     _ensure_columns(conn)
+    _backfill_memory_fts(conn)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+
+def _backfill_memory_fts(conn: sqlite3.Connection) -> None:
+    """Index any memory that predates `memory_fts` (built before this column
+    existed), so chat's `find_memory` works without a forced rebuild. Idempotent:
+    only memories missing from the index are inserted."""
+    conn.execute(
+        "INSERT INTO memory_fts(rowid, name, description)"
+        " SELECT g.id, g.name, COALESCE(g.description, '') FROM groups g"
+        " WHERE g.kind = 'memory'"
+        "   AND NOT EXISTS (SELECT 1 FROM memory_fts m WHERE m.rowid = g.id)"
+    )
 
 
 def _ensure_columns(conn: sqlite3.Connection) -> None:

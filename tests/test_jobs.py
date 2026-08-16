@@ -1,4 +1,4 @@
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from ingest.jobs import (
     MAX_ATTEMPTS,
@@ -44,7 +44,7 @@ def _done_at(conn, photo_id, stage, when):
 
 def test_stage_speed_measures_recent_throughput(conn):
     # 5 captions finished 2s apart -> 4 intervals over 8s -> 0.5/s.
-    base = datetime(2026, 1, 1, tzinfo=UTC)
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
     for i in range(5):
         _done_at(conn, i + 1, "caption", base + timedelta(seconds=2 * i))
     assert abs(stage_speed(conn, "caption") - 0.5) < 1e-9
@@ -52,14 +52,14 @@ def test_stage_speed_measures_recent_throughput(conn):
 
 def test_stage_speed_none_without_two_completions(conn):
     assert stage_speed(conn, "caption") is None
-    _done_at(conn, 1, "caption", datetime(2026, 1, 1, tzinfo=UTC))
+    _done_at(conn, 1, "caption", datetime(2026, 1, 1, tzinfo=timezone.utc))
     assert stage_speed(conn, "caption") is None  # one completion can't span a rate
 
 
 def test_stage_speed_survives_restart_via_persisted_job_history(conn):
     # The rate is read from jobs.updated_at, which persists — no in-memory state,
     # so a fresh process (this fresh conn) still reports the last speed.
-    base = datetime(2026, 1, 1, tzinfo=UTC)
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
     for i in range(3):
         _done_at(conn, i + 1, "embed", base + timedelta(seconds=i))  # 2 intervals / 2s = 1/s
     assert abs(stage_speed(conn, "embed") - 1.0) < 1e-9

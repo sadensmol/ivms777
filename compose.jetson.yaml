@@ -1,8 +1,17 @@
-# Jetson profile: fully containerised, including inference.
+# Jetson profile (JetPack 7): fully containerised, including inference.
 #
-# JetPack ships the NVIDIA container runtime, so the GPU is available inside
-# containers. 8 GB shared memory means a 4B-class caption model.
+# The NVIDIA container runtime hands the Orin iGPU to containers on JetPack 7, so
+# GPU is available inside all three services via `runtime: nvidia`. 8 GB shared
+# memory means a 4B-class caption model.
 services:
+  # Generic ollama on the NVIDIA container runtime — text inference (planner/chat)
+  # runs on the Orin GPU. NOTE: image CAPTIONING (the vision/mtmd path) hangs on
+  # JetPack 7 with this build (an upstream ollama/llama.cpp bug on Orin/JP7 — text
+  # works, any image request deadlocks at 0% CPU). NVIDIA's JP7 ollama image
+  # (ghcr.io/nvidia-ai-iot/ollama:*) has the sm_87 vision kernels but its r38.2/cu13.0
+  # build crashes on this r39.2/cu13.2 box; revisit when a matching r39/cu132 tag
+  # ships. Until then captions stay pending; everything else (embed/tags/search/chat)
+  # works on the GPU. See docs/design.md §3.1.
   inference:
     image: ollama/ollama:latest
     runtime: nvidia
@@ -14,16 +23,38 @@ services:
       - "11434:11434"
 
   # SigLIP runs in-process in app and worker with embed_device=cuda, so both need
-  # GPU access — not just the inference container.
+  # GPU access — not just the inference container. Both build from Dockerfile.jetson
+  # (python:3.12-slim + cu132 torch), which gives CUDA torch on JetPack 7; the
+  # default python:3.12-slim image's aarch64 torch is CPU-only. See docs/design.md §3.1.
+  #
+  # 8 GB Orin: caption + planner default to a 4B-class captioner and a 3B planner
+  # (config.py jetson defaults). Override via IVMS777_CAPTION_MODEL /
+  # IVMS777_PLANNER_MODEL — `make run-jetson` passes them through and pulls them.
   app:
+    build:
+      context: .
+      dockerfile: Dockerfile.jetson
     runtime: nvidia
     environment:
+      # The slim base doesn't declare these (the ollama image does), so without
+      # them the nvidia runtime injects no driver libs and torch sees no GPU.
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: all
       IVMS777_PROFILE: jetson
+      IVMS777_CAPTION_MODEL: ${IVMS777_CAPTION_MODEL:-qwen2.5vl:3b}
+      IVMS777_PLANNER_MODEL: ${IVMS777_PLANNER_MODEL:-qwen2.5:3b}
     depends_on: [inference]
   worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.jetson
     runtime: nvidia
     environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: all
       IVMS777_PROFILE: jetson
+      IVMS777_CAPTION_MODEL: ${IVMS777_CAPTION_MODEL:-qwen2.5vl:3b}
+      IVMS777_PLANNER_MODEL: ${IVMS777_PLANNER_MODEL:-qwen2.5:3b}
     depends_on: [inference]
 
 volumes:

@@ -2,13 +2,13 @@ import html
 import json
 import re
 import sqlite3
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 _CITE = re.compile(r"\[photo:(\d+)\]")
 
 
 def _now() -> str:
-    return datetime.now(UTC).isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 def cited_ids(answer: str) -> list[int]:

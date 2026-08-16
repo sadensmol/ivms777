@@ -17,9 +17,13 @@ from fastapi.templating import Jinja2Templates
 from albums.by_date import DEFAULT_GRAIN, GRAIN_LABELS, ByDateOrganizer
 from albums.memories import MemoriesOrganizer
 from albums.memories_build import build_memories
-from albums.memory_store import current_signature, stored_signature
+from albums.memory_store import (
+    album_key_for_group,
+    current_signature,
+    stored_signature,
+)
 from albums.registry import ORGANIZERS, get_organizer
-from chat.agent import agent_retrieve, is_aggregate_question
+from chat.agent import agent_retrieve, is_aggregate_question, memory_for_show
 from chat.context import build_context as build_chat_context
 from chat.history import (
     add_message,
@@ -31,10 +35,7 @@ from chat.history import (
 from chat.retrieve import is_photo_question
 from config import Settings
 from inference.prompts import chat_messages
-from ingest.caption import backfill_caption_vectors, backfill_captions, caption_handler
-from ingest.embed import backfill_embeds, embed_handler
-from ingest.facets import backfill_place_facets
-from ingest.folders import enqueue_folder_deletion, list_folders, process_folder_deletions
+from ingest.folders import enqueue_folder_deletion, list_folders
 from ingest.jobs import (
     STAGES,
     format_speed,
@@ -43,10 +44,9 @@ from ingest.jobs import (
     stage_counts,
     stage_speed,
 )
-from ingest.taxonomy import backfill_taxonomy, taxonomy_handler
-from ingest.thumbs import backfill_thumbnails, thumb_key
+from ingest.pipeline import drain_pass
+from ingest.thumbs import thumb_key
 from ingest.vocab import load_vocab, seed_tags
-from ingest.worker import drain, thumbnail_handler
 from search.dates import date_where
 from search.facets import (
     SIDEBAR_GROUPS,
@@ -83,6 +83,14 @@ DUPES_ONLY = (
 )
 
 DEFAULT_ORDER = " ORDER BY COALESCE(p.shot_at, p.created_at) DESC, p.id DESC"
+
+
+def _has_member_collage(ctx_param: str | None) -> bool:
+    # A bounded collection — an Organize album, or a memory shown in chat — renders
+    # its WHOLE set as a collage on the leaf, and its members are excluded from the
+    # "similar" strip. The library/search/similar collections are unbounded, so they
+    # get neither (§13).
+    return bool(ctx_param) and ctx_param.startswith(("album:", "chat-memory:"))
 
 
 def _order_clause(sort: str | None) -> tuple[str, list]:
@@ -144,42 +152,15 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.await_build = await_build
 
     def drain_now() -> None:
-        """Build thumbnails and embeddings for whatever has arrived.
+        """Run one ingest pass for whatever has arrived.
 
-        The `worker` container drains continuously in deployment. Doing it here
-        too means a single-container run — and every test — still produces a
-        usable, searchable grid without waiting on a poll.
+        The `worker` container drains continuously in deployment; doing it here too
+        means a single-container run — and every test — still produces a usable,
+        searchable grid without waiting on a poll. The pass itself (`drain_pass`) is
+        the single shared pipeline used by both, and it runs the GPU-free thumbnail
+        stage even when the embedder/inference backend is down (§8).
         """
-        ctx = context()
-        embedder, model_name = ctx.settings.build_embedder()
-        client, caption_model = ctx.settings.build_inference_client()
-        backfill_thumbnails(ctx.conn)
-        backfill_embeds(ctx.conn)
-        backfill_taxonomy(ctx.conn)
-        backfill_place_facets(ctx.conn)
-        backfill_captions(ctx.conn)
-        backfill_caption_vectors(ctx.conn, client, ctx.settings.caption_embed_model)
-        process_folder_deletions(
-            ctx.conn, ctx.originals, ctx.derived, ctx.settings.owner_id,
-            ctx.settings.thumb_grid_px, ctx.settings.thumb_detail_px,
-        )
-        drain(
-            ctx.conn,
-            {
-                "thumbnail": thumbnail_handler(
-                    ctx.originals,
-                    ctx.derived,
-                    ctx.settings.thumb_grid_px,
-                    ctx.settings.thumb_detail_px,
-                ),
-                "embed": embed_handler(ctx.originals, embedder, model_name),
-                "taxonomy": taxonomy_handler(ctx.derived, embedder, vocab),
-                "caption": caption_handler(
-                    ctx.derived, client, caption_model, ctx.settings.caption_embed_model,
-                    list(vocab.dimensions), ctx.settings.thumb_detail_px,
-                ),
-            },
-        )
+        drain_pass(context(), vocab)
 
     register_upload_api(app, context, drain_now)
 
@@ -537,6 +518,17 @@ def create_app(settings: Settings) -> FastAPI:
                         return {"ids": album.photo_ids, "title": album.title,
                                 "description": album.description}
             # The album is gone (e.g. memories rebuilt) — fall back to the library.
+        if ctx_param and ctx_param.startswith("chat-memory:"):
+            # A memory shown IN chat, drilled into: the grid IS that memory, so it
+            # pages within the memory's photos exactly like the Organize leaf does
+            # — same resolution as `album:memories`, only the origin differs (close
+            # returns to /chat, see _origin_url). §10, §13.1.
+            key = ctx_param.split(":", 1)[1]
+            for album in get_organizer(MemoriesOrganizer.name).organize(ctx.conn, owner):
+                if album.key == key:
+                    return {"ids": album.photo_ids, "title": album.title,
+                            "description": album.description}
+            # The memory is gone (rebuilt) — fall back to the library.
         if ctx_param and ctx_param.startswith("similar:"):
             # Drilled into a photo FROM another photo's "similar" strip: this layer
             # IS that origin photo's similar set, and it pages within it (§9, §13).
@@ -610,7 +602,9 @@ def create_app(settings: Settings) -> FastAPI:
 
     def _origin_url(ctx_param: str | None, params: dict[str, str]) -> str:
         # The layer a photo was opened from — where "close" returns to.
-        if ctx_param == "chat":
+        if ctx_param == "chat" or (ctx_param and ctx_param.startswith("chat-memory:")):
+            # A memory shown in chat pages within the memory, but "close" goes back
+            # UP to the conversation it was surfaced in, not to Organize (§13.1).
             return "/chat"
         if ctx_param and ctx_param.startswith("album:"):
             parts = ctx_param.split(":", 3)
@@ -662,7 +656,7 @@ def create_app(settings: Settings) -> FastAPI:
         # A memory/album is a bounded set, so the leaf can show the WHOLE collection
         # as a collage (§13). The library/search/similar collections are unbounded
         # or already shown, so they get no collage.
-        collection_grid = ids if (ctx_param and ctx_param.startswith("album:")) else None
+        collection_grid = ids if _has_member_collage(ctx_param) else None
 
         # Opened from another photo's "similar" strip: explain the match, base vs
         # this photo, strongest facet first (§13).
@@ -719,7 +713,7 @@ def create_app(settings: Settings) -> FastAPI:
         params = _params(request)
         ctx_param = params.get("ctx")
         _collection, ctx_param, ids = _collection_for_photo(ctx_param, params, photo_id)
-        collection_grid = ids if (ctx_param and ctx_param.startswith("album:")) else None
+        collection_grid = ids if _has_member_collage(ctx_param) else None
         if collection_grid:
             # Don't repeat the collection's own photos in the "similar" strip — the
             # collage already shows them; a member appearing twice is noise (§13).
@@ -767,15 +761,42 @@ def create_app(settings: Settings) -> FastAPI:
         "them, or when and where they were taken."
     )
 
+    def _memory_card_html(question: str) -> str | None:
+        # The Organize memory card for a "show me a memory" question, rendered as
+        # HTML so chat shows the memory ITSELF (mosaic + title + story), not just
+        # prose. Reuses the shared `_album_card.html` and links carry
+        # ctx=chat-memory:<key>, so drilling in pages within the memory and "close"
+        # returns to the conversation (§10, §13.1). Re-derived from the question
+        # (deterministic) — no extra stored state, and history re-renders it.
+        ctx = context()
+        owner = ctx.settings.owner_id
+        memory = memory_for_show(ctx.conn, owner, question)
+        if memory is None:
+            return None
+        key = album_key_for_group(ctx.conn, owner, memory["id"])
+        if key is None:
+            return None
+        for album in get_organizer(MemoriesOrganizer.name).organize(ctx.conn, owner):
+            if album.key == key:
+                return templates.env.get_template("_album_card.html").render(
+                    album=album, ctx=f"ctx=chat-memory:{key}"
+                )
+        return None
+
     @app.get("/chat", response_class=HTMLResponse)
     def chat_page(request: Request) -> HTMLResponse:
-        # Render the current session's persisted turns as static history (§10).
+        # Render the current session's persisted turns as static history (§10). A
+        # "show me a memory" turn also re-renders its memory card, so the memory
+        # survives reload just like the answer text does.
         ctx = context()
         session_id = current_session(ctx.conn, ctx.settings.owner_id)
+        messages = session_messages(ctx.conn, session_id)
+        for m in messages:
+            m["memory_html"] = _memory_card_html(m["question"])
         return templates.TemplateResponse(
             request, "chat.html",
             {
-                "messages": session_messages(ctx.conn, session_id),
+                "messages": messages,
                 "model": ctx.settings.planner_model or "fake",
             },
         )
@@ -849,6 +870,13 @@ def create_app(settings: Settings) -> FastAPI:
             tok_per_sec = round(len(parts) / elapsed, 1) if elapsed > 0 else None
             answer = "".join(parts)
             add_message(ctx.conn, session_id, q, answer, cited_ids(answer))
+            # A "show me a memory" turn also streams the memory card itself, so the
+            # answer isn't only prose — the memory renders below it, drillable and
+            # paged exactly like the Organize view (§10, §13.1). Only for memory-show
+            # questions; a normal answer never carries one.
+            card = _memory_card_html(q)
+            if card is not None:
+                yield "event: memory\ndata: " + json.dumps({"html": card}) + "\n\n"
             yield _done(tok_per_sec=tok_per_sec, tokens=len(parts))
 
         return StreamingResponse(events(), media_type="text/event-stream")

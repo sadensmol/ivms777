@@ -1,8 +1,11 @@
+import logging
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger("ivms777.upload")
 
 from ingest.receive import (
     HashMismatchError,
@@ -37,7 +40,7 @@ class FinishRequest(BaseModel):
 
 
 def _now() -> str:
-    return datetime.now(UTC).isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 def register(
@@ -144,7 +147,20 @@ def register(
         ctx.conn.execute(
             "UPDATE uploads SET finished_at = ? WHERE id = ?", (_now(), payload.upload_id)
         )
-        drain_now()
+        # The upload RECEIPT is complete once the bytes are stored and the jobs are
+        # queued — processing is the `worker`'s job (§5, §8). Drain inline too, as a
+        # convenience so a single-container / mac run produces a usable grid without
+        # waiting on a poll — but BEST-EFFORT: a drain failure (e.g. the app
+        # container cannot init CUDA on jetson) must never fail the upload, which
+        # already succeeded. The jobs stay pending and visible in the UI, and the
+        # worker container drains them regardless.
+        try:
+            drain_now()
+        except Exception:  # a convenience drain must never fail the receipt
+            logger.exception(
+                "inline drain after upload %s failed; the worker will process it",
+                payload.upload_id,
+            )
         row = ctx.conn.execute(
             "SELECT files_offered, files_sent, files_failed FROM uploads WHERE id = ?",
             (payload.upload_id,),
