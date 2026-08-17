@@ -27,10 +27,13 @@ class RemoteInferenceClient:
         *,
         json_schema: dict | None = None,
         timeout: float = 120.0,
+        temperature: float | None = None,
         should_stop: Callable[[], bool] | None = None,
     ) -> str:
         # `should_stop` is ignored: no app/worker text caller passes it (caption
         # preemption, §8.1, is internal to the service now) — see Ruling R1/R5.
+        # `temperature` is accepted for interface parity; forwarding it through the
+        # models-service text endpoint is pending plan-15 gateway work.
         return self._client.text_complete(
             model, messages, json_schema=json_schema, timeout=timeout
         )
@@ -41,6 +44,7 @@ class RemoteInferenceClient:
         messages: list[ChatMessage],
         *,
         timeout: float = 120.0,
+        temperature: float | None = None,
     ) -> Iterator[str]:
         yield from self._client.text_stream(model, messages, timeout=timeout)
 

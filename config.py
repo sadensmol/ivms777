@@ -7,40 +7,39 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 Profile = Literal["mac", "jetson", "cloud"]
 
-# Real, currently-pullable model tags. Override per-deploy with IVMS777_CAPTION_MODEL
-# / IVMS777_PLANNER_MODEL. Caption models must be vision-capable.
+# Model ids per profile. On mac/jetson `llama-server` serves ONE gemma GGUF for
+# BOTH text (planner/chat) and vision (caption) over the OpenAI `/v1` API, so
+# both names point at the same model (plan 16, design §3.1/§4/§5.1). The name is
+# passed through for storage/display; `llama-server` serves whatever `-m` loaded.
+# Override per-deploy with IVMS777_CAPTION_MODEL / IVMS777_PLANNER_MODEL.
 PROFILE_DEFAULTS: dict[Profile, dict[str, object]] = {
     "mac": {
-        "caption_model": "qwen2.5vl:7b",
-        "planner_model": "qwen2.5:3b",
+        # One gemma4-E2B GGUF on a host-native llama-server (Metal), reached from
+        # the containers at host.docker.internal:8080 (design §3.1, plan 16).
+        "caption_model": "gemma4-E2B",
+        "planner_model": "gemma4-E2B",
         "embed_device": "cpu",
-        "inference_base_url": "http://host.docker.internal:11434/v1",
+        "inference_base_url": "http://host.docker.internal:8080/v1",
         "ram_budget_mb": 24000,
-        "caption_backend": "ollama",
-        # Placeholder until the `models` service (design §5.1, plan 15) is
-        # actually deployed per profile.
         "models_base_url": "http://models:9000",
     },
     "jetson": {
-        "caption_model": "qwen2.5vl:3b",
-        "planner_model": "qwen2.5:3b",
+        # One gemma4-E2B GGUF on a containerised sm_87 CUDA llama-server, text +
+        # vision on the GPU (design §3.1, plan 16). No Ollama, no in-process VLM.
+        "caption_model": "gemma4-E2B",
+        "planner_model": "gemma4-E2B",
         "embed_device": "cuda",
-        "inference_base_url": "http://inference:11434/v1",
+        "inference_base_url": "http://inference:8080/v1",
         "ram_budget_mb": 6000,
-        # Ollama's CUDA build runs vision on CPU on JP7 (no Orin sm_87 vision
-        # kernels), so jetson captions in-process instead (design §3.1/§4/§8.1).
-        "caption_backend": "inprocess",
-        "caption_model_id": "Qwen/Qwen2.5-VL-3B-Instruct",
         "models_base_url": "http://models:9000",
     },
     "cloud": {
-        # vLLM serves whatever VLLM_MODEL is set to; point these at that model.
+        # cloud is unchanged by plan 16 — still vLLM (open item).
         "caption_model": "qwen2.5vl:7b",
         "planner_model": "qwen2.5:3b",
         "embed_device": "cuda",
         "inference_base_url": "http://inference:8000/v1",
         "ram_budget_mb": 60000,
-        "caption_backend": "ollama",
         "models_base_url": "http://models:9000",
     },
 }
@@ -54,22 +53,18 @@ class Settings(BaseSettings):
 
     caption_model: str | None = None
     planner_model: str | None = None
-    # Dedicated text embedder for caption semantics (§9). A chat/planner model
-    # cannot embed (no embedding head — Ollama returns 501), and SigLIP's text tower
-    # has no text↔text separation (design §4), so this is a purpose-built text
-    # embedder — `nomic-embed-text` by default (benchmarked on real captions, §4).
-    text_embed_model: str = "nomic-embed-text"
+    # Dedicated text embedder for caption semantics (§9). A chat model cannot
+    # embed (no embedding head), and SigLIP's text tower has no text↔text
+    # separation (design §4), so this is a purpose-built text embedder —
+    # `nomic-embed-text-v1.5` by default (benchmarked on real captions, §4). Since
+    # plan 16 drops Ollama, it is loaded IN-PROCESS in the `models` service (mac +
+    # jetson) via `transformers`, not served by a text backend (design §4/§5.1).
+    text_embed_model: str = "nomic-ai/nomic-embed-text-v1.5"
     embed_device: Literal["cpu", "cuda", "mps"] | None = None
     inference_base_url: str | None = None
-    # Captioner adapter selection (design §4, §8.1): "ollama" (mac/cloud, today's
-    # path) vs "inprocess" (jetson — transformers 4-bit VLM on the cu132 GPU,
-    # because Ollama's CUDA build runs vision on CPU on JP7). caption_model_id is
-    # the HF repo id used only by the inprocess backend.
-    caption_backend: Literal["ollama", "inprocess"] | None = None
-    caption_model_id: str | None = None
     # Base URL of the `models` service (design §5.1, plan 15) — the one process
-    # that imports torch/transformers and the only client of Ollama.
-    # `app`/`worker` reach every model/LLM through `build_models_client()`.
+    # that imports torch/transformers and the only client of every inference
+    # backend. `app`/`worker` reach every model/LLM through `build_models_client()`.
     models_base_url: str | None = None
 
     owner_id: int = 1
@@ -135,17 +130,19 @@ class Settings(BaseSettings):
 
     @property
     def caption_embed_model(self) -> str:
-        """Dedicated text embedder for caption meaning (§9), served by Ollama —
-        `nomic-embed-text` by default. NOT the planner (a chat model can't embed)
-        and NOT SigLIP (no text↔text separation). See `text_embed_model`."""
+        """Dedicated text embedder for caption meaning (§9) — `nomic-embed-text-v1.5`
+        by default, loaded in-process in the `models` service (design §4/§5.1). NOT
+        the planner (a chat model can't embed) and NOT SigLIP (no text↔text
+        separation). See `text_embed_model`."""
         return self.text_embed_model
 
     def build_inference_client(self):
         """Return (client, caption_model).
 
         Defaults to `RemoteInferenceClient`, an HTTP shim over the `models`
-        service (design §5.1) — the real Ollama client now lives there, never
-        in this process. Tests set `use_fake_inference` to get the in-process
+        service (design §5.1) — the real inference client (llama-server on
+        mac/jetson, vLLM on cloud) now lives there, never in this process. Tests
+        set `use_fake_inference` to get the in-process
         `FakeInferenceClient` instead. Imports are local so importing `config`
         never pulls in `httpx`/torch until a caller actually builds a client;
         this module itself never imports `OpenAICompatClient`.

@@ -16,7 +16,7 @@ def is_photo_question(client: InferenceClient, model: str, question: str) -> boo
     that blocks real photo searches.
     """
     try:
-        answer = client.complete(model, intent_messages(question), timeout=10.0)
+        answer = client.complete(model, intent_messages(question), timeout=10.0, temperature=0)
         return not answer.strip().lower().startswith("n")
     except Exception:  # noqa: BLE001 - the gate is best-effort; default to answering
         return True

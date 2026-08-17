@@ -61,16 +61,19 @@ def caption_messages(
 
 
 _CHAT_SYSTEM = (
-    "You answer questions about a personal photo library. Use ONLY the photos "
-    "provided below — their captions, tags, and EXIF facts — plus any fact lines "
-    "already given in the context (lines starting with 'count:', 'memories:', or "
-    "'month(s)/year(s) with photos:'). Never invent photos, people, places, or "
-    "dates. For totals or counts, use the count/memories/periods fact given in "
-    "the context — never guess or infer a count from the number of photos shown "
-    "below. State the number in a natural sentence; do NOT quote the raw fact "
-    "line or say \"the fact provided\". Cite every photo you rely on inline as [photo:ID], using the exact ID "
-    "from the context. If no photos are provided, or none are relevant, say you "
-    "have no photos matching that and stop."
+    "You answer questions about a personal photo library STRICTLY from the context "
+    "below — photo captions, tags, and EXIF facts, plus any fact lines already given "
+    "(lines starting with 'count:', 'memories:', or 'month(s)/year(s) with photos:'). "
+    "A photo matches the question ONLY IF its caption or tags EXPLICITLY contain what "
+    "is asked. NEVER infer, assume, or invent a subject, person, animal, place, object, "
+    "or date that is not written in that photo's caption/tags — if the caption does not "
+    "mention it, the photo does NOT match, so leave it out. Do not describe a photo "
+    "beyond what its caption says. Cite EVERY matching photo, and ONLY matching photos, "
+    "inline as [photo:ID] using the exact ID from the context. "
+    "For totals or counts, use the count/memories/periods fact given in the context — "
+    "never guess or infer a count from the number of photos shown. State the number in "
+    "a natural sentence; do NOT quote the raw fact line or say \"the fact provided\". "
+    "If no photos are provided, or none match, say you have no photos matching that and stop."
 )
 
 
@@ -108,4 +111,21 @@ def chat_messages(question: str, context_block: str) -> list[ChatMessage]:
     return [
         {"role": "system", "content": _CHAT_SYSTEM},
         {"role": "user", "content": user},
+    ]
+
+
+_GENERAL_SYSTEM = (
+    "You are a helpful assistant inside a personal photo app. Answer the user's "
+    "question directly and concisely from your own knowledge. This message was routed "
+    "as NOT about the user's own photos or memories, so do not mention searching their "
+    "library or say you have no matching photos — just answer the question."
+)
+
+
+def general_chat_messages(question: str) -> list[ChatMessage]:
+    """Non-photo chat (plan 17): the message was routed as general knowledge / chit-chat,
+    so answer it directly — chat is not limited to photo questions."""
+    return [
+        {"role": "system", "content": _GENERAL_SYSTEM},
+        {"role": "user", "content": question},
     ]

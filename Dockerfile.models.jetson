@@ -1,8 +1,16 @@
-# Jetson Orin Nano (JetPack 7) build of the `models` service — GPU SigLIP +
-# in-process caption VLM. Repurposed from the old `Dockerfile.jetson`, which
-# used to build app/worker directly; now app/worker are torch-free thin
-# clients (Dockerfile) and only this service loads models (design §5.1,
-# plan 15 task 6).
+# syntax=docker/dockerfile:1
+# Jetson Orin Nano (JetPack 7) build of the `models` service — GPU SigLIP + the
+# in-process caption-text embedder (nomic). Since plan 16 there is NO in-process
+# caption VLM (captioning is an OpenAI call to the llama-server `inference`
+# service), so this image no longer ships bitsandbytes/accelerate or a C toolchain
+# — just cu132 torch for SigLIP + the text embedder. app/worker are torch-free
+# thin clients (Dockerfile); only this service loads models (design §5.1).
+#
+# The `uv sync` / `uv pip install` steps use a BuildKit **cache mount** for uv's
+# download cache (see the `# syntax` directive on line 1), so the multi-GB
+# torch/transformers wheels are stored on the builder and REUSED on every rebuild
+# — a dependency change (or `--reinstall`) rebuilds the layer but no longer
+# re-downloads the wheels.
 #
 # The normal Dockerfile.models installs `torch` from PyPI, whose only aarch64
 # wheel is CPU-only, so `embed_device=cuda` would fail. On JetPack 7 (L4T r39,
@@ -22,12 +30,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libheif1 libjpeg62-turbo zlib1g libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
 
-# gcc: Triton needs a C compiler at import time to JIT-compile kernels for the
-# in-process captioner's 4-bit quantization (bitsandbytes), so the slim base's
-# missing toolchain would crash the first caption call, not the image build.
-RUN apt-get update && apt-get install -y --no-install-recommends gcc \
-    && rm -rf /var/lib/apt/lists/*
-
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 WORKDIR /app
@@ -39,14 +41,11 @@ COPY pyproject.toml uv.lock* README.md ./
 # come from the same index so the pair is ABI-compatible; the cu132 wheels are
 # built against NumPy 2.x, matching pyproject's `numpy>=2.5.2` floor (no
 # Jetson-specific numpy pin any more).
-RUN uv sync --no-dev --extra models --frozen || uv sync --no-dev --extra models
-RUN uv pip install --reinstall torch torchvision \
+RUN --mount=type=cache,target=/root/.cache/uv \
+      uv sync --no-dev --extra models --frozen || uv sync --no-dev --extra models
+RUN --mount=type=cache,target=/root/.cache/uv \
+      uv pip install --reinstall torch torchvision \
       --index-url https://download.pytorch.org/whl/cu132
-
-# In-process caption backend (design §3.1/§4/§8.1): Qwen2.5-VL-3B 4-bit via
-# transformers on the cu132 GPU, since Ollama's CUDA build has no Orin sm_87
-# vision kernels. Jetson-only — mac/cloud never install these.
-RUN VIRTUAL_ENV=/app/.venv uv pip install bitsandbytes accelerate
 
 # Flat layout: only the modules the models service actually imports — it
 # never touches web/chat/ingest/search/storage/db/albums.

@@ -48,36 +48,39 @@ below). Ingest is identical everywhere — photos always arrive by upload
 
 | Profile | Inference | Caption model | Planner / chat model | Embed device |
 |---|---|---|---|---|
-| `mac` | Ollama on the **host** | `qwen2.5vl:7b` | `qwen2.5:3b` | `cpu` |
-| `jetson` | Ollama in a container (text only, see below) | Qwen2.5-VL-3B, 4-bit, **in-process** | `qwen2.5:3b` (Ollama) | `cuda` |
+| `mac` | `llama-server` on the **host** (Metal) | `gemma4-E2B` | `gemma4-E2B` | `cpu` |
+| `jetson` | `llama-server` in a container (sm_87 CUDA) | `gemma4-E2B` | `gemma4-E2B` | `cuda` |
 | `cloud` | vLLM in a container, `--gpus all` | `qwen2.5vl:7b` | `qwen2.5:3b` | `cuda` |
 
-The caption model must be **vision-capable**. On `mac`/`cloud` the tags above are
-the shipping defaults in `config.py` — real, currently-pullable Ollama models —
-overridable with `IVMS777_CAPTION_MODEL` / `IVMS777_PLANNER_MODEL`. On `jetson`
-the caption model is instead a Hugging Face repo id (`caption_model_id`, default
-`Qwen/Qwen2.5-VL-3B-Instruct`), since it loads in-process rather than through
-Ollama — see below. The "Gemma 4" family named in the rationale below (§4) is the
-intended target once it is available on Ollama; until then Qwen2.5-VL is the
-working default.
+Since plan 16, `mac` and `jetson` run **one gemma4-E2B GGUF on llama.cpp
+`llama-server`**, which serves **both** the caption (vision) and planner/chat
+(text) roles over the OpenAI `/v1` API — so both model-name columns are the same
+`gemma4-E2B` (the name is for storage/display; `llama-server` serves whatever
+`-m` GGUF it loaded). Override with `IVMS777_CAPTION_MODEL` /
+`IVMS777_PLANNER_MODEL`. There is **no Ollama** on either profile, and **no
+in-process caption VLM** — captioning is a plain OpenAI call to `llama-server`
+with the image as an `image_url` data-URI. `cloud` is unchanged by plan 16 (still
+vLLM; an open item).
 
-**Why Ollama runs on the host under `mac`.** Docker Desktop on macOS boots a
-Linux VM, and Apple exposes no GPU to Linux guests — there is no Metal in a
+**Why `llama-server` runs on the host under `mac`.** Docker Desktop on macOS boots
+a Linux VM, and Apple exposes no GPU to Linux guests — there is no Metal in a
 container, and no configuration changes that. Apple's own `container` project
 does not support GPU passthrough either. Containerised inference on a Mac falls
-back to CPU and runs 3-6x slower. Ollama installed natively gets full Metal, and
-the containerised app reaches it at `host.docker.internal:11434`.
+back to CPU and runs 3-6x slower. `llama-server` built natively with Metal
+(`-DGGML_METAL=ON`) gets full GPU, and the containerised app reaches it at
+`host.docker.internal:8080`.
 
 On Linux this problem does not exist. Under `jetson` and `cloud` everything,
 including inference, runs in containers with real GPU access via the NVIDIA
 container runtime.
 
-**Why Ollama and not vLLM on Mac and Jetson.** vLLM's Metal backend does not
-support vision models, which is the entire workload here, and Docker's own
-benchmarks put it 1.2-1.3x behind llama.cpp on Apple Silicon with far more
-variance. On Jetson, vLLM's aarch64 build is a maintenance burden. vLLM earns
-its place only under `cloud`, where continuous batching genuinely helps with
-concurrent users.
+**Why llama.cpp and not vLLM on Mac and Jetson.** vLLM's Metal backend does not
+support vision models, which is a core workload here, and Docker's own benchmarks
+put it 1.2-1.3x behind llama.cpp on Apple Silicon with far more variance. On
+Jetson, vLLM's aarch64 build is a maintenance burden — and crucially only a
+source-built `sm_87` llama.cpp runs the gemma vision projector on the GPU (§4).
+vLLM earns its place only under `cloud`, where continuous batching genuinely helps
+with concurrent users.
 
 **Jetson sizing.** The Orin Nano Super has 8 GB shared between CPU and GPU at
 102 GB/s (~7.4 GB usable after firmware). A **fixed ~1.5 GB baseline is gone
@@ -87,24 +90,16 @@ containers): ~1.1 GB kernel + iGPU/firmware carveout reserved by L4T at boot,
 baseline is **not reclaimable** — it is set in the device tree, not held by any
 process, so killing services claws back only tens of MB (headless mode a few
 hundred at most; not worth chasing). That leaves roughly **5.8 GB** as the real
-model budget, so the 26B A4B model does not fit and a small (3–4B-class) model is
-used instead. This works only because **at most one heavy in-process model is
-resident at a time** inside the `models` service (§5.1) — SigLIP and the
-caption VLM are never both loaded, and an interactive embed call is never left
-waiting behind a long caption. That invariant is enforced by the `models`
-service's own **in-process residency manager (§8.1, `modelsvc/residency.py`)**,
-not by luck of stage ordering: every SigLIP call goes through
-`use("siglip", HIGH)` and every caption call through `use("caption", LOW)`, and
-on Jetson it evicts whichever of the two is not needed before loading the
-other. There is no runtime RAM-budget check the way an arbitrary model-set
-would need one — since only ever one heavy model is resident, the swap always
-fits by construction (each model's standalone footprint was sized against the
-budget above at design time, §8.1). Expect roughly 6-8 s/photo, so about 8-11
-hours for 5,000 photos at 25 W. Residency is **config-driven, one
-implementation for every profile** — this exclusive swap-on-demand mode runs
-only where `caption_backend == "inprocess"` (jetson); on mac/cloud SigLIP is
-CPU/ample-RAM and captioning is external Ollama, so there is nothing to swap
-(§8.1).
+model budget. Since plan 16 the pieces that share it are: the gemma4-E2B GGUF on
+`llama-server` (~2 GB weights + a CUDA context), SigLIP (~1.6 GB) inside the
+`models` service, and the small in-process caption-text embedder (nomic, ~0.3 GB)
+— all comfortably inside ~5.8 GB. The one heavy in-process model in the `models`
+service is now **SigLIP alone**: the caption VLM that used to share the GPU with
+it is gone (captioning is a remote call to `llama-server`). So the residency
+manager (§8.1, `modelsvc/residency.py`) collapses to an **ensure-loaded** guard —
+`use("siglip", HIGH)` loads SigLIP once and reports it for the resource bar; there
+is nothing to evict, swap, or preempt it against. At MAXN_SUPER expect ~5–6
+s/photo for captioning (§4).
 
 **Jetson device facts (`lockbox-nv`) — verified on the live board 2026-08-16.**
 The one target device, for tuning reference:
@@ -177,17 +172,16 @@ speed (**35.8 tok/s** with CUDA graphs), but **0.40 (~3.0 GB) and below OOM** �
 weights + the CUDA-graph pool + minimum KV do not fit. You **cannot** trade that
 graph memory back for footprint: `--enforce-eager` at the same util drops it to
 **16.6 tok/s**, so graphs *are* the speed. **vLLM's fast floor is ~3.3 GB and it
-cannot reach Ollama's ~2.1 GB.** That still **fights the one-heavy-model-resident
-budget** (§8.1): the caption VLM peaks ~2.7 GB, and a *continuously* resident
-3.3 GB vLLM + 2.7 GB caption + ~1.5 GB baseline ≈ 7.5 GB blows the ~5.8 GB budget
-when both are live. Ollama holds a smaller (~2.1 GB), *evictable* footprint
-(keep-alive) that fits the swap design far more comfortably. So the standing
-recommendation is **MAXN_SUPER + keep Ollama for text** (23.5 tok/s, fits memory,
-zero change); tuned vLLM (35.8) is the upgrade path *iff* a memory-co-existence
-test confirms it fits alongside SigLIP + caption in the ~5.8 GB budget. Single-stream decode is
-bandwidth-bound, so 4-bit (fewer bytes/token) is the *fast* choice and the 67
-INT8 TOPS does not help chat latency; an `sm_87`-native build is **not** the
-first lever — power mode is.
+cannot reach Ollama's ~2.1 GB.** That fed the earlier Ollama-for-text choice, but
+plan 16 supersedes it: a source-built `sm_87` `llama-server` running the single
+gemma4-E2B GGUF does text **and** vision on the GPU at ~2 GB resident (30 tok/s
+text, sub-second vision — §4), beating both Ollama's 26.1 and its broken
+CPU-projector vision, and leaving SigLIP (~1.6 GB) + the nomic embedder (~0.3 GB)
+room inside ~5.8 GB. So the **standing recommendation is MAXN_SUPER + one
+gemma4-E2B on `llama-server`** (§4); tuned vLLM (35.8 tok/s text-only) stays a
+cloud-side option. Single-stream decode is bandwidth-bound, so 4-bit (fewer
+bytes/token) is the *fast* choice and the 67 INT8 TOPS does not help chat latency;
+power mode is the first lever, and the `sm_87` build is what unlocks GPU vision.
 
 **GPU vision IS achievable — via a source-built `sm_87` llama.cpp (verified
 2026-08-16).** Stock Ollama runs the vision projector (CLIP/`mmproj`) on **CPU**
@@ -204,28 +198,32 @@ GGUF serving **both** text and vision:
 | `Qwen2.5-VL-3B` (Q4_K_M + Q8 mmproj) | 23.5 | 13.8 s/img |
 
 `gemma4-E2B` wins on **both** axes: faster text than Ollama (30 vs 26.1) and
-**~24× faster vision** than Qwen (0.57 s vs 13.8 s — Qwen emits ~2048 image
-tokens, gemma far fewer). CPU projector (`--no-mmproj-offload`) is ~149 s for
-Qwen, so GPU offload is ~10–370×. `gemma4` **requires `--jinja`** (its chat
-template aborts otherwise — the cause of the earlier Ollama "empty caption").
+far faster vision (0.57 s *encode* vs Qwen's 13.8 s — Qwen emits ~2048 image
+tokens, gemma ~256). End-to-end per caption is ~5–6 s for gemma vs ~20 s for Qwen
+(add generation). CPU projector (`--no-mmproj-offload`) is ~149 s for Qwen, so GPU
+offload is ~10–370×.
+
+Two gemma4 config requirements (verified 2026-08-16):
+- **`--jinja`** — its chat template aborts otherwise (the earlier "empty caption").
+- **`--chat-template-kwargs '{"enable_thinking":false}'`** — without it gemma4
+  dumps a verbose chain-of-thought instead of a caption; `--reasoning-budget 0`
+  is *not* enough. With thinking off + a captioning system prompt, gemma4-E2B
+  **reads in-image text and fine detail at Qwen2.5-VL quality** (bake-off on a bus
+  photo: both read the route/EMT/"cero emisiones" text; gemma also caught the
+  wrought-iron balconies) — so gemma's speed does **not** cost quality.
+
 This is the basis of plan `16` (single Gemma on a `llama-server`, text + vision on
 GPU, replacing qwen-text + the in-process VLM, and dropping Ollama on jetson).
 
-The shipping default is `qwen2.5:3b` for the planner — an **Ollama tag**, pulled
-into the in-container Ollama — and Qwen2.5-VL-3B for captioning, an **in-process**
-Hugging Face model (`config.py`'s `caption_model_id`,
-`Qwen/Qwen2.5-VL-3B-Instruct`), fetched from Hugging Face on first use and never
-an Ollama tag on jetson. Both fit the 8 GB budget. `gemma4:e4b` is the intended
-captioner alternate once the Gemma 4 family lands on Ollama with working Orin
-vision (§4); until then Qwen2.5-VL is the working default. `IVMS777_PLANNER_MODEL`
-overrides the planner tag — `make run-jetson` passes it through and pulls it into
-the in-container Ollama, so what runs matches what was pulled. `IVMS777_CAPTION_MODEL`
-still exists (`config.py`'s `caption_model`, used for the resource bar's display
-label, §8.1) but on jetson names no Ollama pull — the real in-process weights come
-from `caption_model_id`, downloaded from Hugging Face into the mounted cache the
-first time a caption runs, not by `make run-jetson`. Published benchmark scores do
-not settle the captioner choice on their own — the phase 1 bake-off decides it on
-real photos.
+The shipping default on both `mac` and `jetson` is the single **`gemma4-E2B`
+GGUF** served by `llama-server` for both roles. It is not an Ollama tag or an HF
+`transformers` load any more — `llama-server` loads the GGUF (`-m` + `--mmproj`)
+that the entrypoint fetches into the mounted volume on first run (jetson) or
+`make llama-mac` downloads to `$HOME/.ivms777/models` (mac). `IVMS777_CAPTION_MODEL`
+/ `IVMS777_PLANNER_MODEL` override the name used for storage/display; the actual
+weights are whichever GGUF `llama-server` was pointed at. Published benchmark
+scores do not settle the captioner choice on their own — the phase 1 bake-off
+decides it on real photos.
 
 **Jetson image.** Only the `models` service needs GPU/torch on Jetson —
 `app`/`worker` build from the same generic `Dockerfile` as every other profile
@@ -239,10 +237,11 @@ change: `torch` + `torchvision` come from the CUDA-13.2 index**
 (`https://download.pytorch.org/whl/cu132`) instead of the CPU PyPI wheel.
 JetPack 7 exposes the Orin as **SBSA**, so those upstream CUDA-13.2 wheels run
 on the iGPU directly, and the NVIDIA container runtime (`runtime: nvidia`)
-hands that iGPU to the two containers that need it — inference (Ollama) and
-`models`; `app`/`worker` declare no GPU access at all. The `models` container
+hands that iGPU to the two containers that need it — `inference` (the sm_87
+`llama-server`, built from `Dockerfile.llamacpp.jetson`) and `models`;
+`app`/`worker` declare no GPU access at all. The `models` container
 must also declare `NVIDIA_VISIBLE_DEVICES=all` + `NVIDIA_DRIVER_CAPABILITIES=all`:
-unlike the Ollama image, the `python:3.12-slim` base does not set them, and
+unlike the CUDA base images, the `python:3.12-slim` base does not set them, and
 without them the runtime injects no driver libs, so `libcuda` is absent and
 `torch.cuda.is_available()` is `False`. There is **no jetson-containers, no
 dusty-nv base image, and no `autotag`**: JetPack 7 ships system Python 3.12,
@@ -252,37 +251,29 @@ sync --extra models` from `pyproject.toml` and then reinstalls
 brought. `numpy` stays on `pyproject`'s `>=2.5.2` — the cu132 wheels are built
 against NumPy 2.x, so no Jetson-specific numpy pin is needed.
 
-**Captioning runs in-process on jetson; text stays on Ollama.** Ollama's CUDA
-build ships no Orin `sm_87` vision kernels, so on JetPack 7 a vision request
-silently falls back to running CLIP on the CPU — roughly 20x slower than the GPU
-path, and the reason captions used to stall out or hang indefinitely. Rather than
-chase a matching NVIDIA JetPack-7 Ollama build, `jetson` moves captioning
-**in-process, inside the `models` service**: `Dockerfile.models.jetson` loads
-**Qwen2.5-VL-3B in 4-bit** directly via `transformers` (`captioning.VLMCaptioner`,
-§4, wrapped by `modelsvc.backends.caption_backend.CaptionBackend`) onto the same
-cu132 GPU that already serves SigLIP — never co-resident with it, at most one of
-the two is ever loaded (§8.1) — resident at roughly **2.7 GB**, well inside the
-~5.8 GB Jetson budget. This needs three extra image dependencies, jetson-only,
-never installed on the mac/cloud `Dockerfile.models`: `gcc` (Triton JIT-compiles
-the `bitsandbytes` quantization kernels at import time, and the slim base ships
-no C compiler), `bitsandbytes` (the 4-bit quantization), and `accelerate`
-(device placement for `from_pretrained`). Text inference — the query planner,
-chat, and the caption-embedding call — is unaffected and keeps running on
-Ollama in the generic `ollama/ollama:latest` image, reached only through the
-`models` service (§5.1); only the vision path moved off it.
+**Captioning + text both run on the sm_87 `llama-server`; nothing captions
+in-process.** Ollama's CUDA build shipped no Orin `sm_87` vision kernels, so on
+JetPack 7 a vision request silently ran CLIP on the CPU (~200 s/image) — the
+reason captioning used to be in-process. Plan 16 fixes the root cause instead of
+working around it: a **source-built `sm_87` `llama.cpp`** (`-DGGML_CUDA=ON
+-DCMAKE_CUDA_ARCHITECTURES=87`) runs the gemma projector **on the GPU** (0.57 s
+encode, §4). That binary is **built once** and reused: on the target board the
+`inference` compose service runs the prebuilt `llama-server` from the `llamacpp`
+volume under the cu130 image (no in-image recompile), and `Dockerfile.llamacpp.jetson`
+is the reproducible from-scratch builder for a fresh board. So captioning is a
+plain OpenAI `/v1/chat/completions`
+call to the `inference` container with the image as an `image_url` — no
+`transformers` VLM, no `bitsandbytes`/`accelerate`, no C toolchain in
+`Dockerfile.models.jetson`. The `models` service on jetson now loads only SigLIP
+and the small nomic caption-text embedder on the cu132 GPU; text and vision both
+live in `llama-server`.
 
-> **NOTE — Orin `sm_87` (confirmed 2026-08-16, see the device-facts block in
-> §3.1).** This is no longer a "maybe": the generic cu132 wheels **do not** ship
-> `sm_87` cubins, so kernels JIT from PTX or fall back — the root cause of the
-> uniformly slow (~3–6 tok/s) text decode measured on the board. Worse, the
-> **unpinned `uv pip install --reinstall torch torchvision --index-url .../cu132`
-> below now resolves to `torch 2.13.0+cu132`, whose build explicitly EXCLUDES
-> `sm_87`** (warns "8.0 … except {8.7}") and routes Qwen2's forward through a
-> Triton JIT kernel that needs C headers the slim base lacks (`stdlib.h` missing
-> → `libc6-dev`). Fix direction: **pin `torch` to a version that carries `sm_87`
-> cubins** (or use an NVIDIA Jetson wheel index), and ship an `sm_87`-native
-> inference build (`TORCH_CUDA_ARCH_LIST=8.7`). Because the base is Python 3.12
-> everywhere, the source no longer has a Python-3.10 compatibility constraint.
+> **NOTE — Orin `sm_87` cubins.** The generic cu132 torch wheels **do not** ship
+> `sm_87` cubins, so torch kernels JIT from PTX or fall back — historically the
+> cause of slow in-process decode. This no longer affects inference (gemma text +
+> vision runs on the `sm_87`-native `llama-server`, not torch); it can still slow
+> **SigLIP** in the `models` service. If SigLIP throughput matters, pin a torch
+> build that carries `sm_87` cubins or use an NVIDIA Jetson wheel index.
 
 ### 3.2 Multi-tenancy
 
@@ -297,8 +288,8 @@ the start:
 - `owner_id` on every user-scoped row and in every query.
 - Photo bytes reached through a `Storage` interface (local filesystem now,
   object storage later).
-- Inference reached through one HTTP client, so swapping Ollama for vLLM is a
-  config change.
+- Inference reached through one HTTP client, so swapping the inference server
+  (llama-server / vLLM) is a config change.
 
 v02 adds accounts, signup, and quotas on top of this. Because upload is already
 the only ingest path and every row is already owner-scoped, that is an additive
@@ -399,33 +390,31 @@ restarts and never blocks the UI. This is the Outbox pattern.
 | Role | Model | Backend (inside the `models` service) |
 |---|---|---|
 | Image and text embeddings, zero-shot tags | SigLIP 2 `so400m-patch14-384` | in-process `transformers` — CPU (mac) / CUDA (jetson) |
-| Captions and structured tags | per profile: Ollama VLM `qwen2.5vl:7b` (mac/cloud) **or** Qwen2.5-VL-3B 4-bit (jetson) | mac/cloud: proxied to Ollama · jetson: in-process (`transformers`, cu132 GPU) |
-| Query planning, chat answers | `qwen2.5:3b` (Gemma 4 E4B intended) | proxied to Ollama |
-| Caption text embeddings (§9 similar) | `nomic-embed-text` (dedicated text embedder) | proxied to Ollama (mac + jetson) |
+| Captions and structured tags | `gemma4-E2B` GGUF (mac/jetson) · `qwen2.5vl:7b` (cloud) | OpenAI `/v1` call to `llama-server` (mac/jetson) / vLLM (cloud) |
+| Query planning, chat answers | `gemma4-E2B` GGUF (mac/jetson) · `qwen2.5:3b` (cloud) | OpenAI `/v1` call to `llama-server` (mac/jetson) / vLLM (cloud) |
+| Caption text embeddings (§9 similar) | `nomic-embed-text-v1.5` (dedicated text embedder) | **in-process** `transformers` — CPU (mac) / CUDA (jetson) |
 
-Captioning goes through a **`captioning.Captioner` adapter** (a `caption()` /
-`load()` / `release()` / `footprint_mb()` protocol), not a hardcoded HTTP call,
-because the two profiles use fundamentally different transports: `OllamaCaptioner`
-wraps today's OpenAI-compatible HTTP path (mac/cloud, byte-identical to before),
-and `VLMCaptioner` runs Qwen2.5-VL-3B 4-bit in-process via `transformers` on the
-Jetson's cu132 GPU (§3.1). Both return the same `CaptionResult`, so the `models`
-service's `CaptionBackend` (`modelsvc/backends/caption_backend.py`, §5.1/§8.1) —
-the one place that now constructs and calls a `Captioner` — is written once
-against the protocol and never branches on profile; the ingest `caption` stage
-(§8) itself never touches a `Captioner` at all, it just calls the service's
-`/caption` over HTTP. `config.py`'s `caption_backend` setting (`"ollama"` vs
-`"inprocess"`) selects which adapter `modelsvc/backends/__init__.py` constructs.
+Since plan 16, captioning and text generation are the **same** `gemma4-E2B` GGUF on
+`llama-server` (mac/jetson) — one model, text + vision, on the GPU. Captioning goes
+through a **`captioning.Captioner` adapter** (`OpenAICaptioner`) that POSTs an
+OpenAI `/v1/chat/completions` request with the image as an `image_url` data-URI,
+constrained to `CAPTION_SCHEMA`; the `models` service's `CaptionBackend`
+(`modelsvc/backends/caption_backend.py`, §5.1) wraps it into the caption dict. The
+ingest `caption` stage (§8) never touches a `Captioner` — it calls the service's
+`/caption` over HTTP. There is no in-process caption VLM and no per-profile caption
+branch any more (the old `caption_backend` / `caption_model_id` settings are gone).
 
-The caption text is embedded by a **dedicated text embedder, `nomic-embed-text`**
-(`config.text_embed_model`), served by Ollama on mac and jetson alike, with the
-model's required `search_query:` / `search_document:` task prefixes
-(`embedding/caption_text.py`). NOT the planner (a chat model has no embedding head —
-Ollama returns `501`) and NOT SigLIP (its text tower is trained image↔text, so
-text↔text has no separation — measured). `nomic` was chosen by a benchmark on real
-captions (below); it ties the alternatives on recall while being the smallest and
-fastest, which decides it for the 8 GB Jetson. The resulting `caption_vec` is a
-**text-meaning retrieval index**, consumed as **top-k KNN** (never a fixed cosine
-floor — see §10 and the decision box).
+The caption text is embedded by a **dedicated text embedder, `nomic-embed-text-v1.5`**
+(`config.text_embed_model`), with the model's required `search_query:` /
+`search_document:` task prefixes (`embedding/caption_text.py`). NOT the planner (a
+chat model has no embedding head) and NOT SigLIP (its text tower is trained
+image↔text, so text↔text has no separation — measured). Since plan 16 dropped
+Ollama, it has no server, so it runs **in-process in the `models` service**
+(`embedding/text_embedder.py`, `TextBackend.text_embed`), on CPU (mac) / CUDA
+(jetson). `nomic` was chosen by a benchmark on real captions (below); it ties the
+alternatives on recall while being the smallest and fastest. The resulting
+`caption_vec` is a **text-meaning retrieval index**, consumed as **top-k KNN**
+(never a fixed cosine floor — see §10 and the decision box).
 
 > **DECISION — caption embeddings are the scalable semantic-retrieval index; do not relitigate.**
 > `caption_vec` exists to **vector-search meaning-similar captions** (top-k KNN) so a query
@@ -445,52 +434,48 @@ floor — see §10 and the decision box).
 > 2. **Consume as top-k KNN, NOT a fixed cosine floor.** nomic has a high baseline cosine
 >    (unrelated captions ≈ 0.4–0.5), so a fixed floor like `RERANK_FLOOR = 0.4` is meaningless
 >    here — rank by similarity and take the nearest k; let the agent/LLM verify that shortlist.
-> 3. Served by Ollama on mac and jetson via the inference client (`InferenceClient.embed`,
->    the same Ollama text backend as `/plan` and `/chat`). On the 8 GB jetson it is a second
->    small resident model that swaps with the planner in Ollama; the split caption/embed
->    stages (§8) keep it off the caption VLM's residency slot. (Routing it, like text
->    generation, fully through the models service is the remaining plan-15 gateway work.)
+> 3. Runs **in-process in the `models` service** (`embedding/text_embedder.py`) on mac and
+>    jetson via `transformers`, reached over the models gateway (`/text/embed`) with the same
+>    `InferenceClient.embed` call shape as before. Since plan 16 there is no Ollama to serve it;
+>    it is tiny (~0.3 GB) and rides alongside SigLIP inside the ~5.8 GB Jetson budget. On cloud
+>    (vLLM) it keeps the OpenAI `/embeddings` path.
 >
-> Status: **implemented** — write (`backfill_caption_vectors`, pipeline group 2c) and read
-> (chat top-k rerank, §10) both embed with `nomic-embed-text`; benchmarked on real captions.
+> Status: **implemented** — `caption_vec` is written by `backfill_caption_vectors`
+> (pipeline group 2c) with `nomic-embed-text-v1.5` and now feeds **§9 "similar photos"**
+> (caption-meaning between two photos) and the `/library` search fusion signal.
+> **Chat photo-search no longer uses it** — per **plan 17** chat finds photos with SigLIP
+> **image↔text** (`search_photos`, §10), which needs no captions; captions embed the whole
+> scene, so caption-text search interleaved scene-neighbours (an SUV beside the real match).
 
-Gemma 4 is the *intended* default family on `mac` and `cloud` once it lands on
-Ollama; **today all profiles run Qwen2.5** (`config.py` — captioner `qwen2.5vl`,
-planner `qwen2.5:3b`), and the Jetson profile runs a 4B-class model that may be
-Qwen3-VL. Caption and planner prompts therefore live
-in a per-model template registry in `inference/prompts.py`, keyed by model name,
-with a shared JSON schema all templates must satisfy. Adding a model means
-adding a template, not touching the pipeline.
+Since plan 16, **`mac` and `jetson` run `gemma4-E2B`** for both caption and
+planner/chat (one GGUF on `llama-server`, §3.1); `cloud` stays on Qwen2.5 (vLLM).
+Caption and planner prompts live in a per-model template registry in
+`inference/prompts.py`, keyed by model name, with a shared JSON schema all
+templates must satisfy. Adding a model means adding a template, not touching the
+pipeline.
 
 Gemma 3 is dominated on every axis — Gemma 4 12B beats Gemma 3 27B by roughly 20
 MMMU-Pro points at a third of the memory — and is not used.
 
 SigLIP 2 outperforms OpenCLIP on zero-shot and retrieval. It stays in-process
-rather than behind the inference service because neither Ollama nor vLLM exposes
-an image-embedding endpoint. On `mac` it runs on CPU inside the container:
+rather than behind the inference service because neither `llama-server` nor vLLM
+exposes an image-embedding endpoint. On `mac` it runs on CPU inside the container:
 roughly 1 s/photo, so about 1.5 hours one-time for 5,000 photos, and about 30 ms
 per search query. That one-time cost is the price of containerising the app on a
 Mac.
 
-**Model download.** On `mac`/`cloud`, caption and planner models are pulled by
-the inference service on first use (`ollama pull`, or vLLM's Hugging Face fetch)
-— nothing to script. On `jetson`, that only covers the **planner**: the
-**caption** model is not an Ollama tag there — it is a Hugging Face repo fetched
-**in-process** by the caption adapter (`VLMCaptioner`, §3.1) on the first caption
-call, into the same mounted HF cache SigLIP uses. SigLIP itself is fetched from
-Hugging Face into a mounted cache volume by a startup step that checks free disk
-first and reports progress. All these caches survive container restarts.
+**Model download.** On `mac`/`jetson`, the gemma GGUF (+ mmproj) is fetched once
+into a volume/dir — by the `inference` container's entrypoint on jetson, by `make
+llama-mac` on mac (§3.1). SigLIP and the nomic text embedder are fetched from
+Hugging Face into a mounted cache the first time they are used. On `cloud`, vLLM
+fetches its model from Hugging Face. All these caches survive restarts.
 
-**Bake-off gate.** Phase 1 includes a script that runs candidate caption models
-over the same 50 real photos and reports seconds per photo, memory high-water
-mark, and side-by-side captions. On `mac` the candidates are pulled by Ollama
-(`gemma4:26b-a4b` against `gemma4:12b`); on `jetson` the candidates (`qwen3-vl:4b`
-against `gemma4:e4b`) are fetched from Hugging Face and run **in-process**
-exactly like the shipping default (§3.1) — jetson's Ollama container serves the
-planner only, never the caption candidates. Because published benchmarks for
-these pairs are either close or not directly comparable, the bake-off is how the
-default is actually chosen. The winner becomes the default in config, not in
-code.
+**Bake-off gate.** A script runs candidate caption models over the same real
+photos and reports seconds per photo, memory high-water mark, and side-by-side
+captions (an open item is to widen it — dense text, low light, many objects —
+before the first bulk ingest). Because published benchmarks are either close or
+not directly comparable, the bake-off is how the default is actually chosen. The
+winner becomes the default in config, not in code.
 
 ## 5. Architecture
 
@@ -512,8 +497,8 @@ flowchart TB
     subgraph gpu["The GPU box · docker compose"]
         app["app · FastAPI + Jinja + HTMX<br/>UI · read queries · upload receipt · /api/manifest<br/>NO models, NO torch — a thin client of the models service"]
         worker["worker · ingest pipeline (primary writer)<br/>facets · thumbs · taxonomy · caption · memories · deletions<br/>NO models, NO torch — a thin client of the models service"]
-        models["models · THE ONE INFERENCE GATEWAY (§5.1)<br/>the only process that imports torch/transformers AND the only client of Ollama<br/>loads SigLIP + the caption VLM ONCE · in-process residency (one heavy model resident at a time)<br/>HTTP: /embed/image · /embed/text · /tag · /caption · /plan · /chat · /resources"]
-        infer["inference · Ollama | vLLM<br/>text backend for planner/chat + caption (mac/cloud)<br/>reached ONLY by the models service · (host on mac, container on jetson/cloud)"]
+        models["models · THE ONE INFERENCE GATEWAY (§5.1)<br/>the only process that imports torch/transformers AND the only client of the inference server<br/>loads SigLIP + the nomic caption-text embedder in-process · ensure-loaded residency<br/>HTTP: /embed/image · /embed/text · /tag · /caption · /plan · /chat · /resources"]
+        infer["inference · llama.cpp llama-server (mac/jetson) | vLLM (cloud)<br/>ONE gemma4-E2B GGUF — text (planner/chat) AND vision (caption), on the GPU<br/>reached ONLY by the models service · (host on mac, container on jetson/cloud)"]
         db[("SQLite WAL<br/>sqlite-vec + FTS5 · named volume")]
         store[("Storage<br/>originals + thumbnails")]
     end
@@ -531,7 +516,7 @@ flowchart TB
 
     app -->|"ALL inference: query embed · planner · chat (HTTP)"| models
     worker -->|"ALL inference: embed · zero-shot tags · caption (HTTP)"| models
-    models -->|"text backend: planner/chat, mac/cloud caption (HTTP)"| infer
+    models -->|"gemma4-E2B: planner/chat + caption/vision (OpenAI /v1)"| infer
 
     classDef store fill:#eef2ff,stroke:#8899cc,color:#111;
     class db,store,disk store;
@@ -554,11 +539,11 @@ and `worker`, each with its own torch CUDA context, is exactly what exhausted th
 unified memory.
 
 **One implementation, both platforms.** The `models` service is the same code on
-mac and jetson; only its *internals* switch by profile: SigLIP runs on **CPU** on
-mac and **CUDA** on jetson, and captioning uses the **host Ollama** on mac (Metal
-vision works) versus the **in-process VLM** on jetson (Ollama's CUDA vision is
-broken on JP7, §3.1). The service picks these from config; `app`/`worker` and the
-whole request flow are identical across platforms.
+mac and jetson; only its *internals* switch by profile: SigLIP and the nomic
+caption-text embedder run on **CPU** on mac and **CUDA** on jetson, and captioning
+is the same OpenAI `/v1` call to `llama-server` on both (host on mac, container on
+jetson). The service picks these from config; `app`/`worker` and the whole request
+flow are identical across platforms.
 
 `ivms777-sync` is not part of the deployment. It talks to `app` over HTTP,
 reads one endpoint, and is the only component that ever writes to your disk.
@@ -572,11 +557,12 @@ needs no new component.
 
 **Every model, LLM, embedder, and heavy AI library lives in exactly one process:
 the `models` service.** It is the only process that imports `torch`/`transformers`,
-the only one that loads SigLIP or the caption VLM, and the only client of Ollama.
-`app`, `worker`, and the CLI hold **no models and no torch** — they are thin HTTP
-clients of this service (CLAUDE.md § "One model process"). Loading the same model
-in two processes is forbidden; on the 8 GB unified-memory Jetson a duplicated
-SigLIP plus two torch CUDA contexts is exactly what exhausted memory.
+the only one that loads SigLIP or the caption-text embedder, and the only client of
+the inference server (`llama-server` / vLLM). `app`, `worker`, and the CLI hold
+**no models and no torch** — they are thin HTTP clients of this service (CLAUDE.md
+§ "One model process"). Loading the same model in two processes is forbidden; on
+the 8 GB unified-memory Jetson a duplicated SigLIP plus two torch CUDA contexts is
+exactly what exhausted memory.
 
 **HTTP surface** (the whole app's inference vocabulary):
 
@@ -588,13 +574,13 @@ SigLIP plus two torch CUDA contexts is exactly what exhausted memory.
   `logit_bias`); `RemoteEmbedder` fetches and caches this once so taxonomy
   scoring (§9) can stay client-side (ingest keeps computing tag probabilities
   itself, over `embed_text` + this calibration — nothing server-side changes).
-- `POST /caption` — a caption + structured tags for one image.
+- `POST /caption` — a caption + structured tags for one image (OpenAI `/v1` call
+  to `llama-server` with the image as an `image_url`, §4).
 - `POST /plan`, `POST /chat` — text generation (query planner, chat answers).
-- Caption-meaning text embeddings (§9) use the **dedicated text embedder
-  `nomic-embed-text`** over Ollama (`InferenceClient.embed`, the same Ollama text
-  backend as `/plan` / `/chat`) — NOT `/embed/text` (that is SigLIP, image↔text only).
-  Consumed as top-k KNN (§10). Routing this through the models service is pending
-  plan-15 gateway work.
+- `POST /text/embed` — caption-meaning text embeddings (§9) from the **in-process
+  dedicated text embedder `nomic-embed-text-v1.5`** (`TextBackend`,
+  `embedding/text_embedder.py`) — NOT `/embed/text` (that is SigLIP, image↔text
+  only). Consumed as top-k KNN (§10).
 - `GET /resources` — what is resident + memory + **GPU load** (this is the only
   process with GPU access, so it is the one that reads it), for the resource bar (§13).
 
@@ -602,24 +588,22 @@ SigLIP plus two torch CUDA contexts is exactly what exhausted memory.
 platforms):**
 
 - **SigLIP** in-process — `embed_device=cpu` on mac, `cuda` on jetson/cloud.
-- **Captioning** — mac/cloud proxy to Ollama's vision model (Metal/GPU vision
-  works there); **jetson runs the caption VLM in-process** (Qwen2.5-VL-3B 4-bit via
-  `transformers`, because Ollama's CUDA build has no Orin `sm_87` vision kernels —
-  §3.1).
-- **Text** (`/plan`, `/chat`, and the `nomic-embed-text` caption embedder) — proxied to
-  Ollama (host on mac, container on jetson/cloud). SigLIP/caption/tag already go **only**
-  through the `models` service; text generation and the caption embedder still reach Ollama
-  via a shared `InferenceClient` in `app`/`worker` (transitional — Ollama is the single
-  loader, so no model is duplicated; consolidating text behind the gateway is the remaining
-  plan-15 work).
+- **Captioning** — an OpenAI `/v1/chat/completions` call to `llama-server`
+  (mac/jetson) / vLLM (cloud); the same gemma4-E2B GGUF that answers text also does
+  vision on the GPU (§3.1/§4). No in-process caption VLM.
+- **Text** (`/plan`, `/chat`) — the same OpenAI-compatible inference server, via a
+  shared `OpenAICompatClient`. **Caption-meaning text embeddings** run in-process
+  (`nomic`, `embedding/text_embedder.py`) on mac/jetson because `llama-server` has
+  no embedding endpoint; cloud (vLLM) keeps the OpenAI `/embeddings` path.
 
 **Residency is coordinated in-process here** — there is no cross-process DB lease.
-On the 8 GB Jetson the service keeps at most **one heavy in-process model resident
-at a time** (SigLIP ~1.6 GB **xor** the caption VLM ~2.7 GB), loading/freeing on
-demand within a RAM budget; an interactive request (a chat/search query embed)
-**preempts** an in-flight caption via a simple in-process priority, then the worker
-resumes captioning. Because all model memory now lives in this single process, the
-budget is real and local — no second process can hold a hidden copy.
+Since plan 16 removed the in-process caption VLM, **SigLIP is the only heavy
+in-process model**, so residency (`modelsvc/residency.py`) is a simple
+**ensure-loaded** guard: SigLIP loads once and stays resident; there is nothing to
+evict, swap, or preempt it against. On the 8 GB Jetson the gemma GGUF (~2 GB) lives
+in `llama-server`, SigLIP (~1.6 GB) and the nomic embedder (~0.3 GB) in this
+process — all local, so the budget is real and no second process holds a hidden
+copy.
 
 This **retires the earlier cross-process model lease** (`model_lease`) and the
 two-process `ModelCoordinator`: with models in one process, residency is an
@@ -910,21 +894,20 @@ stopped.
 4. **taxonomy** — SigLIP zero-shot scoring against `vocab.yaml`, plus pixel
    statistics. Fast, runs immediately after embed.
 5. **caption** — the `worker` calls the `models` service's `POST /caption`
-   (§5.1) with one photo's thumbnail; the service's `CaptionBackend` runs
-   whichever `captioning.Captioner` adapter (§4) the profile selects —
-   `OllamaCaptioner` over HTTP on mac/cloud, `VLMCaptioner` in-process on
-   jetson — entirely inside itself, and returns a caption sentence and a JSON
-   tag object, written straight to the DB. Slowest stage by two orders of
-   magnitude, runs last.
+   (§5.1) with one photo's thumbnail; the service's `CaptionBackend`
+   (`OpenAICaptioner`, §4) POSTs an OpenAI `/v1/chat/completions` request with the
+   image to `llama-server` (mac/jetson) / vLLM (cloud) and returns a caption
+   sentence and a JSON tag object, written straight to the DB. Slowest stage,
+   runs last.
 
    The caption's §9 text embedding is a **separate step, not part of this stage**
    (pipeline group 2c): `backfill_caption_vectors` embeds every captioned photo that
    still has no vector, in ONE batch, with the dedicated text embedder
-   (`nomic-embed-text`, §4) into `photos.caption_vec`. It is its own step because that
-   embedder is a different model/backend (Ollama) from both SigLIP and the caption VLM,
-   so it shares no residency slot with them and is never interleaved per-photo with the
-   VLM. A caption written this pass gets its vector this pass or the next; a library
-   captioned before the column existed backfills the same way — no re-caption needed.
+   (`nomic-embed-text-v1.5`, in-process in the `models` service, §4) into
+   `photos.caption_vec`. It is its own step (a different model from SigLIP and from
+   the caption call) so it is never interleaved per-photo with captioning. A caption
+   written this pass gets its vector this pass or the next; a library captioned
+   before the column existed backfills the same way — no re-caption needed.
 
 **Stages are drained in order across the whole library, not per photo.** Every
 photo is embedded and scored before any photo is captioned. This is what keeps
@@ -938,7 +921,7 @@ model is resident when is no longer a property of *this* loop's ordering — it
 is decided by the `models` service's **in-process residency manager (§8.1)**,
 the single place that loads and unloads models.
 
-### 8.1 In-process residency — one heavy model at a time
+### 8.1 In-process residency — SigLIP ensure-loaded
 
 All model work lives in the one `models` service (§5.1), so deciding which
 heavy model is loaded right now is an **in-process** concern —
@@ -955,80 +938,44 @@ need no edit even though there is nothing left for them to coordinate: `app`
 and `worker` hold no models, so `require()` now loads nothing, refuses
 nothing, and never raises.
 
-On the unified-memory Jetson the shared RAM is one pool: SigLIP (~1.6 GB) and
-the caption VLM (~2.7 GB) resident together, on top of the fixed ~1.5 GB L4T
-baseline (§3.1), would eat deep into the ~5.8 GB budget for no benefit —
-ingest never embeds and captions the same photo at the same instant. The rule
-that prevents it is blunt: **at any instant, at most one heavy in-process
-model is loaded.**
-
-That rule lives in one component inside the `models` service —
-`Residency` — the **single decision point**. A sub-backend never loads its
-model directly; it wraps its call in `residency.use(name, priority=...)` and
-the residency manager does the rest:
+Since plan 16 removed the in-process caption VLM (captioning is now a remote
+OpenAI call to `llama-server`), **SigLIP is the only heavy in-process model** in
+the service. Nothing contends with it for the GPU, so residency is no longer a
+swap/preempt arbiter — it is a plain **ensure-loaded** guard. A sub-backend never
+loads its model directly; it wraps its call in `residency.use(name)` and the
+manager loads it once:
 
 ```python
 with residency.use("siglip", priority=HIGH):
-    ...            # SigLIP is resident; the caption VLM is not
+    ...            # SigLIP is loaded once, then reused
 ```
 
-Two models are registered, one per heavy sub-backend. `SiglipBackend` wraps
-every `/embed/image`, `/embed/text`, `/tag`, and `/embed/calibration` call in
-`use("siglip", priority=HIGH)` — search, chat, memory rebuild, and ingest
-embed/taxonomy all look identical from here, an HTTP request against the same
-endpoint, so there is no more per-caller workload taxonomy the way the old
-coordinator needed one (`CHAT`, `SEARCH`, `INGEST_EMBED`, …). `CaptionBackend`
-wraps every `/caption` call in `use("caption", priority=LOW)` — ingest only.
-Text (`/plan`, `/chat`, and the `nomic-embed-text` caption embedder — `TextBackend`,
-proxied to Ollama) is a **separate backend and is never registered with `Residency`**:
-it carries no eviction cost, so a chat/planner/caption-embed request never contends
-with SigLIP or the captioner for anything, and never evicts either one. (Ollama runs
-its own one-model-at-a-time swap between the planner and `nomic` internally.)
+`SiglipBackend` wraps every `/embed/image`, `/embed/text`, `/tag`, and
+`/embed/calibration` call in `use("siglip", priority=HIGH)` — search, chat, memory
+rebuild, and ingest embed/taxonomy all look identical from here, an HTTP request
+against the same endpoint, so there is no per-caller workload taxonomy the way the
+old coordinator needed one. `priority` is retained as a readability hint only;
+with a single registered model there is nothing to prioritise against, so `use()`
+loads once and never evicts or preempts. Captioning is not registered with
+`Residency` at all — it is a remote call. Neither is the in-process `nomic`
+text embedder (tiny, ~0.3 GB, loaded once by `TextBackend`).
 
-**Config-driven, one implementation, two modes** — `Residency(exclusive=...)`
-is constructed once at service startup, selected by
-`settings.caption_backend == "inprocess"` (`modelsvc/backends/__init__.py`):
+Because captioning left the GPU-sharing picture, the whole caption-preemption
+path is gone too: no `should_preempt`, no `CaptionPreempted`/503, no
+`ModelsCaptionPreempted`. A caption is a plain HTTP call that either returns or
+errors (and retries like any stage). This removes the `StoppingCriteria` +
+`threading.Condition` machinery the two-model swap used to need.
 
-- **Exclusive** (jetson). SigLIP and the caption VLM share one CUDA device and
-  must not be co-resident. On `use(name)`, if the other model is the currently
-  resident one, `Residency` releases it first (`release_siglip_embedder` for
-  SigLIP; the VLM adapter's own `.release()` drops it and empties the CUDA
-  cache) and only then loads the one just asked for — a **swap**, not a
-  budget check, since at most one of the two is ever resident by
-  construction. A `HIGH`-priority caller (an interactive embed) waiting on a
-  `LOW`-priority holder (a background caption) sets `should_preempt()`; the
-  caption backend threads that flag into the VLM's own generation loop via a
-  `transformers` `StoppingCriteria` (`captioning/vlm_adapter.py`), which
-  raises `inference.client.InferenceCancelled` the moment it fires — caught by
-  `CaptionBackend.caption` and re-raised as `modelsvc.residency.CaptionPreempted`;
-  the `/caption` route maps that to HTTP **503**; `ModelsClient.caption()` on
-  the `worker` side raises `ModelsCaptionPreempted`; `ingest/caption.py::caption_handler`
-  catches that and raises `ingest.worker.Preempted`, which returns the claimed
-  photo to `pending` (`requeue_running`) rather than a failed attempt — never
-  a burnt retry, the same guarantee the old cross-process hard-preempt gave,
-  now entirely inside one process with a `threading.Condition` instead of a
-  DB row + heartbeat thread. So chat/search wins the GPU within one
-  `StoppingCriteria` check, not a whole caption.
-- **Non-exclusive** (mac/cloud, `caption_backend == "ollama"`). SigLIP is
-  CPU-resident with ample RAM headroom, and captioning is external Ollama —
-  nothing in-process contends for anything. `use()` is then just an
-  idempotent ensure-loaded: load once on the first call, never evict, never
-  preempt (`should_preempt()` always returns `False`) — mac/cloud behave
-  exactly as they did before this refactor. `OllamaCaptioner`'s
-  streaming/watcher-thread preemption path is still wired (same code as
-  jetson's `CaptionBackend.caption`) but never fires, since nothing ever sets
-  `should_preempt`.
-
-What is actually resident (`residency.resident()` — `["siglip"]`,
-`["caption"]`, or `[]` on jetson; every model ever ensure-loaded, on
-mac/cloud), the models-process RAM, the **GPU load**, and the **current in-flight
-op** (`active` — `embedding` / `tagging` / `captioning` / `planning` / `chat`, or
-`null` when idle; tracked by `modelsvc/activity.py` since the service is the one
-place that sees every call) are all reported by `CompositeBackend.resources()` on
-`GET /resources`, which `/api/resources` proxies for the **resource bar (§13)**.
-The `active` step replaces the removed cross-process lease *workload* that the old
-bar displayed (§8.1) — it is ground truth of what the GPU is doing, not a declared
-intent.
+What is resident (`residency.resident()` — `["siglip"]` once loaded, **plus the
+llama-server / vLLM text model**, e.g. `gemma4-E2B`, which is a separate always-on
+process serving both text and captioning, so it is reported in EVERY state — the bar
+shows it during captioning/idle too, not only chat/planning), the models-process RAM,
+the **GPU load**, and the **current in-flight op** (`active` — `embedding` / `tagging`
+/ `captioning` / `planning` / `chat`, or `null` when idle; tracked by
+`modelsvc/activity.py` since the service is the one place that sees every call) are all
+reported by `CompositeBackend.resources()` on `GET /resources`, which `/api/resources`
+proxies for the **resource bar (§13)**. The `active` step is ground truth of what the
+GPU is doing, not a declared intent.
 
 Failed jobs retry up to 3 times with the error recorded, then stay `failed` and
 are listed in the UI. One bad file never stalls the queue.
@@ -1322,7 +1269,7 @@ flowchart TB
         sim["/photo similar<br/>(similar_photos = thin wrapper)"] --> core
     end
     subgraph agentic["Agentic wrappers · LLM, latency-tolerant"]
-        chat["/chat<br/>off-topic gate → core → verify/refine loop → answer"] --> core
+        chat["/chat<br/>route → SigLIP library / memory search OR general answer"] --> core
         mem["Memories<br/>theme discovery + event context tools"] --> core
     end
     core["search/retriever.py · graceful additive core"]
@@ -1380,63 +1327,32 @@ layer first — and the deterministic questions never touch the model at all:
    reload needs no stored state), each cover linked with `ctx=chat-memory:<key>`
    (§13.1) so opening one pages **within that memory** and "close" returns to the
    conversation.
-1. **Plan** the question into a `QuerySpec` (§9.1): a `hard_filters` dict (EXIF
-   facets + explicit date, §6.2) and `soft_tags` hints, the same split the core
-   uses everywhere. "a photo with a dog" becomes a `subject: dog` tag hint, not
-   a vibe.
-2. **Generate candidates via the core, then hard-filter.** `search/retriever.py`'s
-   `candidates()` (§9.2) — the same semantic+keyword fusion `/library` search
-   uses — produces the pool; `_hard_filter` then cuts it **exactly** by the
-   planner's EXIF/date predicates (a photo failing one is out, no exceptions).
-   If that empties a non-empty pool, chat answers honest-empty right there — an
-   EXIF/date mismatch is a fact, not something to second-guess.
-3. **Rank by caption meaning, take top-k — deliberately *not* the core's `refine()`.**
-   Candidates are ranked by caption-meaning cosine (`search/rerank.py`) — the question
-   and each caption embedded by the dedicated text embedder (`nomic-embed-text`, §4) —
-   and the top-k are kept as the **seed** for the verify loop. There is **no cosine
-   floor**: a text embedder's absolute cosines are not calibrated to a fixed cut
-   (nomic's baseline is high, so any fixed floor is meaningless — §4), so the shortlist
-   is a pure **top-k KNN** and honest-empty is the **agent's** job (step 4), which reads
-   the shortlisted captions and answers `[]` when none fit. A photo whose caption vector
-   is not computed yet is **kept** (sunk below the scored matches): the caption signal is
-   *unavailable*, not *weak*, exactly as `similar` degrades (§9). Chat calls
-   `candidates()` + `_hard_filter` directly and ranks itself instead of the core's
-   `refine()`, because `refine()` folds the fusion/KNN rank in as an **unconditional**
-   content contribution (`fusion_rank_contribution`, §9.2) — right for `/library` search
-   where a semantic neighbour *is* a result, wrong for a chat seed. Planner `soft_tags`
-   travel on the `Query` for parity but never score here (chat doesn't call `refine()`).
-   So chat works from the moment photos are embedded and sharpens as caption vectors
-   backfill (§8). The deliberate trade vs the old fixed floor: the deterministic
-   honest-empty guard is gone; honest-empty now rests on the agent, whose prompt forbids
-   inventing a match and returns `[]` when the shortlist has none.
-4. **Bounded verify/refine loop** (the §9.1 interactive exception). Seeded with
-   those candidates, an agent verifies each match and, for questions one
-   retrieval cannot answer, pulls more via read-only tools (`search`, `similar`,
-   `nearby`) over a few rounds before returning the **verified** id set — these
-   tools call the same core (`search_photos`/`similar_photos`, §9.2), never a
-   private fetch. It never invents a match; a candidate that does not fit is
-   dropped, not narrated.
-
-   The loop's tools are **only** the candidate-pullers — `search`, `similar`,
-   `nearby` — because every count / memory / period question was already answered
-   by the direct-DB layer (step 0), before any model was touched, so the loop
-   only ever sees an open-ended *photo* question. Tool-calls are
-   **schema-constrained**
-   (`chat/agent.py::_TOOL_CALL_SCHEMA`, strict structured output): the model can
-   only emit a valid `expand`/`answer` object naming a tool that exists, so the
-   "malformed JSON / made-up tool" failure mode is gone on the weak planner. The
-   system prompt also forbids stating any number it did not actually count, so the
-   old "8 photos" confabulation cannot return for the rare relational count that
-   reaches the agent. `agent_retrieve` returns the **verified** id set (`<= k`), or
-   `[]` when nothing fits — no facts, no cards; those belong to step 0.
-5. **Context assembly** builds a compact block per verified photo: id, date,
-   caption, top tags, and its EXIF facts — camera, lens, ISO, aperture, shutter,
-   focal length, coordinates when present. ~60 tokens each. The facts let "what
-   lens did I use most on that trip?" be answered from data, not captions.
-6. **The chat model answers** (the planner model, Qwen2.5 — §4), grounded only on
-   those blocks, citing photos as `[photo:123]`. The UI **streams** tokens over SSE
-   and renders each citation inline as a clickable thumbnail. The loop drives
-   *retrieval* only; the answer still streams — it is not produced inside the loop.
+1. **Route — one agentic decision (plan 17).** A single schema-constrained call to the
+   planner model (`chat/agent.py::route`, temperature 0) classifies the message into
+   ONE tool, using the user's own photos/memories ONLY when the message is about them:
+   `search_library` (they want photos OF something — a person, animal, object, place,
+   scene), `search_memories` (a saved memory/trip/album by name or theme), or `none`
+   (general knowledge, chit-chat — **anything else**). There is **no off-topic gate**:
+   chat is a general assistant, so a `none` message is answered from the model's own
+   knowledge, not refused. Any routing failure falls back to `none`.
+2. **Run the tool (only for a library/memory question).**
+   - `search_library` → **SigLIP image↔text** (`search_photos`, §9.2): the query text
+     embedded by SigLIP's text tower, matched against each photo's **image** vector.
+     This is what SigLIP is built for and is the photo finder. Captions / `caption_vec`
+     are **not** used here (plan 17): a lossy text↔text hop that ranked scene-neighbours
+     (an SUV photo whose caption shared "car/sign") next to the real match. Returns the
+     top-k photos.
+   - `search_memories` → memories whose name/theme matches (`memories_for_show`).
+   - `none` → no retrieval.
+3. **Answer — grounded or general, streamed at temperature 0.** For a tool result the
+   model is given ONLY those photos/memories (per photo: id, date, caption, top tags,
+   EXIF facts — camera, lens, ISO, aperture, shutter, focal length, coords — ~60 tokens)
+   and answers **strictly from them**, citing `[photo:ID]`; the grounding prompt forbids
+   inventing a subject not written in a caption and says to report none when the results
+   do not match (honest-empty). For `none`, the model answers from general knowledge with
+   no library mention. Counts / memory-show / periods never reach here — `direct_answer`
+   (step 0) served them straight from SQLite with no model. The answer **streams** over
+   SSE, each `[photo:ID]` rendered as a clickable thumbnail.
 
 **Agentic RAG flow.** Direct-DB first (no model); the semantic tail degrades to
 plain fusion at every stage.
@@ -1444,50 +1360,36 @@ plain fusion at every stage.
 ```mermaid
 flowchart TB
     quest["User question · /chat"] --> direct{"Direct-DB answerable?<br/>direct_answer — total · subject FTS · memory count · memory show/list · periods<br/>conservative: declines when unsure"}
-    direct -->|yes| dbans["Answer straight from SQLite<br/>NO model call · instant even mid-caption (§8.1)<br/>never reaches the planner (kills the 'all'-class bug)<br/>memory-show also renders the Organize card(s) (event: memory)<br/>covers link ctx=chat-memory:key → page within the memory, close → /chat"]
-    direct -->|declines: semantic / relational| gate{"Off-topic gate<br/>one-word classifier: about the photos? (models service /plan)"}
-    gate -->|no| refuse["Short refuse: answers only about your photos<br/>· skips retrieval entirely"]
-    gate -->|yes| plan["1 · Plan → QuerySpec §9.1<br/>hard_filters (EXIF+date) + soft_tags hints"]
-    plan --> core["2 · Core §9.2: candidates() + _hard_filter<br/>same fusion as /library · EXACT EXIF/date cut<br/>query embed: models service /embed/text, HIGH priority —<br/>preempts an in-flight caption on jetson (§8.1)"]
-    core -->|hard filter empties a non-empty pool| honestfilter["Honest 'couldn't find X'<br/>· NO sources (EXIF/date fact mismatch)"]
-    core -->|survivors| rerank["3 · Caption-meaning top-k rank (nomic · search/rerank.py)<br/>NOT core's refine() — its fused rank is unconditional content<br/>NO fixed floor (nomic baseline high) · NO caption vector = kept"]
-    rerank -->|top-k seed| loop["4 · Bounded verify / refine agent loop<br/>candidate tools ONLY: search · similar · nearby (same core)<br/>schema-constrained tool-calls · drops non-fits, never invents"]
-    loop -->|agent verifies none fit| honest["Honest 'couldn't find X'<br/>· NO sources"]
-    loop -->|verified matches| ctx["5 · Context assembly<br/>~60 tok/photo: id · date · caption · tags · EXIF facts"]
-    ctx --> ans["6 · Chat model answers, grounded ONLY on blocks<br/>streams SSE · cites [photo:id] as thumbnails"]
-
-    plan -.->|any failure → degrade| fb["plain semantic + keyword fusion<br/>chat/retrieve.py → core candidates() §9.2 · no second pipeline"]
-    core -.-> fb
-    rerank -.-> fb
-    loop -.-> fb
-    fb --> ans
+    direct -->|yes| dbans["Answer straight from SQLite<br/>NO model call · memory-show also renders the Organize card(s) (event: memory)<br/>covers link ctx=chat-memory:key → page within the memory, close → /chat"]
+    direct -->|declines| route{"1 · Route — planner, temp 0, schema (plan 17)<br/>is it about the user's OWN photos/memories?"}
+    route -->|search_library| lib["2 · SigLIP image↔text (search_photos, §9.2)<br/>query text vs each photo's IMAGE vector · top-k<br/>NO captions / caption_vec"]
+    route -->|search_memories| mem["2 · Memory search by name/theme (memories_for_show)"]
+    route -->|none · general Q / chit-chat| gen["General answer from the model's own knowledge<br/>chat is NOT photo-limited · no off-topic gate · no search"]
+    lib --> ground["3 · Answer grounded ONLY on results<br/>id·date·caption·tags·EXIF · cite [photo:id]<br/>strict: never invent · honest-empty when none match"]
+    mem --> ground
+    ground --> ans["Stream SSE · temp 0 · cites render as thumbnails"]
+    gen --> ans
 ```
 
-**Off-topic guard.** Before retrieving anything, a one-word classifier
-(`chat/retrieve.py::is_photo_question`, prompt in `inference/prompts.py`)
-decides whether the question is actually about the photo collection — broadly:
-any question about the photos, the collection's totals/counts, its memories or
-other organizers, dates/periods, cameras, places, or a follow-up about a number
-the app already showed ("why do I see over 800?"). Only a question that is
-clearly unrelated to the library — general life advice, math, coding, world
-trivia, chit-chat — is refused with a short "I can only answer questions about
-your photos" reply, skipping retrieval entirely so unrelated questions never
-dump the library as false evidence. Any classifier error, or an unexpected
-reply, defaults to on-topic — a gate that occasionally lets an off-topic
-question through is far better than one that blocks a real question. Only
-questions that pass the gate reach retrieval.
+**No off-topic gate (plan 17).** Chat is a general assistant, so it does not refuse
+non-photo questions. The router (step 1) decides whether a message needs the user's
+own photos/memories; when it does not (`none`), the model just answers it. Only a
+library/memory question triggers a search — so unrelated questions never dump the
+library as false evidence, and general questions are answered normally instead of
+being turned away.
 
-The answer is grounded only in the verified matches' captions and tags. When the
-agent verifies that none of the top-k caption-nearest candidates fit, the model is
-instructed to say so rather than invent an answer, and no sources are shown. Captions are model-generated and
+The answer to a library/memory question is grounded ONLY on that tool's results'
+captions/tags/EXIF, and the grounding prompt forbids inventing a subject not written
+in a caption — so when the search returns nothing that matches, the model says it has
+none rather than fabricating one (honest-empty). Captions are model-generated and
 imperfect, so the chat view always shows its sources — the thumbnails are the
-evidence. Shown and stored sources are the ids the answer actually **cites** (a
-subset of the verified matches), never the raw candidate set.
+evidence. Shown and stored sources are the ids the answer actually **cites**, never
+the raw candidate set.
 
-**Degrade, never crash.** Any planner, rerank, embed, or loop failure falls back
-to the plain semantic + keyword fusion, so chat always answers. That fallback is
-itself the core's `candidates()` stage (§9.2) — it re-implements no ranking of its
-own, so fusion lives in exactly one place (plan 12 single-pipeline invariant).
+**Degrade, never crash.** Any route, search, embed, or generation failure falls back
+to a plain answer (a failed route defaults to `none`; a failed `search_library`
+degrades to the core's `candidates()` fusion, §9.2), so chat always answers and no
+ranking is re-implemented outside the core (plan 12 single-pipeline invariant).
 
 The view reads like a normal chat: each question and its grounded answer are kept
 on the page as a running conversation, a processing indicator shows while the
@@ -1798,15 +1700,14 @@ The tool moves other people's photographs, so its defaults are paranoid.
   comes from the `models` service — the only process with GPU access (§5.1) —
   read per profile from the tool that box already ships: `tegrastats`
   (`GR3D_FREQ`) on jetson, `nvidia-smi` on cloud, and nothing on mac (the
-  `models` container has no GPU there, and Ollama exposes no utilization
-  number). `snapshot()` fetches `gpu_pct` best-effort through
+  `models` container has no GPU there, and the host `llama-server` exposes no
+  utilization number). `snapshot()` fetches `gpu_pct` best-effort through
   `ModelsClient.resources()` (the `models` service's own `GET /resources`,
   §5.1), so the bar keeps showing RAM/CPU when the `models` service is down,
   and simply **omits the GPU field** where no GPU is readable. Since
   `app`/`worker` hold no models (§8.1), there is no cross-process lease left
-  to show here — model residency (which of SigLIP/the caption VLM is loaded
-  right now) is an internal concern of the `models` service, observable on
-  its own `/resources` (§8.1), not on this bar.
+  to show here — model residency (SigLIP, loaded once) is an internal concern of
+  the `models` service, observable on its own `/resources` (§8.1), not on this bar.
 - `/upload` — leads with the **folder list**: every folder in the library
   (§3.2c) with its photo count and a confirm-guarded **Delete from library**
   button (a folder mid-deletion shows "deleting…"). Below it, a **directory-only**
@@ -1980,7 +1881,7 @@ storage/
   local.py
   keys.py              # content-addressed storage keys
 inference/
-  client.py            # OpenAI-compatible HTTP client (Ollama and vLLM)
+  client.py            # OpenAI-compatible HTTP client (llama-server and vLLM)
   prompts.py           # caption, planner, chat templates
   fakes.py
 embedding/
@@ -1988,6 +1889,8 @@ embedding/
   vectors.py           # (de)serialize + L2-normalize
   store.py             # photo_vec read/write + KNN
   siglip.py            # real SigLIP 2 (torch, runtime only)
+  caption_text.py      # caption-meaning text embedding (task prefixes) (§9)
+  text_embedder.py     # in-process nomic text embedder (torch, models-service only)
   fakes.py             # deterministic hash-derived vectors for tests
 ingest/
   receive.py           # verify hash, store original, create photo + source rows
@@ -2042,8 +1945,8 @@ tests/
 docs/
 ```
 
-Both Ollama and vLLM expose an OpenAI-compatible API, so one HTTP client covers
-every profile. Only `base_url` and the model name differ.
+Both `llama-server` (mac/jetson) and vLLM (cloud) expose an OpenAI-compatible API,
+so one HTTP client covers every profile. Only `base_url` and the model name differ.
 
 `ivms777_sync` imports nothing from `ivms777`. It has no database, no
 Pillow, no models — only the standard library plus `httpx` — so it installs on a

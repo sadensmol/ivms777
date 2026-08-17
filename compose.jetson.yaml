@@ -1,69 +1,96 @@
 # Jetson profile (JetPack 7): fully containerised, including inference.
 #
 # The NVIDIA container runtime hands the Orin iGPU to containers on JetPack 7, so
-# GPU is available inside all three services via `runtime: nvidia`. 8 GB shared
-# memory means a 4B-class caption model.
+# GPU is available inside the services that declare `runtime: nvidia`. 8 GB shared
+# memory means one small model — plan 16 runs a single gemma4-E2B GGUF.
 services:
-  # Generic ollama on the NVIDIA container runtime — text inference (planner/chat)
-  # runs on the Orin GPU. NOTE: image CAPTIONING (the vision/mtmd path) hangs on
-  # JetPack 7 with this build (an upstream ollama/llama.cpp bug on Orin/JP7 — text
-  # works, any image request deadlocks at 0% CPU). NVIDIA's JP7 ollama image
-  # (ghcr.io/nvidia-ai-iot/ollama:*) has the sm_87 vision kernels but its r38.2/cu13.0
-  # build crashes on this r39.2/cu13.2 box; revisit when a matching r39/cu132 tag
-  # ships. Until then captions stay pending; everything else (embed/tags/search/chat)
-  # works on the GPU. See docs/design.md §3.1.
+  # llama.cpp `llama-server` — THE one inference backend (plan 16). Serves the
+  # single gemma4-E2B GGUF over the OpenAI `/v1` API for BOTH text (planner/chat)
+  # AND vision (caption), with the projector on the GPU (sm_87, §3.1). Replaces
+  # the old Ollama container, whose CUDA build ran vision on the CPU on JP7.
+  #
+  # It REUSES the `llama-server` binary already compiled for sm_87 in the
+  # `llamacpp` external volume (built once inside the cu130 image) — no in-image
+  # recompile. The cu130 image supplies the matching CUDA runtime libs the binary
+  # was linked against. (`Dockerfile.llamacpp.jetson` remains the reproducible
+  # from-scratch builder for a fresh board — see the README.) ALL optimization
+  # flags live here in `command`; the entrypoint fetches the GGUFs into
+  # `llama-models` once. Requires MAXN_SUPER — `make run-jetson` sets it.
   inference:
-    image: ollama/ollama:latest
+    image: ghcr.io/nvidia-ai-iot/ollama:r38.2.arm64-sbsa-cu130-24.04
     runtime: nvidia
     environment:
-      OLLAMA_HOST: 0.0.0.0
-      # The model coordinator assumes Ollama holds exactly one LLM resident at
-      # a time (warm/evict via inference/client.py); cap it so a second
-      # implicit load can't keep both in memory on the 8 GB Orin.
-      OLLAMA_MAX_LOADED_MODELS: 1
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: all
+      LLAMA_BIN: /llamacpp/llama.cpp/build/bin/llama-server
+      LD_LIBRARY_PATH: /llamacpp/llama.cpp/build/bin
+      LLAMA_MODEL_DIR: /models
+    entrypoint: ["/bin/sh", "/opt/ivms777/llama-server-entrypoint.sh"]
+    command:
+      - -m
+      - /models/gemma-4-E2B-it-Q4_K_M.gguf
+      - --mmproj
+      - /models/mmproj-F16.gguf
+      - -ngl
+      - "99"
+      - --flash-attn
+      - "on"
+      - --jinja
+      - --chat-template-kwargs
+      - '{"enable_thinking":false}'
+      - -c
+      - "4096"
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
     volumes:
-      - ollama-models:/root/.ollama
+      - llamacpp:/llamacpp             # prebuilt sm_87 llama-server binary + libs (reused, no recompile)
+      - llama-models:/models           # gemma GGUF + mmproj, fetched once
+      - ./scripts/llama-server-entrypoint.sh:/opt/ivms777/llama-server-entrypoint.sh:ro
     ports:
-      - "11434:11434"
+      - "8080:8080"
 
-  # app/worker are thin clients (design §5.1, plan 15 task 6) — no GPU, no
-  # torch, the same slim `Dockerfile` as every other profile. Only the
-  # `models` service needs the iGPU.
+  # app/worker are thin clients (design §5.1) — no GPU, no torch, the same slim
+  # `Dockerfile` as every other profile. Only `inference` and `models` need the iGPU.
   app:
     build: .
     environment:
       IVMS777_PROFILE: jetson
-      IVMS777_PLANNER_MODEL: ${IVMS777_PLANNER_MODEL:-qwen2.5:3b}
+      IVMS777_PLANNER_MODEL: ${IVMS777_PLANNER_MODEL:-gemma4-E2B}
     depends_on: [models]
   worker:
     build: .
     environment:
       IVMS777_PROFILE: jetson
-      IVMS777_PLANNER_MODEL: ${IVMS777_PLANNER_MODEL:-qwen2.5:3b}
+      IVMS777_PLANNER_MODEL: ${IVMS777_PLANNER_MODEL:-gemma4-E2B}
     depends_on: [models]
 
-  # SigLIP + the in-process caption VLM run with embed_device=cuda, so this is
-  # the one container that needs GPU access. Builds from Dockerfile.models.jetson
-  # (python:3.12-slim + cu132 torch), which gives CUDA torch on JetPack 7; the
-  # default python:3.12-slim image's aarch64 torch is CPU-only. See docs/design.md §3.1.
-  #
-  # 8 GB Orin: caption + planner default to a 4B-class captioner and a 3B planner
-  # (config.py jetson defaults). Override via IVMS777_CAPTION_MODEL /
-  # IVMS777_PLANNER_MODEL — `make run-jetson` passes them through and pulls them.
+  # SigLIP + the in-process caption-text embedder (nomic) run with
+  # embed_device=cuda, so this container needs GPU access. Builds from
+  # Dockerfile.models.jetson (python:3.12-slim + cu132 torch), which gives CUDA
+  # torch on JetPack 7. Captioning is NO LONGER in-process — it is an OpenAI call
+  # to the `inference` service above (design §3.1/§5.1, plan 16).
   models:
     build:
       context: .
       dockerfile: Dockerfile.models.jetson
     runtime: nvidia
     environment:
-      # The slim base doesn't declare these (the ollama image does), so without
-      # them the nvidia runtime injects no driver libs and torch sees no GPU.
+      # The slim base doesn't declare these (the cuda images do), so without them
+      # the nvidia runtime injects no driver libs and torch sees no GPU.
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: all
       IVMS777_PROFILE: jetson
-      IVMS777_CAPTION_MODEL: ${IVMS777_CAPTION_MODEL:-qwen2.5vl:3b}
-      IVMS777_PLANNER_MODEL: ${IVMS777_PLANNER_MODEL:-qwen2.5:3b}
+      IVMS777_CAPTION_MODEL: ${IVMS777_CAPTION_MODEL:-gemma4-E2B}
+      IVMS777_PLANNER_MODEL: ${IVMS777_PLANNER_MODEL:-gemma4-E2B}
     depends_on: [inference]
 
 volumes:
-  ollama-models:
+  # The prebuilt sm_87 llama-server binary lives here, created out-of-band (built
+  # once inside the cu130 image). `external` = use the existing volume as-is, never
+  # recreate. A fresh board populates it once via `Dockerfile.llamacpp.jetson`
+  # (README) or by building llama.cpp into it.
+  llamacpp:
+    external: true
+  llama-models:

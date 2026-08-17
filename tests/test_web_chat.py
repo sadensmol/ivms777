@@ -291,15 +291,20 @@ def test_chat_stream_never_aborts_when_the_coordinator_lease_times_out(settings,
     assert "event: done" in body
 
 
-def test_off_topic_question_is_refused_without_retrieval(settings, monkeypatch):
-    # The classifier says "no" -> canned refusal, no photos retrieved, still persisted.
+def test_off_topic_question_is_answered_generally(settings, monkeypatch):
+    # Chat is NOT photo-limited (plan 17): a general question routes to `none` and is
+    # answered directly by the model — no library search, no refusal — still persisted.
     settings.data_dir.mkdir(parents=True, exist_ok=True)
-    fake = FakeInferenceClient(responses=["no"])
+    fake = FakeInferenceClient(
+        responses=['{"tool": "none", "query": null}'],   # router: general, no tool
+        streams=[["Walking", " is", " fine."]],           # the model's general answer
+    )
     monkeypatch.setattr(Settings, "build_inference_client", lambda self: (fake, "fake"))
     app = create_app(settings)
     with TestClient(app) as tc:
         body = tc.get("/chat/stream?q=should+I+walk+or+drive").text
-        assert "only answer questions about your photos" in body
-        assert "event: sources" not in body           # nothing retrieved, no strip
+        assert "Walking" in body and "fine." in body      # answered from general knowledge
+        assert "only answer questions about your photos" not in body  # not refused
         history = tc.get("/chat").text
-        assert "should I walk or drive" in history     # the refused turn is saved
+        assert "should I walk or drive" in history         # the turn is saved
+        assert "Walking is fine." in history               # persisted joined answer

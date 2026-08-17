@@ -34,6 +34,7 @@ class FakeInferenceClient:
         *,
         json_schema: dict | None = None,
         timeout: float = 120.0,
+        temperature: float | None = None,
         should_stop: Callable[[], bool] | None = None,
     ) -> str:
         if should_stop is not None and should_stop():
@@ -42,7 +43,7 @@ class FakeInferenceClient:
         assert self._responses, "FakeInferenceClient ran out of queued responses"
         return self._responses.pop(0)
 
-    def stream(self, model, messages, *, timeout: float = 120.0):
+    def stream(self, model, messages, *, timeout: float = 120.0, temperature: float | None = None):
         self.calls.append((model, messages))
         assert self._streams, "FakeInferenceClient ran out of queued streams"
         yield from self._streams.pop(0)

@@ -57,8 +57,10 @@ class InferenceClient(Protocol):
 class OpenAICompatClient:
     """Talks to anything speaking the OpenAI chat-completions API.
 
-    That covers Ollama (mac, jetson) and vLLM (cloud), so swapping the inference
-    backend is a base_url change, not a code change.
+    That covers llama.cpp `llama-server` (mac, jetson) and vLLM (cloud), so
+    swapping the inference backend is a base_url change, not a code change.
+    `warm`/`evict`/`loaded_models` use Ollama-native endpoints and are no-ops
+    against llama-server (nothing calls them on the llama-server path).
     """
 
     def __init__(
@@ -80,9 +82,12 @@ class OpenAICompatClient:
         *,
         json_schema: dict | None = None,
         timeout: float = 120.0,
+        temperature: float | None = None,
         should_stop: Callable[[], bool] | None = None,
     ) -> str:
         payload: dict = {"model": model, "messages": messages}
+        if temperature is not None:
+            payload["temperature"] = temperature
         if json_schema is not None:
             payload["response_format"] = {
                 "type": "json_schema",
@@ -149,8 +154,11 @@ class OpenAICompatClient:
         messages: list[ChatMessage],
         *,
         timeout: float = 120.0,
+        temperature: float | None = None,
     ) -> Iterator[str]:
-        payload = {"model": model, "messages": messages, "stream": True}
+        payload: dict = {"model": model, "messages": messages, "stream": True}
+        if temperature is not None:
+            payload["temperature"] = temperature
         with self._client.stream(
             "POST", "/chat/completions", json=payload, timeout=timeout
         ) as response:

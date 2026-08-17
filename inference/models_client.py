@@ -10,15 +10,6 @@ from collections.abc import Iterator
 import httpx
 
 
-class ModelsCaptionPreempted(RuntimeError):
-    """The `models` service preempted an in-flight caption for a
-    higher-priority interactive embed (§8.1, plan 15 task 5) — the
-    client-side counterpart of `modelsvc.residency.CaptionPreempted`, raised
-    on a 503 from `/caption`. `ingest.caption.caption_handler` catches this
-    and maps it to `ingest.worker.Preempted` so the job stays pending
-    instead of burning a retry."""
-
-
 class ModelsClient:
     def __init__(self, base_url: str, transport: httpx.BaseTransport | None = None) -> None:
         self._client = httpx.Client(base_url=base_url.rstrip("/"), transport=transport)
@@ -47,8 +38,6 @@ class ModelsClient:
     ) -> dict:
         payload = {"image": base64.b64encode(image).decode(), "dimensions": dimensions}
         response = self._client.post("/caption", json=payload, timeout=timeout)
-        if response.status_code == 503:
-            raise ModelsCaptionPreempted()
         response.raise_for_status()
         return response.json()
 

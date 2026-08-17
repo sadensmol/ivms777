@@ -1,13 +1,13 @@
-# Mac profile: everything containerised except Ollama.
+# Mac profile: everything containerised except the inference server.
 #
 # Docker Desktop on macOS runs a Linux VM with no Metal passthrough, so a
 # containerised model would silently fall back to CPU and run several times
-# slower. Ollama therefore runs natively on the host and the `models` service
-# is the ONLY container that reaches it, through host.docker.internal —
-# app/worker are thin clients and never talk to Ollama directly (design §5.1).
-# Build/run natively on Apple Silicon (arm64). The Linux arm64 torch wheel is
-# CPU-only, so SigLIP runs on CPU (§4) without pulling ~2 GB of unused NVIDIA CUDA
-# libraries the amd64 wheel would drag in — and native arm64 avoids emulation.
+# slower. Since plan 16 the inference server is a host-native `llama-server`
+# (Metal) serving one gemma4-E2B GGUF for text + vision; the `models` service is
+# the ONLY container that reaches it, at host.docker.internal:8080 — app/worker
+# are thin clients and never talk to it directly (design §5.1). Build/run natively
+# on Apple Silicon (arm64). The Linux arm64 torch wheel is CPU-only, so SigLIP and
+# the in-process caption-text embedder run on CPU (§4).
 services:
   app:
     platform: linux/arm64
@@ -21,6 +21,6 @@ services:
     platform: linux/arm64
     environment:
       IVMS777_PROFILE: mac
-      IVMS777_INFERENCE_BASE_URL: http://host.docker.internal:11434/v1
+      IVMS777_INFERENCE_BASE_URL: http://host.docker.internal:8080/v1
     extra_hosts:
       - "host.docker.internal:host-gateway"

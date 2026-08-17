@@ -54,6 +54,81 @@ _TOOL_CALL_SCHEMA = {
     "required": ["action", "tool", "query", "photo_id", "photo_ids"],
 }
 
+# --- Agentic tool router (plan 17) --------------------------------------------
+# Chat is a GENERAL assistant that is ALSO agentic over the user's library. It is
+# NOT limited to photo questions: general knowledge / chit-chat is answered directly.
+# One schema-constrained routing decision picks a tool ONLY when the question is
+# about the user's own photos or memories — otherwise `none` (answer from the model's
+# own knowledge). The photo tool is SigLIP **image↔text** (`search_library`), which is
+# what SigLIP is for; captions/`caption_vec` are not used here (plan 17, §10).
+_ROUTER_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "tool": {"type": "string", "enum": ["search_library", "search_memories", "none"]},
+        "query": {"type": ["string", "null"]},
+    },
+    "required": ["tool", "query"],
+}
+_ROUTER_SYSTEM = (
+    "You route a chat message for a personal photo app. Pick the ONE tool needed to "
+    "answer it, using the user's OWN photos/memories only when the message is about "
+    "them:\n"
+    "- search_library: the user wants their photos OF something (a person, animal, "
+    "object, place, scene, activity). Set query to the visual thing to find, e.g. "
+    "'a man in black', 'dogs', 'the beach at sunset'.\n"
+    "- search_memories: the user asks about one of their saved memories/trips/albums "
+    "by name or theme. Set query to that name or theme.\n"
+    "- none: ANYTHING ELSE — general knowledge, facts, advice, chit-chat, or any "
+    "question not about the user's own photos/memories. The assistant answers these "
+    "itself; DO NOT force a photo search.\n"
+    "Reply with ONLY the JSON object."
+)
+
+
+def route(client: InferenceClient, model: str, question: str) -> dict:
+    """One agentic routing decision (plan 17): which tool, if any, this question needs.
+    Returns {"tool": "search_library"|"search_memories"|"none", "query": str|None}.
+    Any failure routes to `none` so chat still answers (as a general assistant)."""
+    messages = [
+        {"role": "system", "content": _ROUTER_SYSTEM},
+        {"role": "user", "content": question},
+    ]
+    try:
+        raw = client.complete(
+            model, messages, json_schema=_ROUTER_SCHEMA, timeout=20.0, temperature=0
+        )
+    except Exception:  # noqa: BLE001 — backend without structured output → plain call
+        try:
+            raw = client.complete(model, messages, timeout=20.0, temperature=0)
+        except Exception:  # noqa: BLE001 — router is best-effort; default to a plain answer
+            return {"tool": "none", "query": None}
+    start, end = raw.find("{"), raw.rfind("}")
+    if start == -1 or end <= start:
+        return {"tool": "none", "query": None}
+    try:
+        parsed = json.loads(raw[start : end + 1])
+    except (json.JSONDecodeError, ValueError):
+        return {"tool": "none", "query": None}
+    tool = parsed.get("tool")
+    if tool not in ("search_library", "search_memories"):
+        tool = "none"
+    return {"tool": tool, "query": (parsed.get("query") or "").strip() or None}
+
+
+def search_library(
+    conn: sqlite3.Connection, embedder: Embedder, owner_id: int, query: str, *, k: int = 12
+) -> list[int]:
+    """The photo-finder tool: SigLIP **image↔text** retrieval (query text vs each
+    photo's image embedding) — `search_photos`, best first. No captions (plan 17)."""
+    return search_photos(conn, embedder, owner_id, query, k=k)
+
+
+def search_memories(conn: sqlite3.Connection, owner_id: int, query: str) -> list[dict]:
+    """The memory-finder tool: memories whose name/theme matches `query` (or all of
+    them for a plural/all request), as {name, date, size} (reuses `memories_for_show`)."""
+    return memories_for_show(conn, owner_id, query)
+
 
 def retrieve(
     conn: sqlite3.Connection,

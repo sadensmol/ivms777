@@ -11,12 +11,11 @@ import base64
 import json
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from modelsvc.backends.base import ModelBackend
-from modelsvc.residency import CaptionPreempted
 
 
 class ImageEmbedRequest(BaseModel):
@@ -113,15 +112,7 @@ def create_models_app(backend: ModelBackend) -> FastAPI:
     @app.post("/caption", response_model=CaptionResponse)
     def caption(req: CaptionRequest) -> CaptionResponse:
         image = base64.b64decode(req.image)
-        try:
-            result = backend.caption(image, req.dimensions)
-        except CaptionPreempted as exc:
-            # An interactive embed preempted this in-flight caption (§8.1,
-            # plan 15 task 5) — 503 tells `ModelsClient` to raise
-            # `ModelsCaptionPreempted`, which `caption_handler` maps to
-            # `Preempted` (job stays pending, never a burnt retry).
-            raise HTTPException(status_code=503, detail="caption preempted") from exc
-        return CaptionResponse(**result)
+        return CaptionResponse(**backend.caption(image, req.dimensions))
 
     @app.post("/text/complete", response_model=TextCompleteResponse)
     def text_complete(req: TextCompleteRequest) -> TextCompleteResponse:

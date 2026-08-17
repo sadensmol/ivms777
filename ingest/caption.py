@@ -5,12 +5,12 @@ from embedding.caption_text import embed_caption_texts
 from embedding.store import write_caption_vector
 from embedding.vectors import l2_normalize
 from inference.client import InferenceClient
-from inference.models_client import ModelsCaptionPreempted, ModelsClient
+from inference.models_client import ModelsClient
 from ingest.jobs import enqueue
 from ingest.taxonomy import reindex_fts
 from ingest.thumbs import thumb_key
 from ingest.vocab import tag_id_map
-from ingest.worker import Preempted, StageHandler
+from ingest.worker import StageHandler
 from storage.base import Storage
 
 
@@ -26,17 +26,15 @@ def caption_handler(
     vlm tags, written straight to the DB. It does NOT embed the caption: the
     caption-vector (§9) is a SEPARATE, batched step (`backfill_caption_vectors`,
     pipeline group 2c) that embeds captions with the dedicated text embedder
-    (`nomic-embed-text`) — a different model/backend, so it is not interleaved with
-    the caption VLM per photo. Drains last (§8). A `models_client.caption` error
-    raises so the queue retries the job rather than writing half a row.
+    (`nomic-embed-text`, in-process in the `models` service) — a different model,
+    so it is not interleaved with the caption call per photo. Drains last (§8). A
+    `models_client.caption` error raises so the queue retries the job rather than
+    writing half a row.
 
-    `should_preempt` is still threaded through for the stage's own
-    between-photo yield point (`ingest.worker.drain`); aborting an in-flight
-    `/caption` call mid-VLM-call is now the service's own concern (§8.1, plan
-    15 task 5's `modelsvc.residency`). The service maps that abort to HTTP 503,
-    `models_client.caption` raises `ModelsCaptionPreempted`, and this stage
-    maps THAT to `ingest.worker.Preempted` (job stays pending, no burnt
-    retry — the plan-14 invariant, now carried over HTTP).
+    `should_preempt` is still threaded through for the stage's own between-photo
+    yield point (`ingest.worker.drain`). Since plan 16 captioning is a remote
+    OpenAI call to llama-server (not an in-process GPU model), there is nothing to
+    preempt mid-call — SigLIP is the only heavy in-process model left (§8.1).
     """
 
     def handle(conn: sqlite3.Connection, photo_id: int) -> None:
@@ -49,10 +47,7 @@ def caption_handler(
         # Prefer the detail thumbnail; fall back to the grid one the photo already has.
         image_key = detail_key if derived.exists(detail_key) else row["thumb_key"]
         image = derived.read(image_key)
-        try:
-            result = models_client.caption(image, dimensions)
-        except ModelsCaptionPreempted as exc:
-            raise Preempted() from exc
+        result = models_client.caption(image, dimensions)
 
         conn.execute(
             "UPDATE photos SET caption=?, caption_model=?, ai_title=?, ai_description=? WHERE id=?",

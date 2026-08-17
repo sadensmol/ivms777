@@ -6,14 +6,16 @@ from config import Settings
 def test_defaults_to_mac_profile():
     s = Settings(data_dir=Path("/tmp/pl"))
     assert s.profile == "mac"
-    assert s.caption_model == "qwen2.5vl:7b"
+    # One gemma4-E2B GGUF on llama-server serves text + vision (plan 16).
+    assert s.caption_model == "gemma4-E2B"
+    assert s.planner_model == "gemma4-E2B"
     assert s.embed_device == "cpu"
 
 
 def test_jetson_profile_overrides_model_and_device():
     s = Settings(profile="jetson", data_dir=Path("/tmp/pl"))
-    assert s.caption_model == "qwen2.5vl:3b"
-    assert s.planner_model == "qwen2.5:3b"
+    assert s.caption_model == "gemma4-E2B"
+    assert s.planner_model == "gemma4-E2B"
     assert s.embed_device == "cuda"
 
 

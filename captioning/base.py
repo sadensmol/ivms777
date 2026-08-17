@@ -1,12 +1,12 @@
 """Captioner protocol and result type (design §4).
 
 `Captioner` is the seam between the caption pipeline stage and whatever
-actually produces a caption — today's Ollama/OpenAI-compatible backend, or
-(later) an in-process Jetson VLM. Both implementations return the exact same
-`CaptionResult` shape.
+actually produces a caption. Since plan 16 there is one implementation —
+`OpenAICaptioner` over an OpenAI-compatible backend (llama-server / vLLM) — but
+the protocol stays so the `models` service's `CaptionBackend` is written against
+it, not a concrete class.
 """
 
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -23,11 +23,4 @@ class Captioner(Protocol):
     name: str
     caption_model: str
 
-    def caption(self, image: bytes, dimensions: list[str], *,
-                should_preempt: Callable[[], bool] = lambda: False) -> CaptionResult: ...
-
-    def load(self) -> None: ...
-
-    def release(self) -> None: ...
-
-    def footprint_mb(self) -> int: ...
+    def caption(self, image: bytes, dimensions: list[str]) -> CaptionResult: ...

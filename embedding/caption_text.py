@@ -1,10 +1,12 @@
-"""Caption-meaning text embeddings (§9) — a dedicated **text** embedder reached
-through the inference client (Ollama), NOT SigLIP.
+"""Caption-meaning text embeddings (§9) — a dedicated **text** embedder, NOT SigLIP.
 
 SigLIP's text tower is trained for image↔text, so text↔text cosines collapse into a
 narrow band with no separation (measured; design §4). A purpose-built text embedder
-(`nomic-embed-text` by default — benchmark in §4) gives real neighbour ordering, so a
-query can KNN meaning-similar captions out of a huge library without the LLM looping.
+(`nomic-embed-text-v1.5` by default — benchmark in §4) gives real neighbour ordering,
+so a query can KNN meaning-similar captions out of a huge library without the LLM
+looping. Since plan 16 dropped Ollama, it is loaded IN-PROCESS in the `models`
+service (`embedding/text_embedder.py`); `client.embed` reaches it over the models
+gateway (`/text/embed`), same call shape as before.
 
 Such embedders need a task prefix on each input; the pair is model-specific, so it
 lives here (one place) keyed by model name. Query and document use different prefixes.

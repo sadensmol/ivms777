@@ -6,7 +6,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from inference.models_client import ModelsCaptionPreempted, ModelsClient
+from inference.models_client import ModelsClient
 from modelsvc.app import create_models_app
 from modelsvc.backends.fake import FakeBackend
 
@@ -42,22 +42,7 @@ def test_caption_round_trips():
     assert set(result.keys()) == {"caption", "title", "description", "tags", "model"}
 
 
-def test_caption_raises_models_caption_preempted_on_a_503_response():
-    # The seam side of Deliverable 3 (§8.1, plan 15 task 5): a 503 from
-    # `/caption` (the service preempted an in-flight caption) must raise a
-    # distinct client-side exception, NOT the generic `raise_for_status()`
-    # error — `caption_handler` catches this specific type to avoid a burnt
-    # retry.
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(503, json={"detail": "caption preempted"})
-
-    client = ModelsClient("http://modelsvc", transport=httpx.MockTransport(handler))
-
-    with pytest.raises(ModelsCaptionPreempted):
-        client.caption(b"image-bytes", ["scene"])
-
-
-def test_caption_still_raises_for_other_error_statuses():
+def test_caption_raises_for_error_statuses():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500, json={"detail": "boom"})
 

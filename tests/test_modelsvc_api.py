@@ -8,23 +8,12 @@ from fastapi.testclient import TestClient
 
 from modelsvc.app import create_models_app
 from modelsvc.backends.fake import FakeBackend
-from modelsvc.residency import CaptionPreempted
 
 _IMAGE_B64 = base64.b64encode(b"not-really-a-jpeg").decode()
 
 
 def _client() -> TestClient:
     return TestClient(create_models_app(FakeBackend()))
-
-
-class _PreemptingBackend(FakeBackend):
-    """A backend whose caption() was preempted by a higher-priority embed
-    in-flight (§8.1, plan 15 task 5) — proves the `/caption` route maps
-    `CaptionPreempted` to HTTP 503, the seam `ModelsClient`/`caption_handler`
-    rely on to never burn a retry on preempt."""
-
-    def caption(self, image: bytes, dimensions: list[str]) -> dict:
-        raise CaptionPreempted()
 
 
 def test_embed_image_returns_one_vector_per_image():
@@ -72,15 +61,8 @@ def test_caption_returns_the_expected_shape():
     assert set(data.keys()) == {"caption", "title", "description", "tags", "model"}
     assert isinstance(data["caption"], str) and data["caption"]
     assert isinstance(data["tags"], dict)
-    # The ACTUAL model the backend used (jetson's differs from settings.caption_model).
+    # The ACTUAL model the backend used (may differ from settings.caption_model).
     assert data["model"] == "fake"
-
-
-def test_caption_preempted_by_residency_returns_503():
-    with TestClient(create_models_app(_PreemptingBackend())) as tc:
-        resp = tc.post("/caption", json={"image": _IMAGE_B64, "dimensions": ["scene"]})
-    assert resp.status_code == 503
-    assert resp.json()["detail"] == "caption preempted"
 
 
 def test_text_complete_returns_text():

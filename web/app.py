@@ -24,7 +24,13 @@ from albums.memory_store import (
     stored_signature,
 )
 from albums.registry import ORGANIZERS, get_organizer
-from chat.agent import direct_answer, memories_for_show, retrieve
+from chat.agent import (
+    direct_answer,
+    memories_for_show,
+    route,
+    search_library,
+    search_memories,
+)
 from chat.context import build_context as build_chat_context
 from chat.history import (
     add_message,
@@ -33,9 +39,8 @@ from chat.history import (
     new_session,
     session_messages,
 )
-from chat.retrieve import is_photo_question
 from config import Settings
-from inference.prompts import chat_messages
+from inference.prompts import chat_messages, general_chat_messages
 from ingest.folders import enqueue_folder_deletion, list_folders
 from ingest.jobs import (
     STAGES,
@@ -783,10 +788,6 @@ def create_app(settings: Settings) -> FastAPI:
             "folders": list_folders(ctx.conn, ctx.settings.owner_id),
         }
 
-    OFF_TOPIC_REPLY = (
-        "I can only answer questions about your photos — try asking what's in "
-        "them, or when and where they were taken."
-    )
     BUSY_REPLY = (
         "The library is busy processing photos right now — please try again "
         "in a moment."
@@ -886,31 +887,32 @@ def create_app(settings: Settings) -> FastAPI:
             coordinator = ctx.make_coordinator(client, "app")
             try:
                 with coordinator.require("CHAT"):
-                    embedder, _ = ctx.settings.build_embedder()
-                    if not is_photo_question(client, model, q):
-                        yield f"data: {json.dumps({'delta': OFF_TOPIC_REPLY})}\n\n"
-                        add_message(ctx.conn, session_id, q, OFF_TOPIC_REPLY, [])
-                        yield _done()
-                        return
-                    # Standard RAG (§10), semantic tail only: plan -> fuse -> hard-filter
-                    # -> rank by caption meaning -> take the top-N. Those photos go
-                    # straight into the context; the answering model grounds ONLY on them
-                    # and cites the ones that match (`_CHAT_SYSTEM`), or says it has none
-                    # when nothing in the context fits. No agent verify/expand loop — the
-                    # retrieved captions ARE the evidence. Counts/memories/periods never
-                    # reach here — direct_answer handled them above.
-                    ids = retrieve(
-                        ctx.conn, embedder, client,
-                        owner_id=owner_id, question=q, dimensions=list(vocab.dimensions),
-                        caption_embed_model=ctx.settings.caption_embed_model,
-                        tag_score_min=ctx.settings.tag_score_min,
-                        planner_model=model, k=12,
-                    )
-                    context_block = build_chat_context(ctx.conn, ids)
-                    messages = chat_messages(q, context_block)
+                    # Agentic RAG (plan 17, §10): ONE routing decision picks a tool only
+                    # when the question is about the user's own photos/memories — general
+                    # knowledge / chit-chat is answered directly (chat is NOT photo-limited,
+                    # no off-topic gate). The photo tool is SigLIP image↔text
+                    # (`search_library`); memories via `search_memories`. `direct_answer`
+                    # (above) already served pure DB counts / memory-show / periods with no
+                    # model. Grounded answers cite [photo:ID]; general answers do not search.
+                    decision = route(client, model, q)
+                    if decision["tool"] == "search_library":
+                        embedder, _ = ctx.settings.build_embedder()
+                        ids = search_library(
+                            ctx.conn, embedder, owner_id, decision["query"] or q, k=12
+                        )
+                        messages = chat_messages(q, build_chat_context(ctx.conn, ids))
+                    elif decision["tool"] == "search_memories":
+                        mems = search_memories(ctx.conn, owner_id, decision["query"] or q)
+                        block = "memories: " + (
+                            "; ".join(f"{m['name']} ({m['size']} photos)" for m in mems)
+                            or "none"
+                        )
+                        messages = chat_messages(q, block)
+                    else:  # general knowledge / chit-chat — answer directly, no search
+                        messages = general_chat_messages(q)
                     parts: list[str] = []
                     started_at = None
-                    for delta in client.stream(model, messages):
+                    for delta in client.stream(model, messages, temperature=0):
                         if started_at is None:  # clock starts at the first token, not the wait before it
                             started_at = time.monotonic()
                         parts.append(delta)

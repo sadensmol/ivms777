@@ -1,6 +1,5 @@
 from pathlib import Path
 
-import pytest
 from fastapi.testclient import TestClient
 
 from inference.models_client import ModelsClient
@@ -8,9 +7,8 @@ from ingest.caption import caption_handler
 from ingest.jobs import enqueue, stage_counts
 from ingest.thumbs import thumb_key
 from ingest.vocab import load_vocab, seed_tags
-from ingest.worker import Preempted, drain
+from ingest.worker import drain
 from modelsvc.app import create_models_app
-from modelsvc.residency import CaptionPreempted
 from storage.local import LocalStorage
 from tests.factories import add_photo
 from tests.fixtures import make_jpeg
@@ -171,31 +169,3 @@ def test_models_client_caption_error_leaves_the_photo_uncaptioned(conn, tmp_path
 
     assert conn.execute("SELECT caption FROM photos WHERE id = 1").fetchone()["caption"] is None
     assert stage_counts(conn, "caption")["done"] == 0  # not marked done; retried later
-
-
-def test_a_preempted_caption_leaves_the_job_pending_with_no_burnt_retry(conn, tmp_path):
-    # The preempt -> retry seam over HTTP (§8.1, plan 15 task 5, Deliverable
-    # 3): the service's `/caption` route returned 503 (an interactive embed
-    # preempted this caption), `ModelsClient.caption` raised
-    # `ModelsCaptionPreempted`, and `caption_handler` must map that to
-    # `ingest.worker.Preempted` — NOT a normal failure — so the job goes back
-    # to 'pending' (not 'failed', no burnt attempt) and the photo stays
-    # uncaptioned for the next drain to retry.
-    derived = LocalStorage(tmp_path / "thumbs")
-    seed_tags(conn, VOCAB)
-    _photo_with_detail_thumb(conn, derived, 1, "ff" * 32)
-    backend = FakeCaptionBackend(error=CaptionPreempted())
-    models_client = _models_client(backend)
-    enqueue(conn, 1, "caption")
-
-    with pytest.raises(Preempted):
-        drain(
-            conn,
-            {"caption": caption_handler(derived, models_client, DIMS, 1600)},
-        )
-
-    assert conn.execute("SELECT caption FROM photos WHERE id = 1").fetchone()["caption"] is None
-    counts = stage_counts(conn, "caption")
-    assert counts["pending"] == 1  # requeued, not failed/done
-    assert counts["failed"] == 0
-    assert counts["done"] == 0

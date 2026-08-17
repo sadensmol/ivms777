@@ -45,10 +45,10 @@ def test_build_backend_returns_fake_backend_when_use_fake_embedder(tmp_path):
 
 
 def test_build_backend_real_path_wires_text_and_shares_one_inference_client(tmp_path):
-    # Construct-only, no network: SiglipBackend/OllamaCaptioner/TextBackend are
+    # Construct-only, no network: SiglipBackend/OpenAICaptioner/TextBackend are
     # all lazy about actually calling out. Proves the real path wires
     # text=TextBackend and that caption + text share ONE inference client
-    # (the single Ollama gateway, deliverable 7).
+    # (the single llama-server/vLLM gateway, design §5.1).
     settings = Settings(data_dir=tmp_path, profile="mac")
     backend = build_backend(settings)
     assert isinstance(backend, CompositeBackend)
@@ -111,15 +111,14 @@ def test_composite_backend_resources_reports_siglip_resident():
 
 
 def test_composite_backend_resources_reports_the_residency_resident_list_when_wired():
-    residency = Residency(exclusive=True)
+    residency = Residency()
     residency.register("siglip", lambda: None, lambda: None)
-    residency.register("caption", lambda: None, lambda: None)
-    with residency.use("caption", priority=1):
+    with residency.use("siglip", priority=1):
         pass
 
     backend = CompositeBackend(embed=_StubEmbed(), residency=residency)
 
-    assert backend.resources()["resident"] == ["caption"]  # NOT the Task-2 placeholder
+    assert backend.resources()["resident"] == ["siglip"]  # from the residency, not the placeholder
 
 
 def test_composite_backend_resources_falls_back_to_the_placeholder_without_residency():
@@ -199,15 +198,16 @@ def test_siglip_backend_without_residency_behaves_as_before():
     assert backend.embed_text(["dog"]) == [[0.3]]
 
 
-def test_build_backend_wires_an_exclusive_residency_on_jetson(tmp_path):
+def test_build_backend_wires_a_non_exclusive_residency_on_jetson(tmp_path):
+    # Since plan 16 there is no in-process caption VLM, so residency is always
+    # non-exclusive and SigLIP is the only model wired into it (the captioner is a
+    # remote OpenAI call).
     settings = Settings(data_dir=tmp_path, profile="jetson", use_fake_inference=True)
     backend = build_backend(settings)
     assert isinstance(backend, CompositeBackend)
     assert backend._residency is not None
-    assert backend._residency._exclusive is True
-    # ONE Residency shared by both heavy sub-backends.
+    assert backend._residency._exclusive is False
     assert backend._embed._residency is backend._residency
-    assert backend._caption._residency is backend._residency
 
 
 def test_build_backend_wires_a_non_exclusive_residency_on_mac(tmp_path):
@@ -215,4 +215,3 @@ def test_build_backend_wires_a_non_exclusive_residency_on_mac(tmp_path):
     backend = build_backend(settings)
     assert backend._residency._exclusive is False
     assert backend._embed._residency is backend._residency
-    assert backend._caption._residency is backend._residency

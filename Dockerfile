@@ -1,3 +1,6 @@
+# syntax=docker/dockerfile:1
+# app/worker thin-client image (torch-free). The `uv sync` uses a BuildKit cache
+# mount so its wheels are reused across rebuilds instead of re-downloaded.
 FROM python:3.12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -8,7 +11,8 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 WORKDIR /app
 COPY pyproject.toml uv.lock* README.md ./
-RUN uv sync --no-dev --frozen --no-install-project || uv sync --no-dev --no-install-project
+RUN --mount=type=cache,target=/root/.cache/uv \
+      uv sync --no-dev --frozen --no-install-project || uv sync --no-dev --no-install-project
 
 # Flat layout: each top-level package lives at the repo root.
 COPY config.py vocab.yaml ./

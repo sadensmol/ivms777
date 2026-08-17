@@ -1,6 +1,9 @@
+# syntax=docker/dockerfile:1
 # The `models` service (mac/cloud) — the one process that loads torch/
 # transformers (design §5.1, plan 15 task 6). app/worker are thin clients and
-# never install these; this image is the only one that does.
+# never install these; this image is the only one that does. The `uv sync` uses a
+# BuildKit cache mount so the torch/transformers wheels are stored on the builder
+# and reused across rebuilds instead of re-downloaded.
 FROM python:3.12-slim
 
 # libheif1: HEIC decoding (pillow-heif, used by the image embedder's input
@@ -16,7 +19,8 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 WORKDIR /app
 COPY pyproject.toml uv.lock* README.md ./
-RUN uv sync --no-dev --extra models --frozen || uv sync --no-dev --extra models
+RUN --mount=type=cache,target=/root/.cache/uv \
+      uv sync --no-dev --extra models --frozen || uv sync --no-dev --extra models
 
 # Flat layout: only the modules the models service actually imports — it
 # never touches web/chat/ingest/search/storage/db/albums.

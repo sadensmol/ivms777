@@ -98,12 +98,12 @@ class CompositeBackend:
             resident = list(self._residency.resident())
         else:
             resident = ["siglip"] if self._embed is not None else []
-        # The text model (Ollama on mac/cloud) is shown ONLY while text is the
-        # active op — a chat/planning turn actually uses it. Ollama keeps it warm
-        # for minutes after a chat, but listing it during an unrelated embedding
-        # is misleading ("embedding needs only SigLIP, why is qwen loaded?"): the
-        # bar shows the models the CURRENT op uses, like the old workload set (§13).
-        if self._text is not None and active in ("chat", "planning"):
+        # The text model (llama-server / vLLM) is a SEPARATE always-on process that
+        # keeps its one model loaded for its whole life and also serves captioning, so
+        # it is resident in EVERY state — show it always (idle, embedding, captioning,
+        # chat, planning), not only during a text op. (Under the old Ollama warm/unload
+        # model this was gated to chat/planning; there is no unload now — §13.)
+        if self._text is not None:
             text_fn = getattr(self._text, "resident_models", None)
             if text_fn is not None:
                 for model in text_fn():

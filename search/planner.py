@@ -61,7 +61,7 @@ def planner_messages(query: str, dimensions: list[str]) -> list[ChatMessage]:
 def plan(client: InferenceClient, model: str, query: str, dimensions: list[str]) -> QuerySpec:
     """Free-text query -> QuerySpec in one call. Any failure -> raw-query fallback."""
     try:
-        raw = client.complete(model, planner_messages(query, dimensions), timeout=20.0)
+        raw = client.complete(model, planner_messages(query, dimensions), timeout=20.0, temperature=0)
         return QuerySpec.model_validate(json.loads(_strip(raw)))
     except Exception:  # noqa: BLE001 - the planner is optional; degrade to fusion (§9.1)
         return QuerySpec(semantic=query)

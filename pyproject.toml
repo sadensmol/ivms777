@@ -22,12 +22,15 @@ dependencies = [
 
 # The `models` service is the only process that loads torch/transformers
 # (design §5.1, plan 15 task 6) — app/worker/ingest install core only, so the
-# default `uv sync` stays torch-free and their image is slim. bitsandbytes +
-# accelerate stay Dockerfile-pip (jetson-only, not here) — see Dockerfile.models.jetson.
+# default `uv sync` stays torch-free and their image is slim. `einops` is required
+# by the in-process caption-text embedder's custom modeling code
+# (nomic-embed-text-v1.5, design §4). Since plan 16 there is no in-process caption
+# VLM, so no bitsandbytes/accelerate anywhere.
 [project.optional-dependencies]
 models = [
     "torch>=2.13.0",
     "transformers>=5.15.0",
+    "einops>=0.8",
 ]
 
 [dependency-groups]

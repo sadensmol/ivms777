@@ -1,0 +1,58 @@
+# llama.cpp `llama-server` for the Jetson Orin Nano (JetPack 7, sm_87) — the ONE
+# inference backend on jetson since plan 16: one gemma4-E2B GGUF served over the
+# OpenAI `/v1` API for BOTH text (planner/chat) and vision (caption), on the GPU.
+# Replaces the Ollama `inference` container (design §3.1/§5.1).
+#
+# The Jetson host has no nvcc/cmake, so the CUDA build happens IN THIS IMAGE. Per
+# plan 16 (verified 2026-08-16), a cu130 build env produces a binary that runs on
+# the r39.2/cu132 driver, so we build against the CUDA 13.0 devel image and ship
+# on the 13.0 runtime image; `runtime: nvidia` injects the host driver at run time.
+
+# ---- build stage: compile llama-server with CUDA for Orin sm_87 ----
+FROM nvidia/cuda:13.0.0-devel-ubuntu24.04 AS build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git cmake build-essential libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+# Pin nothing here — llama.cpp master carries the gemma4 + mtmd fixes plan 16
+# relies on; pin a tag via LLAMACPP_REF if a regression ever lands.
+ARG LLAMACPP_REF=master
+RUN git clone --depth 1 --branch "${LLAMACPP_REF}" https://github.com/ggml-org/llama.cpp .
+
+# -DGGML_CUDA=ON + CMAKE_CUDA_ARCHITECTURES=87 → native Orin kernels (no PTX JIT).
+# -DGGML_NATIVE=ON tunes for the A78AE CPU. -DLLAMA_CURL=OFF drops the libcurl
+# dependency (GGUFs are fetched by the entrypoint, not by llama.cpp).
+RUN cmake -B build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DGGML_CUDA=ON \
+      -DCMAKE_CUDA_ARCHITECTURES=87 \
+      -DGGML_NATIVE=ON \
+      -DLLAMA_CURL=OFF \
+    && cmake --build build --target llama-server -j"$(nproc)"
+
+# ---- runtime stage: ship llama-server + its shared libs ----
+FROM nvidia/cuda:13.0.0-runtime-ubuntu24.04
+
+# wget + CA certs: the entrypoint pulls the GGUFs from Hugging Face on first run.
+# libgomp1: llama.cpp's OpenMP runtime.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      wget ca-certificates libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# The server binary and every shared lib the CUDA build produced (libggml*.so,
+# libllama.so, …). Keeping the flat layout llama.cpp emits under build/bin.
+COPY --from=build /src/build/bin/ /opt/llama.cpp/bin/
+ENV PATH="/opt/llama.cpp/bin:${PATH}" \
+    LD_LIBRARY_PATH="/opt/llama.cpp/bin:${LD_LIBRARY_PATH}"
+
+COPY scripts/llama-server-entrypoint.sh /usr/local/bin/llama-server-entrypoint.sh
+RUN chmod +x /usr/local/bin/llama-server-entrypoint.sh
+
+# The entrypoint fetches the GGUFs (idempotent) into /models, then `exec "$@"` —
+# so ALL the llama-server flags live in the compose `command` (design/plan 16),
+# not baked in here.
+ENV LLAMA_MODEL_DIR=/models
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/llama-server-entrypoint.sh"]

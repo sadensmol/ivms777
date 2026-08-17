@@ -30,7 +30,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # `_thin_client_files` below are walked.
 _EXEMPT_FILES = {
     REPO_ROOT / "embedding" / "siglip.py",
-    REPO_ROOT / "captioning" / "vlm_adapter.py",
+    REPO_ROOT / "embedding" / "text_embedder.py",  # caption-text embedder, models-service-only
     REPO_ROOT / "inference" / "client.py",
 }
 
