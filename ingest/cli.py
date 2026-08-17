@@ -22,18 +22,10 @@ def main() -> None:
     # not eagerly here: on a backend outage (e.g. the container cannot init CUDA on
     # jetson) the worker must keep producing thumbnails so photos still appear in
     # the library — it must NOT crash on startup, which left the whole library
-    # unprocessed (§8).
-    client, _ = context.settings.build_inference_client()
-    coordinator = context.make_coordinator(client, "worker")
+    # unprocessed (§8). Model load/evict + GPU serialization live in the `models`
+    # service conveyor (plan 18); the worker is a thin client with no coordinator.
     while True:
-        drain_pass(
-            context, vocab, coordinator,
-            # The worker no longer signals cross-process preempt (design §8.1) —
-            # the `modelsvc` service owns caption preemption internally (plan 15
-            # task 5); the NoopCoordinator's lease is a nullcontext, so there is
-            # nothing to yield here.
-            should_preempt=lambda: False,
-        )
+        drain_pass(context, vocab, should_preempt=lambda: False)
         time.sleep(POLL_SECONDS)
 
 

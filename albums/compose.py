@@ -1,10 +1,13 @@
 import json
+import logging
 import sqlite3
 
 from albums.memory_store import Memory
 from albums.seeds import Candidate
 from inference.client import ChatMessage, InferenceClient
 from search.semantic import similar_photos
+
+logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = (
     "You compose ONE memory from a set of photos taken close together in time and "
@@ -21,6 +24,16 @@ _SYSTEM_PROMPT = (
     "Drop any photo that does not belong via drop_photo_ids."
 )
 
+# The prompt must fit the SMALLEST context we run: jetson's `llm_ctx: 2048` (§3.1,
+# deliberately small to shrink gemma's resident footprint on the 8 GB board). At
+# ~40 tokens per photo line, 24 lines plus the system prompt and the agent's own
+# tool rounds leaves comfortable room; unbounded, a large cluster produced a 3326-
+# token request that llama-server rejected outright. Captions are the long part of
+# a line, so they are clipped too — a caption is one sentence in practice, and the
+# cap only bites on pathological ones.
+MAX_SUMMARY_PHOTOS = 24
+MAX_CAPTION_CHARS = 160
+
 
 def compose_memory(
     conn: sqlite3.Connection,
@@ -31,6 +44,7 @@ def compose_memory(
     *,
     signature: str,
     max_rounds: int = 3,
+    use_captions: bool = True,
 ) -> Memory | None:
     """Curate + narrate one candidate via a bounded agent loop (§11, §9.1).
 
@@ -48,7 +62,9 @@ def compose_memory(
             return None
         if turn.get("action") == "expand" and not force_answer:
             messages.append({"role": "assistant", "content": json.dumps(turn)})
-            messages.append({"role": "user", "content": _run_tool(conn, owner_id, turn)})
+            messages.append(
+                {"role": "user", "content": _run_tool(conn, owner_id, turn, use_captions)}
+            )
             continue
         if turn.get("action") != "answer" or not turn.get("keep"):
             return None
@@ -62,10 +78,23 @@ def compose_memory(
     return None
 
 
-def _summarise(conn: sqlite3.Connection, owner_id: int, photo_ids: list[int]) -> str:
-    """One compact line per photo: id, date, place, caption, top tags (~40 tokens)."""
+def _summarise(
+    conn: sqlite3.Connection, owner_id: int, photo_ids: list[int], *, limit: int = MAX_SUMMARY_PHOTOS
+) -> str:
+    """One compact line per photo: id, date, place, caption, top tags (~40 tokens).
+
+    **Capped at `limit` lines.** A seed candidate is every photo in a time/place
+    cluster and has no upper bound — a busy day can hold a hundred. At ~40 tokens
+    each that overruns the jetson's 2048-token context and `llama-server` rejects
+    the whole request ("request (3326 tokens) exceeds the available context size"),
+    which used to abort the entire rebuild. The agent only needs enough of the
+    cluster to judge whether it is one coherent memory, so the summary is truncated
+    and says so — the omitted photos are still kept in the memory, they just do not
+    each get a line in the prompt.
+    """
     lines: list[str] = []
-    for photo_id in photo_ids:
+    omitted = max(0, len(photo_ids) - limit)
+    for photo_id in photo_ids[:limit]:
         photo = conn.execute(
             "SELECT shot_at, gps_lat, gps_lon, caption FROM photos WHERE id = ? AND owner_id = ?",
             (photo_id, owner_id),
@@ -84,19 +113,30 @@ def _summarise(conn: sqlite3.Connection, owner_id: int, photo_ids: list[int]) ->
                 (photo_id,),
             )
         )
+        caption = (photo["caption"] or "")[:MAX_CAPTION_CHARS]
         lines.append(
             f"[{photo_id}] {photo['shot_at'] or 'no date'} · {place} · "
-            f"{photo['caption'] or ''}" + (f" · tags: {tags}" if tags else "")
+            f"{caption}" + (f" · tags: {tags}" if tags else "")
         )
-    return "Photos:\n" + "\n".join(lines)
+    summary = "Photos:\n" + "\n".join(lines)
+    if omitted:
+        # Say it outright: the agent must not read the truncation as "the cluster
+        # is only this big" and judge coherence on a partial view.
+        summary += f"\n(+{omitted} more photos in this cluster, not listed)"
+    return summary
 
 
-def _run_tool(conn: sqlite3.Connection, owner_id: int, turn: dict) -> str:
+def _run_tool(
+    conn: sqlite3.Connection, owner_id: int, turn: dict, use_captions: bool = True
+) -> str:
     """Run one read-only expansion tool; always returns a short text block."""
     tool = turn.get("tool")
     photo_id = turn.get("photo_id")
     if tool == "similar" and isinstance(photo_id, int):
-        ids = [r["id"] for r in similar_photos(conn, owner_id, photo_id, k=5)]
+        ids = [
+            r["id"]
+            for r in similar_photos(conn, owner_id, photo_id, k=5, use_captions=use_captions)
+        ]
         return "Similar photos: " + (_summarise(conn, owner_id, ids) if ids else "(none)")
     if tool == "facets" and isinstance(photo_id, int):
         facts = [
@@ -128,7 +168,16 @@ def _complete(
 
     No strict json_schema (Ollama's strict mode is unreliable with the mixed
     expand/answer shape); the reply is expected to be a bare JSON object and
-    parsed leniently. Anything unparseable skips the candidate (§11)."""
+    parsed leniently. Anything unparseable skips the candidate (§11).
+
+    A FAILED CALL SKIPS THIS CANDIDATE — it never aborts the build. The catch used
+    to list only the parse errors, so an `httpx.HTTPStatusError` (a 500 from
+    `/text/complete`, e.g. a prompt over the context limit) propagated out through
+    `build_memories` and killed the background thread: one bad cluster and the
+    whole rebuild died with nothing stored. The failure is logged rather than
+    swallowed silently, because a rebuild that quietly keeps zero memories is
+    indistinguishable from a library with no memories in it.
+    """
     turn_messages = messages
     if force_answer:
         turn_messages = [
@@ -137,6 +186,10 @@ def _complete(
         ]
     try:
         raw = client.complete(model, turn_messages, timeout=60.0)
+    except Exception:  # one candidate must never abort the build
+        logger.exception("memory composition call failed; skipping this candidate")
+        return None
+    try:
         start, end = raw.find("{"), raw.rfind("}")
         if start == -1 or end <= start:
             return None

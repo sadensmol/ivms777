@@ -1,7 +1,14 @@
 import sqlite3
 from pathlib import Path
 
+import pillow_heif
 from PIL import Image, ImageOps
+
+# Apple HEIC is a first-class source format, and this stage opens the ORIGINAL.
+# Registering here rather than relying on `ingest.exif` / `ingest.thumbs` having
+# been imported first: the opener is global and registration is idempotent, so
+# the cost is nothing and the stage stops depending on import order.
+pillow_heif.register_heif_opener()
 
 from embedding.base import Embedder
 from embedding.store import write_vector

@@ -15,18 +15,18 @@ class FakeClient:
 
 
 def test_caption_parses_into_result():
-    payload = {"caption": "a dog", "title": "Dog", "description": "a brown dog", "tags": {"subject": ["dog"]}}
+    payload = {"caption": "a dog", "title": "Dog", "description": "a brown dog"}
     cap = OpenAICaptioner(FakeClient(payload), "gemma4-E2B")
-    r = cap.caption(b"imgbytes", ["subject", "scene"])
+    r = cap.caption(b"imgbytes")
     assert isinstance(r, CaptionResult)
-    assert r.caption == "a dog" and r.title == "Dog" and r.tags == {"subject": ["dog"]}
+    assert r.caption == "a dog" and r.title == "Dog" and r.description == "a brown dog"
     assert cap.caption_model == "gemma4-E2B" and cap.name == "gemma4-E2B"
 
 
 def test_caption_sends_the_image_and_schema():
-    c = FakeClient({"caption": "x", "title": "x", "description": "x", "tags": {}})
+    c = FakeClient({"caption": "x", "title": "x", "description": "x"})
     cap = OpenAICaptioner(c, "gemma4-E2B")
-    cap.caption(b"imgbytes", ["subject"])
+    cap.caption(b"imgbytes")
     model, messages, json_schema = c.calls[0]
     assert model == "gemma4-E2B"
     assert json_schema is not None  # constrained to CAPTION_SCHEMA

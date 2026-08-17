@@ -42,6 +42,12 @@ snapshots — once written they describe a unit of work, not the current state.
 When the design changes, the plan does not get rewritten retroactively; a new
 plan supersedes it.
 
+**Every plan lives in `docs/plans/`, no exceptions.** This holds even when a plan
+is produced by an external skill or tool (`planning:make`, `system-design`,
+`superpowers:writing-plans`, any other). Point the skill at `docs/plans/` and use
+the `NN-*.md` naming. Never write a plan anywhere else — not a scratch dir, not
+the repo root, not the skill's own default location.
+
 ## UI: never lose the user's place
 
 Any state the user set is sacred. A search query, active filters, the chosen

@@ -1,3 +1,7 @@
+import subprocess
+import sys
+from pathlib import Path
+
 from embedding.fakes import FakeEmbedder
 from embedding.store import knn, read_vector, write_vector
 from embedding.vectors import l2_normalize
@@ -8,6 +12,27 @@ from storage.keys import content_key
 from storage.local import LocalStorage
 from tests.factories import add_photo
 from tests.fixtures import make_jpeg
+
+
+def test_importing_the_embed_stage_alone_registers_the_heic_opener():
+    # This stage opens the ORIGINAL, and Apple HEIC is a first-class source format
+    # (storage.local.IMAGE_EXTENSIONS). It used to work only because `ingest.exif`
+    # and `ingest.thumbs` happened to be imported first and register the opener
+    # globally. A fresh subprocess importing ONLY `ingest.embed` is the one way to
+    # prove the stage no longer depends on that import order.
+    code = (
+        "import ingest.embed; from PIL import Image; "
+        "assert '.heic' in Image.registered_extensions(), 'HEIC opener not registered'"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).resolve().parent.parent,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_write_and_read_round_trip(conn):

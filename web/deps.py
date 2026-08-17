@@ -41,16 +41,6 @@ class AppContext:
             self._local.conn = conn
         return conn
 
-    def make_coordinator(self, client, holder: str):
-        """Return a `NoopCoordinator` (design §8.1 stub, plan 15 task 7):
-        app/worker hold no models anymore — `modelsvc` owns all loading and
-        residency — so there is nothing left to coordinate. `client` and
-        `holder` are accepted for signature compatibility with every
-        call site (`web/app.py`, `ingest/cli.py`); neither is used."""
-        from models.coordinator import NoopCoordinator
-
-        return NoopCoordinator()
-
 
 def build_context(settings: Settings) -> AppContext:
     from db.connection import connect, migrate

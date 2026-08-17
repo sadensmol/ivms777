@@ -27,8 +27,8 @@ class OpenAICaptioner:
         self.name = model
         self.caption_model = model
 
-    def caption(self, image: bytes, dimensions: list[str]) -> CaptionResult:
-        msgs = caption_messages(self.caption_model, encode_image(image), dimensions)
+    def caption(self, image: bytes) -> CaptionResult:
+        msgs = caption_messages(self.caption_model, encode_image(image))
         raw = self._client.complete(self.caption_model, msgs, json_schema=CAPTION_SCHEMA)
         obj = json.loads(raw)
-        return CaptionResult(obj["caption"], obj["title"], obj["description"], obj.get("tags") or {})
+        return CaptionResult(obj["caption"], obj["title"], obj["description"])

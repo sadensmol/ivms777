@@ -1,6 +1,3 @@
-import gc
-from functools import lru_cache
-
 import numpy as np
 import torch
 from PIL import Image
@@ -16,7 +13,20 @@ _HF_ID = "google/siglip2-so400m-patch14-384"
 class SiglipEmbedder:
     def __init__(self, model_name: str, device: str) -> None:
         self.device = device
-        self.model = AutoModel.from_pretrained(_HF_ID).to(device).eval()
+        # fp16 on cuda: this ~1B-param model is ~4 GB in float32 but ~2 GB in
+        # float16 — on the 8 GB unified Jetson that difference is the whole caption
+        # swap budget (§8/§8.1). CPU/MPS stay float32 (half is slow/unsupported on
+        # CPU). Inference-only, so fp16 precision is fine for cosine similarity.
+        self.dtype = torch.float16 if device == "cuda" else torch.float32
+        # `device_map=device`, NOT `.to(device)`. `.to()` materialises every weight in
+        # HOST RAM first and the copy is never released — measured on the Jetson at
+        # 5128 MB RSS vs 2940 MB here, a 2.2 GB difference on a 7.4 GB board (§8.1).
+        # `gc`/`empty_cache`/`malloc_trim` do NOT reclaim it; the tensors stay
+        # referenced. `device_map` streams shard-by-shard straight to the device, so
+        # the host copy never exists. Needs `accelerate` (the `models` extra).
+        self.model = AutoModel.from_pretrained(
+            _HF_ID, dtype=self.dtype, device_map=device
+        ).eval()
         self.processor = AutoProcessor.from_pretrained(_HF_ID)
         # SigLIP's learned zero-shot calibration (see embedding.vectors); read from
         # the model so it is always exact for this checkpoint.
@@ -26,7 +36,22 @@ class SiglipEmbedder:
     @torch.no_grad()
     def embed_images(self, images: list[Image.Image]) -> list[list[float]]:
         inputs = self.processor(images=images, return_tensors="pt").to(self.device)
+        # pixel_values is float; match the model dtype (fp16 on cuda) or the conv
+        # rejects it. Text ids stay integer, so embed_texts needs no cast.
+        inputs["pixel_values"] = inputs["pixel_values"].to(self.dtype)
         return self._normalized(self.model.get_image_features(**inputs))
+
+    def embed_image_bytes(self, images: list[bytes]) -> list[list[float]]:
+        """Decode, then embed. The bytes (not PIL objects) are what cross the
+        `TorchWorker` pipe, so the decode happens here — in the child that owns
+        torch — and the models parent stays image-library-free (plan 20)."""
+        from io import BytesIO
+
+        return self.embed_images([Image.open(BytesIO(b)).convert("RGB") for b in images])
+
+    def calibration(self) -> dict:
+        """SigLIP's zero-shot calibration, as the worker protocol returns it."""
+        return {"logit_scale": self.logit_scale, "logit_bias": self.logit_bias}
 
     @torch.no_grad()
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
@@ -47,33 +72,3 @@ class SiglipEmbedder:
         unit = array / norms
         assert unit.shape[1] == EMBED_DIM, f"expected {EMBED_DIM}, got {unit.shape[1]}"
         return unit.tolist()
-
-
-@lru_cache(maxsize=2)
-def get_siglip_embedder(model_name: str, device: str) -> SiglipEmbedder:
-    """Load the SigLIP model once and reuse it.
-
-    Building a `SiglipEmbedder` loads ~400M of weights from disk into torch — far
-    too slow to redo per request. Every route (search, /photo ctx paging, chat)
-    goes through this cache, so the model is resident after the first use and a
-    photo click no longer reloads it.
-    """
-    return SiglipEmbedder(model_name, device)
-
-
-def release_siglip_embedder() -> None:
-    """Drop the cached SigLIP model and return its GPU allocation to the driver.
-
-    On a unified-memory Jetson (8 GB shared CPU+GPU) SigLIP and the Ollama vision
-    captioner cannot both be resident: a loaded SigLIP pins torch's CUDA caching
-    allocator, so CUDA reports almost no free memory and Ollama silently offloads
-    the captioner to the CPU (≈20× slower). The worker calls this after the
-    embed/taxonomy stages and before the caption stage, so the captioner gets the
-    GPU (design §8). `empty_cache()` is what actually hands the freed blocks back
-    to the driver — clearing the cache only drops Python references.
-    """
-    get_siglip_embedder.cache_clear()
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()

@@ -17,23 +17,22 @@ class FakeCaptioner:
     def __init__(self):
         self.calls = 0
 
-    def caption(self, image, dimensions):
+    def caption(self, image):
         self.calls += 1
         return CaptionResult(
-            caption="a cat", title="Cat", description="a cat photo", tags={"subject": ["cat"]}
+            caption="a cat", title="Cat", description="a cat photo"
         )
 
 
 def test_caption_backend_returns_the_dict_with_the_model_key():
     backend = CaptionBackend(FakeCaptioner())
 
-    result = backend.caption(b"image-bytes", ["subject"])
+    result = backend.caption(b"image-bytes")
 
     assert result == {
         "caption": "a cat",
         "title": "Cat",
         "description": "a cat photo",
-        "tags": {"subject": ["cat"]},
         "model": "fake-cap",
     }
 
@@ -42,8 +41,8 @@ def test_caption_backend_calls_the_captioner_each_time():
     captioner = FakeCaptioner()
     backend = CaptionBackend(captioner)
 
-    backend.caption(b"one", [])
-    backend.caption(b"two", [])
+    backend.caption(b"one")
+    backend.caption(b"two")
 
     assert captioner.calls == 2
 

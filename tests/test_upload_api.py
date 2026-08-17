@@ -147,6 +147,35 @@ def test_finish_returns_the_receipt_even_when_the_inline_drain_fails(client, con
     ).fetchone()[0] is not None                                # the upload is marked finished
 
 
+def test_inline_drain_off_leaves_the_work_to_the_worker(settings):
+    # Wherever a `worker` container runs — every compose profile — the app must
+    # NOT drain inline (§5: app serves reads, worker owns writes). The inline pass
+    # covers the WHOLE queue, so it held the finish request open for the entire
+    # library and put a second drainer on the same jobs; on the Jetson that pinned
+    # `app` at 100 % CPU racing the worker for a GPU with `gpu_concurrency: 1`.
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.inline_drain = False
+    with TestClient(create_app(settings)) as client:
+        conn = client.app.state.context.conn
+        upload_id = start(client)
+        send(client, upload_id, "Pictures/a.jpg", jpeg_bytes())
+        summary = client.post(
+            "/api/upload/finish", json={"upload_id": upload_id}
+        ).json()
+
+    assert summary == {"offered": 0, "sent": 1, "failed": 0}  # receipt still returns
+    # The bytes landed and every stage is queued — but nothing ran any of them.
+    assert conn.execute("SELECT thumb_key FROM photos").fetchone()["thumb_key"] is None
+    assert [tuple(row) for row in conn.execute(
+        "SELECT stage, status FROM jobs ORDER BY stage"
+    )] == [
+        ("caption", "pending"),
+        ("embed", "pending"),
+        ("taxonomy", "pending"),
+        ("thumbnail", "pending"),
+    ]
+
+
 def test_an_unknown_upload_id_is_rejected(client):
     data = jpeg_bytes()
     response = send(client, 999, "a.jpg", data)

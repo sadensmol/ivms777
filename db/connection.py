@@ -4,7 +4,7 @@ from pathlib import Path
 import sqlite_vec
 
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 class SchemaTooOldError(RuntimeError):

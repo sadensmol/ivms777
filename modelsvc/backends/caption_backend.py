@@ -14,12 +14,11 @@ class CaptionBackend:
     def __init__(self, captioner: Captioner) -> None:
         self._captioner = captioner
 
-    def caption(self, image: bytes, dimensions: list[str]) -> dict:
-        result = self._captioner.caption(image, dimensions)
+    def caption(self, image: bytes) -> dict:
+        result = self._captioner.caption(image)
         return {
             "caption": result.caption,
             "title": result.title,
             "description": result.description,
-            "tags": result.tags,
             "model": self._captioner.caption_model,
         }

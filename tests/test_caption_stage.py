@@ -14,7 +14,6 @@ from tests.factories import add_photo
 from tests.fixtures import make_jpeg
 
 VOCAB = load_vocab(Path("vocab.yaml"))
-DIMS = list(VOCAB.dimensions)
 
 
 class FakeCaptionBackend:
@@ -26,10 +25,10 @@ class FakeCaptionBackend:
     def __init__(self, response: dict | None = None, *, error: Exception | None = None):
         self.response = response
         self.error = error
-        self.calls: list[tuple[bytes, list[str]]] = []
+        self.calls: list[bytes] = []
 
-    def caption(self, image: bytes, dimensions: list[str]) -> dict:
-        self.calls.append((image, dimensions))
+    def caption(self, image: bytes) -> dict:
+        self.calls.append(image)
         if self.error is not None:
             raise self.error
         return self.response
@@ -46,7 +45,7 @@ def _photo_with_detail_thumb(conn, derived, pid, hash_hex, detail_px=1600):
     add_photo(conn, photo_id=pid, content_hash=hash_hex, thumb_key=thumb_key(hash_hex, 320))
 
 
-def test_caption_stage_writes_caption_title_description_and_vlm_tags(conn, tmp_path):
+def test_caption_stage_writes_caption_title_description_and_no_tags(conn, tmp_path):
     derived = LocalStorage(tmp_path / "thumbs")
     seed_tags(conn, VOCAB)
     _photo_with_detail_thumb(conn, derived, 1, "aa" * 32)
@@ -54,13 +53,12 @@ def test_caption_stage_writes_caption_title_description_and_vlm_tags(conn, tmp_p
         "caption": "a dog on a beach",
         "title": "Beach day",
         "description": "A dog runs on the sand.",
-        "tags": {"subject": ["pet"], "setting": ["beach"]},
         "model": "fake-vlm",
     })
     models_client = _models_client(backend)
     enqueue(conn, 1, "caption")
 
-    drain(conn, {"caption": caption_handler(derived, models_client, DIMS, 1600)})
+    drain(conn, {"caption": caption_handler(derived, models_client, 1600)})
 
     row = conn.execute(
         "SELECT caption, caption_model, ai_title, ai_description FROM photos WHERE id = 1"
@@ -69,13 +67,9 @@ def test_caption_stage_writes_caption_title_description_and_vlm_tags(conn, tmp_p
     assert row["ai_title"] == "Beach day"
     assert "sand" in row["ai_description"]
     assert row["caption_model"] == "fake-vlm"  # the ACTUAL model the service used
-    vlm = {
-        (r["dimension"], r["label"]) for r in conn.execute(
-            "SELECT t.dimension, t.label FROM photo_tags pt JOIN tags t ON t.id = pt.tag_id"
-            " WHERE pt.photo_id = 1 AND pt.source = 'vlm'"
-        )
-    }
-    assert ("subject", "pet") in vlm and ("setting", "beach") in vlm
+    # The caption model writes NO tags — tags are SigLIP-only (design §7).
+    assert conn.execute("SELECT COUNT(*) FROM photo_tags WHERE photo_id = 1").fetchone()[0] == 0
+    # The caption TEXT is still indexed into FTS, so keyword search finds it.
     assert conn.execute("SELECT rowid FROM photo_fts WHERE photo_fts MATCH 'beach'").fetchone() is not None
     # The caption stage writes TEXT only; the §9 vector is embedded separately in the
     # SigLIP group (backfill_caption_vectors), so it is NOT set by this stage.
@@ -114,12 +108,11 @@ def test_caption_makes_a_photo_findable_by_keyword(conn, tmp_path):
         "caption": "a slice of Neapolitan pizza",
         "title": "Pizza night",
         "description": "A cheesy slice on a plate.",
-        "tags": {},
         "model": "fake-vlm",
     })
     models_client = _models_client(backend)
     enqueue(conn, 1, "caption")
-    drain(conn, {"caption": caption_handler(derived, models_client, DIMS, 1600)})
+    drain(conn, {"caption": caption_handler(derived, models_client, 1600)})
     assert keyword_search(conn, owner_id=1, query="Neapolitan", k=10) == [1]
 
 
@@ -131,7 +124,7 @@ def test_caption_skips_a_photo_with_no_thumbnail(conn, tmp_path):
     models_client = _models_client(backend)
     enqueue(conn, 1, "caption")
 
-    drain(conn, {"caption": caption_handler(derived, models_client, DIMS, 1600)})
+    drain(conn, {"caption": caption_handler(derived, models_client, 1600)})
 
     assert conn.execute("SELECT caption FROM photos WHERE id = 1").fetchone()["caption"] is None
     assert stage_counts(conn, "caption")["done"] == 1  # skipped cleanly, not a crash/failure
@@ -145,12 +138,12 @@ def test_caption_falls_back_to_the_grid_thumb_when_the_detail_is_missing(conn, t
     make_jpeg(derived.local_path(thumb_key(hash_hex, 320)))  # only the grid thumb exists
     add_photo(conn, photo_id=1, content_hash=hash_hex, thumb_key=thumb_key(hash_hex, 320))
     backend = FakeCaptionBackend({
-        "caption": "c", "title": "t", "description": "d", "tags": {}, "model": "fake-vlm",
+        "caption": "c", "title": "t", "description": "d", "model": "fake-vlm",
     })
     models_client = _models_client(backend)
     enqueue(conn, 1, "caption")
 
-    drain(conn, {"caption": caption_handler(derived, models_client, DIMS, 1600)})
+    drain(conn, {"caption": caption_handler(derived, models_client, 1600)})
 
     assert conn.execute("SELECT caption FROM photos WHERE id = 1").fetchone()["caption"] == "c"
 
@@ -165,7 +158,7 @@ def test_models_client_caption_error_leaves_the_photo_uncaptioned(conn, tmp_path
     models_client = _models_client(backend)
     enqueue(conn, 1, "caption")
 
-    drain(conn, {"caption": caption_handler(derived, models_client, DIMS, 1600)})
+    drain(conn, {"caption": caption_handler(derived, models_client, 1600)})
 
     assert conn.execute("SELECT caption FROM photos WHERE id = 1").fetchone()["caption"] is None
     assert stage_counts(conn, "caption")["done"] == 0  # not marked done; retried later

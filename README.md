@@ -31,7 +31,9 @@ runs are fast. There is **no Ollama** any more.
 ### Build llama.cpp for Mac (Metal)
 
 `make up` (via `make llama-mac`) builds and starts `llama-server` for you into
-`$HOME/.ivms777/llama.cpp`. To do it by hand instead:
+`$HOME/.llama/llama.cpp` — a persistent cache **outside** the library dir, so it
+is built once and `make clean` never removes it (`make llama-rebuild` forces a
+from-scratch rebuild + GGUF re-download). To do it by hand instead:
 
 ```bash
 brew install cmake

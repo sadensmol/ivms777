@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from ingest.jobs import (
     MAX_ATTEMPTS,
@@ -28,10 +28,11 @@ def test_requeue_stalled_recovers_orphaned_running_jobs(conn):
     assert stage_counts(conn, "caption")["pending"] == 1
 
 
-def test_format_speed_stays_readable_for_slow_stages():
+def test_format_speed_is_always_per_second_never_minutes_or_hours():
     assert format_speed(None) is None
-    assert format_speed(2.0) == "2.0/s"          # fast stages: per second
-    assert format_speed(0.0333333) == "2.0/min"  # ~30 s/caption reads as 2.0/min, not "0.0/s"
+    assert format_speed(2.0) == "2.0/s"           # fast stages: per second
+    assert format_speed(0.42) == "0.42/s"         # sub-1/s keeps 2 decimals
+    assert format_speed(0.0333333) == "0.033/s"   # ~30 s/caption: per SECOND, never "/min"
 
 
 def _done_at(conn, photo_id, stage, when):
@@ -44,7 +45,7 @@ def _done_at(conn, photo_id, stage, when):
 
 def test_stage_speed_measures_recent_throughput(conn):
     # 5 captions finished 2s apart -> 4 intervals over 8s -> 0.5/s.
-    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    base = datetime(2026, 1, 1, tzinfo=UTC)
     for i in range(5):
         _done_at(conn, i + 1, "caption", base + timedelta(seconds=2 * i))
     assert abs(stage_speed(conn, "caption") - 0.5) < 1e-9
@@ -52,14 +53,14 @@ def test_stage_speed_measures_recent_throughput(conn):
 
 def test_stage_speed_none_without_two_completions(conn):
     assert stage_speed(conn, "caption") is None
-    _done_at(conn, 1, "caption", datetime(2026, 1, 1, tzinfo=timezone.utc))
+    _done_at(conn, 1, "caption", datetime(2026, 1, 1, tzinfo=UTC))
     assert stage_speed(conn, "caption") is None  # one completion can't span a rate
 
 
 def test_stage_speed_survives_restart_via_persisted_job_history(conn):
     # The rate is read from jobs.updated_at, which persists — no in-memory state,
     # so a fresh process (this fresh conn) still reports the last speed.
-    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    base = datetime(2026, 1, 1, tzinfo=UTC)
     for i in range(3):
         _done_at(conn, i + 1, "embed", base + timedelta(seconds=i))  # 2 intervals / 2s = 1/s
     assert abs(stage_speed(conn, "embed") - 1.0) < 1e-9

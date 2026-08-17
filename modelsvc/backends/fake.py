@@ -41,17 +41,22 @@ class FakeBackend:
         # FakeBackend behaves exactly like the in-process FakeEmbedder path.
         return {"logit_scale": 10.0, "logit_bias": -5.0}
 
-    def caption(self, image: bytes, dimensions: list[str]) -> dict:
+    def caption(self, image: bytes) -> dict:
         return {
             "caption": "a fake photo",
             "title": "Fake Photo",
             "description": "a fake photo, produced by the fake models backend",
-            "tags": {dimension: [f"{dimension}:fake"] for dimension in dimensions},
             "model": "fake",
         }
 
     def text_complete(
-        self, model: str, messages: list[dict], json_schema: dict | None = None
+        self,
+        model: str,
+        messages: list[dict],
+        json_schema: dict | None = None,
+        *,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> str:
         last = messages[-1]["content"] if messages else ""
         return f"fake completion for: {last}"
@@ -79,3 +84,18 @@ class FakeBackend:
             "resident": ["fake"],
             "active": None,
         }
+
+    def models_state(self) -> dict:
+        return {
+            "resident": [],
+            "budget_mb": 0,
+            "free_mb": 0.0,
+            "used_mb": 0,
+            "active": None,
+        }
+
+    def model_ensure(self, name: str) -> None:
+        return None
+
+    def model_unload(self, name: str) -> None:
+        return None

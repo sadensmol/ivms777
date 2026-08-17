@@ -2,6 +2,7 @@ import json
 import re
 import sqlite3
 
+from chat.context import build_context
 from chat.retrieve import retrieve as fusion_retrieve
 from embedding.base import Embedder
 from embedding.caption_text import embed_caption_texts
@@ -55,6 +56,11 @@ _TOOL_CALL_SCHEMA = {
 }
 
 # --- Agentic tool router (plan 17) --------------------------------------------
+# Every routing/tool-selection call emits ONE small JSON object, so it is capped here.
+# Without a cap a grammar-constrained decode that never closes the object runs to the
+# whole KV context (2048 on jetson, §3.1) and returns an EMPTY string — measured: 1606
+# tokens, `truncated = 1`, 56 s, no output, the loop silently degrading to "no tool".
+_ROUTING_MAX_TOKENS = 128
 # Chat is a GENERAL assistant that is ALSO agentic over the user's library. It is
 # NOT limited to photo questions: general knowledge / chit-chat is answered directly.
 # One schema-constrained routing decision picks a tool ONLY when the question is
@@ -96,11 +102,15 @@ def route(client: InferenceClient, model: str, question: str) -> dict:
     ]
     try:
         raw = client.complete(
-            model, messages, json_schema=_ROUTER_SCHEMA, timeout=20.0, temperature=0
+            model, messages, json_schema=_ROUTER_SCHEMA, timeout=20.0, temperature=0,
+            max_tokens=_ROUTING_MAX_TOKENS,
         )
     except Exception:  # noqa: BLE001 — backend without structured output → plain call
         try:
-            raw = client.complete(model, messages, timeout=20.0, temperature=0)
+            raw = client.complete(
+                model, messages, timeout=20.0, temperature=0,
+                max_tokens=_ROUTING_MAX_TOKENS,
+            )
         except Exception:  # noqa: BLE001 — router is best-effort; default to a plain answer
             return {"tool": "none", "query": None}
     start, end = raw.find("{"), raw.rfind("}")
@@ -278,7 +288,14 @@ def _tool(
 
 # --- Aggregate tools: real numbers, never inferred from the shown candidates ---
 
-_COUNT_INTENT = re.compile(r"\b(how many|how much|number of|count of|total number|total of)\b", re.IGNORECASE)
+_COUNT_INTENT = re.compile(
+    r"\b(how many|how much|number of|count of|total number|total of"
+    # "total <photoword>" ("what total photos do I have") — a total-count phrasing
+    # with no "how many"/"number of". Kept photo-word-scoped so "a total eclipse"
+    # is never mistaken for a count.
+    r"|total\s+(?:photos?|images?|pictures?|pics?|photographs?|shots?))\b",
+    re.IGNORECASE,
+)
 # The thing being counted, when the question narrows it: "...with dogs", "...of the dog".
 _COUNT_SUBJECT = re.compile(
     r"\b(?:with|of|containing|showing|that (?:have|contain|show)|tagged)\s+(.+?)[?.!]*\s*$", re.IGNORECASE
@@ -286,8 +303,9 @@ _COUNT_SUBJECT = re.compile(
 # Words in a bare "how many photos …" total question that are NOT a narrowing subject.
 _PHOTO_WORD = re.compile(r"\b(?:photos?|images?|pictures?|pics?|photographs?|shots?)\b", re.IGNORECASE)
 _TOTAL_FILLER = re.compile(
-    r"\b(?:do|does|did|i|we|you|my|our|us|the|a|an|there|are|is|be|been|have|has|had|"
-    r"got|hold|holding|currently|now|right|stored|saved|in|of|total|altogether|all|together)\b",
+    r"\b(?:what|whats|which|do|does|did|i|we|you|my|our|us|the|a|an|there|are|is|be|been|"
+    r"have|has|had|got|hold|holding|currently|now|right|stored|saved|in|of|total|"
+    r"altogether|all|together)\b",
     re.IGNORECASE,
 )
 
@@ -314,6 +332,31 @@ def is_aggregate_question(question: str) -> bool:
     return bool(_COUNT_INTENT.search(question))
 
 
+# App-specific vocabulary — a question naming any of these is ABOUT the library or an
+# app feature, so it is NEVER off-topic and Guardrails must never refuse it (§10),
+# whatever the weak router decides. Counts and memory-intent are caught by their own
+# matchers below; this covers the rest (albums, uploads, organize, tags, cameras, the
+# library itself).
+_APP_TOPIC = re.compile(
+    r"\b(photos?|pictures?|images?|pics?|photographs?|shots?|librar(?:y|ies)|"
+    r"memor(?:y|ies)|albums?|collections?|organi[sz]e[ds]?|uploads?|folders?|"
+    r"tags?|tagged|captions?|faces?|cameras?|lens|lenses|galler(?:y|ies))\b",
+    re.IGNORECASE,
+)
+
+
+def is_app_topic(question: str) -> bool:
+    """True when the question is about the photo library or an app feature — a count,
+    a memory, an album, an upload, tags, cameras, the library itself (§10). Guardrails
+    must NEVER refuse these as off-topic, regardless of what the weak router decides —
+    a deterministic override so app functionality is never turned away."""
+    return (
+        is_aggregate_question(question)
+        or bool(_MEMORY_INTENT.search(question))
+        or bool(_APP_TOPIC.search(question))
+    )
+
+
 # The counted noun right after "how many" / "number of" — the reliable signal for
 # WHICH thing is being counted (photos vs memories vs months/years). Reading it
 # fixes "how many photos are in my Borjomi memory" (counted noun = photos, not a
@@ -325,12 +368,20 @@ def _count_subject(question: str) -> str:
     """The clean subject of a subject-count ("...with dogs" -> "dogs", "number of
     beach photos" -> "beach"), or "" when there is none. Photo words and leading
     determiners are stripped so the residue is a real FTS term, never the word
-    "photos" itself."""
+    "photos" itself.
+
+    `_COUNT_SUBJECT` anchors on the FIRST preposition, so "number OF photos with
+    dog" captures "photos with dog"; once "photos" is gone a stray leading "with"
+    (and its determiner) remains — that leaked "with dog" is what made the keyword
+    count 0. So strip a leading RUN of prepositions/determiners, not just one."""
     match = _COUNT_SUBJECT.search(question)
     if not match:
         return ""
     subject = _PHOTO_WORD.sub(" ", match.group(1))
-    subject = re.sub(r"^\s*(?:my|the|a|an|any|some)\s+", "", subject, flags=re.IGNORECASE)
+    subject = re.sub(
+        r"^\s*(?:(?:with|of|containing|showing|tagged|my|the|a|an|any|some)\s+)+",
+        "", subject, flags=re.IGNORECASE,
+    )
     return " ".join(subject.split()).strip(" ?.!,'\"“”")
 
 
@@ -539,9 +590,187 @@ def _turn(
     if force:
         turn_messages = [*messages, {"role": "user", "content": "Answer now (action=answer)."}]
     try:
-        raw = client.complete(model, turn_messages, timeout=60.0, json_schema=_TOOL_CALL_SCHEMA)
+        raw = client.complete(
+            model, turn_messages, timeout=60.0, json_schema=_TOOL_CALL_SCHEMA,
+            temperature=0, max_tokens=_ROUTING_MAX_TOKENS,
+        )
     except Exception:  # noqa: BLE001 — backend without structured output → plain call
-        raw = client.complete(model, turn_messages, timeout=60.0)
+        raw = client.complete(
+            model, turn_messages, timeout=60.0, temperature=0,
+            max_tokens=_ROUTING_MAX_TOKENS,
+        )
+    start, end = raw.find("{"), raw.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    parsed = json.loads(raw[start : end + 1])
+    return parsed if isinstance(parsed, dict) else None
+
+
+# --- Fully-agentic path (direct answers OFF, §10) -----------------------------
+# When the user turns the deterministic direct-DB step OFF, EVERY question — counts,
+# memory-show, periods, photo search — runs through this bounded tool loop instead.
+# The model gets REAL tools (count/list/periods are actual DB reads, search is SigLIP
+# image↔text), gathers facts + candidate photos, then a final grounded answer streams
+# from those facts. A count is a number the model asked for, never one inferred from
+# the handful of retrieved photos (the "8 photos" bug direct_answer also guards).
+# The loop's FIRST decision is on-topic-or-not: a question about the world answers with
+# no tool at all. That is not politeness — `search` is the only op that needs SigLIP,
+# and on the 8 GB board SigLIP and gemma cannot be co-resident (§8.1), so one stray
+# search costs a gemma evict + llama-server respawn mid-answer.
+_AGENTIC_SYSTEM = (
+    "You are an agent for a personal photo app. Every tool reads the user's OWN "
+    "library — their photos and their saved memories — and NOTHING else.\n"
+    "STEP 1, always: is this message about the user's own photos or memories?\n"
+    '- NO — general knowledge, facts about the world, advice, chit-chat, or anything '
+    'not in their library: reply {"action":"answer"} IMMEDIATELY and call NO tool. '
+    'You answer it yourself from what you know. "How many regions are in Russia" is '
+    "about the world, not about their photos — do NOT search, do NOT count.\n"
+    "- YES: use tools to get REAL data before answering — never guess a count or "
+    "invent a photo. One JSON action per step; pick the tool whose result actually "
+    "answers the question:\n"
+    '- {"action":"count_photos","query":"..."} — how MANY photos match a phrase '
+    "(e.g. 'dog'); empty query = the whole-library total. Use this for any 'how "
+    "many photos' / 'number of photos' question. Returns a number, not photos.\n"
+    '- {"action":"list_memories"} — the user\'s saved memories with their sizes. Use '
+    "this for ANY question about memories, INCLUDING 'how many memories' — count the "
+    "returned list yourself (there is no count tool for memories).\n"
+    '- {"action":"count_periods","grain":"month"|"year"} — how many distinct '
+    "months/years have photos. Use for 'how many months/years'.\n"
+    '- {"action":"search","query":"..."} — fetch candidate PHOTOS matching a phrase, '
+    "to SHOW them. This one runs the image-search model, so it is by far the most "
+    "EXPENSIVE tool: use it ONLY when the user wants to SEE their own photos of "
+    "something. Never for a count, never for a question about the world.\n"
+    '- {"action":"answer","query":null} — you have gathered enough (or there was '
+    "nothing to gather); stop. Do NOT write the answer here — the answer is written "
+    "in a later step.\n"
+    "`query` is a SHORT search phrase (a few words) or null. It is NEVER a sentence "
+    "and NEVER your answer to the user.\n"
+    "When in doubt, prefer answering over calling a tool. Reply with ONLY the JSON "
+    "object."
+)
+
+_AGENTIC_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": ["search", "count_photos", "list_memories", "count_periods", "answer"],
+        },
+        "query": {"type": ["string", "null"]},
+        "grain": {"type": ["string", "null"], "enum": ["month", "year", None]},
+    },
+    "required": ["action", "query", "grain"],
+}
+
+
+def agentic_gather(
+    conn: sqlite3.Connection,
+    embedder: Embedder,
+    client: InferenceClient,
+    model: str,
+    owner_id: int,
+    question: str,
+    *,
+    max_rounds: int = 4,
+) -> tuple[str, bool]:
+    """Fully-agentic direct-OFF path (§10): the model calls REAL count/search tools,
+    then we build a grounded block for the final answer. Returns (block, grounded);
+    `grounded` False means nothing was gathered, so the caller answers from general
+    knowledge. Any failure degrades to whatever was gathered so far — never raises."""
+    messages = [
+        {"role": "system", "content": _AGENTIC_SYSTEM},
+        {"role": "user", "content": question},
+    ]
+    facts: list[str] = []
+    photo_ids: list[int] = []
+    seen: set[int] = set()
+    try:
+        for round_no in range(max_rounds):
+            turn = _agentic_turn(client, model, messages, force=round_no == max_rounds - 1)
+            if turn is None or turn.get("action") == "answer":
+                break
+            result = _run_agentic_tool(conn, embedder, owner_id, turn, photo_ids, seen, facts)
+            messages.append({"role": "assistant", "content": json.dumps(turn)})
+            messages.append({"role": "user", "content": result})
+    except Exception:  # noqa: BLE001, S110 — degrade to what we gathered; never crash chat
+        pass
+    parts = list(facts)
+    if photo_ids:
+        parts.append(build_context(conn, photo_ids))
+    grounded = bool(facts or photo_ids)
+    return ("\n".join(parts) if grounded else ""), grounded
+
+
+def _run_agentic_tool(
+    conn: sqlite3.Connection,
+    embedder: Embedder,
+    owner_id: int,
+    turn: dict,
+    photo_ids: list[int],
+    seen: set[int],
+    facts: list[str],
+) -> str:
+    """Run one agentic tool; append its result to `facts`/`photo_ids` and return a
+    short line for the model's next turn. Search widens the candidate pool; the three
+    count tools produce REAL numbers as fact lines the final answer states verbatim."""
+    action = turn.get("action")
+    if action == "search":
+        query = turn.get("query")
+        ids = (
+            search_photos(conn, embedder, owner_id, query, k=10)
+            if isinstance(query, str) and query
+            else []
+        )
+        for pid in ids:
+            if pid not in seen:
+                seen.add(pid)
+                photo_ids.append(pid)
+        return _summarise(conn, owner_id, ids)
+    if action == "count_photos":
+        query = (turn.get("query") or "").strip()
+        n = count_photos(conn, owner_id, query)
+        line = f"count: {n} photo(s)" + (f' matching "{query}"' if query else " in the library")
+        facts.append(line)
+        return line
+    if action == "list_memories":
+        mems = list_memories(conn, owner_id)
+        line = "memories: " + (
+            "; ".join(f"{m['name']} ({m['size']} photos)" for m in mems) or "none"
+        )
+        facts.append(line)
+        return line
+    if action == "count_periods":
+        grain = "year" if (turn.get("grain") or "").startswith("year") else "month"
+        n, _ = count_periods(conn, owner_id, grain)
+        line = f"{grain}(s) with photos: {n}"
+        facts.append(line)
+        return line
+    return "no result"
+
+
+def _agentic_turn(
+    client: InferenceClient, model: str, messages: list[dict], force: bool
+) -> dict | None:
+    """One agentic tool-selection turn -> parsed dict, or None. Schema-constrained;
+    a backend without structured output falls back to a plain call. `force` nudges the
+    last round to stop gathering (action=answer).
+
+    Temp 0 and a hard `_ROUTING_MAX_TOKENS` cap, like every routing call: this decides
+    a tool, it does not write prose."""
+    turn_messages = messages
+    if force:
+        turn_messages = [*messages, {"role": "user", "content": "Answer now (action=answer)."}]
+    try:
+        raw = client.complete(
+            model, turn_messages, timeout=60.0, json_schema=_AGENTIC_SCHEMA,
+            temperature=0, max_tokens=_ROUTING_MAX_TOKENS,
+        )
+    except Exception:  # noqa: BLE001 — backend without structured output → plain call
+        raw = client.complete(
+            model, turn_messages, timeout=60.0, temperature=0,
+            max_tokens=_ROUTING_MAX_TOKENS,
+        )
     start, end = raw.find("{"), raw.rfind("}")
     if start == -1 or end <= start:
         return None

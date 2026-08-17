@@ -55,12 +55,12 @@ def test_tag_returns_labels_per_dimension():
 
 def test_caption_returns_the_expected_shape():
     with _client() as tc:
-        resp = tc.post("/caption", json={"image": _IMAGE_B64, "dimensions": ["scene"]})
+        resp = tc.post("/caption", json={"image": _IMAGE_B64})
     assert resp.status_code == 200
     data = resp.json()
-    assert set(data.keys()) == {"caption", "title", "description", "tags", "model"}
+    # No tags — the caption model returns only the caption sentence (design §7).
+    assert set(data.keys()) == {"caption", "title", "description", "model"}
     assert isinstance(data["caption"], str) and data["caption"]
-    assert isinstance(data["tags"], dict)
     # The ACTUAL model the backend used (may differ from settings.caption_model).
     assert data["model"] == "fake"
 
@@ -103,14 +103,16 @@ def test_calibration_returns_fake_backend_values():
     assert resp.json() == {"logit_scale": 10.0, "logit_bias": -5.0}
 
 
-def test_resources_reports_memory_and_resident_models():
+def test_resources_reports_resident_models_and_nothing_else():
+    # §5.1: this endpoint carries no machine metrics. They are host-wide sysfs and
+    # psutil reads needing no CUDA context, so `app` takes them directly and the
+    # resource bar keeps showing them while this service is down or restarting.
     with _client() as tc:
         resp = tc.get("/resources")
     assert resp.status_code == 200
     data = resp.json()
-    assert data["ram_total_mb"] > 0
     assert isinstance(data["resident"], list)
-    assert data["gpu_pct"] is None  # fake backend has no GPU
+    assert set(data) == {"resident", "active"}
 
 
 def test_text_stream_streams_tokens_as_sse():

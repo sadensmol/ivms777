@@ -37,7 +37,7 @@ def test_delete_folder_removes_its_photos_and_all_metadata(conn, tmp_path):
     enqueue_folder_deletion(conn, 1, "Trip")
     assert process_folder_deletions(conn, originals, derived, 1, 320, 1600) == 1
 
-    gone = lambda sql, *p: conn.execute(sql, p).fetchone() is None  # noqa: E731
+    gone = lambda sql, *p: conn.execute(sql, p).fetchone() is None
     assert gone("SELECT 1 FROM photos WHERE id = ?", pid)
     assert gone("SELECT 1 FROM photo_tags WHERE photo_id = ?", pid)
     assert gone("SELECT 1 FROM photo_facets WHERE photo_id = ?", pid)

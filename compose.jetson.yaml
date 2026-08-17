@@ -1,96 +1,70 @@
-# Jetson profile (JetPack 7): fully containerised, including inference.
+# Jetson profile (JetPack 7): fully containerised.
 #
 # The NVIDIA container runtime hands the Orin iGPU to containers on JetPack 7, so
 # GPU is available inside the services that declare `runtime: nvidia`. 8 GB shared
 # memory means one small model — plan 16 runs a single gemma4-E2B GGUF.
+#
+# Since plan 18 there is NO separate `inference` service: the `models` container
+# is the single model process AND owns gemma's lifecycle — it spawns the
+# PROPERLY-BUILT sm_87 cu132 `llama-server` (baked into its own image,
+# Dockerfile.models.jetson) as a child process on :8080, and loads/evicts it (plus
+# SigLIP + nomic) through its conveyor (design §3.1/§5.1/§8.1). app/worker stay
+# thin clients with no GPU.
 services:
-  # llama.cpp `llama-server` — THE one inference backend (plan 16). Serves the
-  # single gemma4-E2B GGUF over the OpenAI `/v1` API for BOTH text (planner/chat)
-  # AND vision (caption), with the projector on the GPU (sm_87, §3.1). Replaces
-  # the old Ollama container, whose CUDA build ran vision on the CPU on JP7.
-  #
-  # It REUSES the `llama-server` binary already compiled for sm_87 in the
-  # `llamacpp` external volume (built once inside the cu130 image) — no in-image
-  # recompile. The cu130 image supplies the matching CUDA runtime libs the binary
-  # was linked against. (`Dockerfile.llamacpp.jetson` remains the reproducible
-  # from-scratch builder for a fresh board — see the README.) ALL optimization
-  # flags live here in `command`; the entrypoint fetches the GGUFs into
-  # `llama-models` once. Requires MAXN_SUPER — `make run-jetson` sets it.
-  inference:
-    image: ghcr.io/nvidia-ai-iot/ollama:r38.2.arm64-sbsa-cu130-24.04
-    runtime: nvidia
-    environment:
-      NVIDIA_VISIBLE_DEVICES: all
-      NVIDIA_DRIVER_CAPABILITIES: all
-      LLAMA_BIN: /llamacpp/llama.cpp/build/bin/llama-server
-      LD_LIBRARY_PATH: /llamacpp/llama.cpp/build/bin
-      LLAMA_MODEL_DIR: /models
-    entrypoint: ["/bin/sh", "/opt/ivms777/llama-server-entrypoint.sh"]
-    command:
-      - -m
-      - /models/gemma-4-E2B-it-Q4_K_M.gguf
-      - --mmproj
-      - /models/mmproj-F16.gguf
-      - -ngl
-      - "99"
-      - --flash-attn
-      - "on"
-      - --jinja
-      - --chat-template-kwargs
-      - '{"enable_thinking":false}'
-      - -c
-      - "4096"
-      - --host
-      - 0.0.0.0
-      - --port
-      - "8080"
-    volumes:
-      - llamacpp:/llamacpp             # prebuilt sm_87 llama-server binary + libs (reused, no recompile)
-      - llama-models:/models           # gemma GGUF + mmproj, fetched once
-      - ./scripts/llama-server-entrypoint.sh:/opt/ivms777/llama-server-entrypoint.sh:ro
-    ports:
-      - "8080:8080"
-
-  # app/worker are thin clients (design §5.1) — no GPU, no torch, the same slim
-  # `Dockerfile` as every other profile. Only `inference` and `models` need the iGPU.
   app:
     build: .
     environment:
       IVMS777_PROFILE: jetson
       IVMS777_PLANNER_MODEL: ${IVMS777_PLANNER_MODEL:-gemma4-E2B}
+      # Thin clients, but an upload burst (206 photos) left each holding ~640 MB of
+      # anonymous glibc arena across 113 mappings — one per-thread arena for 18
+      # threads on a 6-core box. Two arenas trade a little malloc contention for
+      # RAM we do not have (§8.1).
+      MALLOC_ARENA_MAX: "2"
     depends_on: [models]
   worker:
     build: .
     environment:
       IVMS777_PROFILE: jetson
       IVMS777_PLANNER_MODEL: ${IVMS777_PLANNER_MODEL:-gemma4-E2B}
+      MALLOC_ARENA_MAX: "2"
     depends_on: [models]
 
-  # SigLIP + the in-process caption-text embedder (nomic) run with
-  # embed_device=cuda, so this container needs GPU access. Builds from
-  # Dockerfile.models.jetson (python:3.12-slim + cu132 torch), which gives CUDA
-  # torch on JetPack 7. Captioning is NO LONGER in-process — it is an OpenAI call
-  # to the `inference` service above (design §3.1/§5.1, plan 16).
+  # The one model process: SigLIP + nomic (cu132 torch, embed_device=cuda) AND the
+  # sm_87 cu132 llama-server it supervises for gemma (text + vision). Builds from
+  # Dockerfile.models.jetson (cu132 base + llama.cpp build stage). Mounts the GGUFs
+  # at /data/models where build_llm_process (plan 18) looks for them.
   models:
     build:
       context: .
       dockerfile: Dockerfile.models.jetson
     runtime: nvidia
     environment:
-      # The slim base doesn't declare these (the cuda images do), so without them
-      # the nvidia runtime injects no driver libs and torch sees no GPU.
+      # The slim/runtime base doesn't declare these; without them the nvidia
+      # runtime injects no driver libs and torch (and llama-server) see no GPU.
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: all
       IVMS777_PROFILE: jetson
       IVMS777_CAPTION_MODEL: ${IVMS777_CAPTION_MODEL:-gemma4-E2B}
       IVMS777_PLANNER_MODEL: ${IVMS777_PLANNER_MODEL:-gemma4-E2B}
-    depends_on: [inference]
+      # The models service spawns llama-server on localhost and points its own
+      # OpenAI client at it (plan 18) — no separate inference host.
+      IVMS777_INFERENCE_BASE_URL: http://localhost:8080/v1
+      # The spawned binary's ggml CUDA libs live beside it in the llamacpp volume;
+      # the child gets this on its LD_LIBRARY_PATH (build_llm_process, plan 18).
+      IVMS777_LLM_LDPATH: /llamacpp/llama.cpp/build/bin
+    volumes:
+      - ivms777-data:/data
+      - llamacpp:/llamacpp             # prebuilt sm_87 llama-server binary + ggml libs (reused, no recompile)
+      - llama-models:/data/models       # gemma GGUF + mmproj (already populated on the board)
+    ports:
+      - "8080:8080"   # llama-server, exposed for debugging
 
 volumes:
-  # The prebuilt sm_87 llama-server binary lives here, created out-of-band (built
-  # once inside the cu130 image). `external` = use the existing volume as-is, never
-  # recreate. A fresh board populates it once via `Dockerfile.llamacpp.jetson`
-  # (README) or by building llama.cpp into it.
+  # The prebuilt sm_87 llama-server binary + ggml CUDA libs, built ONCE out-of-band
+  # (Dockerfile.llamacpp.jetson) into this external volume and REUSED — never
+  # recompiled by the models image. `external` = use as-is, never recreate.
   llamacpp:
     external: true
+  # gemma GGUF + mmproj (already populated on the board; a fresh board fetches once).
   llama-models:

@@ -22,30 +22,38 @@ class TextBackend:
         self,
         client,
         *,
-        text_embed_model: str | None = None,
-        device: str | None = None,
+        text_worker=None,
         model_name: str | None = None,
     ) -> None:
         self._client = client
-        self._text_embed_model = text_embed_model
-        self._device = device or "cpu"
+        # nomic's `TorchWorker` (plan 20), or None on cloud (real /embeddings backend).
+        self._text_worker = text_worker
         # The text model llama-server/vLLM keeps resident — for the resource bar (§13).
         self._model_name = model_name
 
     def text_complete(
-        self, model: str, messages: list[dict], json_schema: dict | None = None
+        self,
+        model: str,
+        messages: list[dict],
+        json_schema: dict | None = None,
+        *,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> str:
-        return self._client.complete(model, messages, json_schema=json_schema)
+        return self._client.complete(
+            model, messages, json_schema=json_schema,
+            temperature=temperature, max_tokens=max_tokens,
+        )
 
     def text_stream(self, model: str, messages: list[dict]) -> Iterator[str]:
         yield from self._client.stream(model, messages)
 
     def text_embed(self, model: str, texts: list[str]) -> list[list[float]]:
-        if self._text_embed_model is None:
+        # nomic runs in a killable child (plan 20, §8.1) so evicting it really
+        # returns its RAM; cloud has a real /embeddings backend and no worker.
+        if self._text_worker is None:
             return self._client.embed(model, texts)
-        from embedding.text_embedder import get_text_embedder
-
-        return get_text_embedder(self._text_embed_model, self._device).embed_texts(texts)
+        return self._text_worker.call("embed_texts", texts)
 
     def text_warm(self, model: str) -> None:
         self._client.warm(model)

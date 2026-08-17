@@ -69,21 +69,25 @@ def test_full_pass_processes_when_the_embedder_is_available(ctx):
     assert embedded["status"] == "done"
 
 
-def test_idle_pass_never_takes_a_model_lease(ctx):
-    # No photos at all → nothing pending in embed/taxonomy/caption → drain_pass
-    # must not call coordinator.require(...) for either workload (§8.1 "Idle →
-    # resume": the gate is on lease ENTRY, so an idle poll never loads a model).
-    import contextlib
+def test_idle_pass_never_builds_an_embedder(ctx, monkeypatch):
+    # No photos at all → nothing pending in embed/taxonomy/caption → drain_pass must
+    # not build an embedder / models client (which would reach the `models` service
+    # and load SigLIP). Load-on-demand lives in the service conveyor (plan 18); an
+    # idle poll stays model-free.
+    def _boom(*args, **kwargs):
+        raise AssertionError("idle pass must not build a model client")
 
-    seen: list[str] = []
+    cls = type(ctx.settings)
+    monkeypatch.setattr(cls, "build_embedder", _boom)
+    monkeypatch.setattr(cls, "build_models_client", _boom)
+    monkeypatch.setattr(cls, "build_inference_client", _boom)
 
-    class SpyCoordinator:
-        @contextlib.contextmanager
-        def require(self, workload):
-            seen.append(workload)
-            raise AssertionError(f"idle pass must not take the {workload} lease")
-            yield  # pragma: no cover
+    drain_pass(ctx, load_vocab(VOCAB_PATH))  # empty library → no model work
 
-    drain_pass(ctx, load_vocab(VOCAB_PATH), SpyCoordinator())
 
-    assert seen == []
+def test_drain_pass_has_no_coordinator_param():
+    import inspect
+
+    from ingest.pipeline import drain_pass as dp
+
+    assert "coordinator" not in inspect.signature(dp).parameters

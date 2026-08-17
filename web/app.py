@@ -1,8 +1,11 @@
 import json
+import logging
 import threading
 import time
 from pathlib import Path
 from urllib.parse import urlencode
+
+logger = logging.getLogger("ivms777.web")
 
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import (
@@ -25,7 +28,9 @@ from albums.memory_store import (
 )
 from albums.registry import ORGANIZERS, get_organizer
 from chat.agent import (
+    agentic_gather,
     direct_answer,
+    is_app_topic,
     memories_for_show,
     route,
     search_library,
@@ -39,8 +44,14 @@ from chat.history import (
     new_session,
     session_messages,
 )
+from chat.prefs import get_prefs, set_prefs
 from config import Settings
-from inference.prompts import chat_messages, general_chat_messages
+from inference.prompts import (
+    GUARDRAIL_REFUSAL,
+    agentic_answer_messages,
+    chat_messages,
+    general_chat_messages,
+)
 from ingest.folders import enqueue_folder_deletion, list_folders
 from ingest.jobs import (
     STAGES,
@@ -53,7 +64,6 @@ from ingest.jobs import (
 from ingest.pipeline import drain_pass
 from ingest.thumbs import thumb_key
 from ingest.vocab import load_vocab, seed_tags
-from models.coordinator import LeaseBusyError, RefusedError
 from models.resources import snapshot
 from search.dates import date_where
 from search.facets import (
@@ -160,14 +170,21 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.await_build = await_build
 
     def drain_now() -> None:
-        """Run one ingest pass for whatever has arrived.
+        """Run one ingest pass for whatever has arrived — single-process runs only.
 
-        The `worker` container drains continuously in deployment; doing it here too
-        means a single-container run — and every test — still produces a usable,
-        searchable grid without waiting on a poll. The pass itself (`drain_pass`) is
-        the single shared pipeline used by both, and it runs the GPU-free thumbnail
-        stage even when the embedder/inference backend is down (§8).
+        A bare `uvicorn` run and every test have no `worker`, so draining here is
+        what produces a usable, searchable grid without waiting on a poll. The pass
+        itself (`drain_pass`) is the single shared pipeline used by both, and it
+        runs the GPU-free thumbnail stage even when the embedder/inference backend
+        is down (§8).
+
+        Wherever a `worker` container DOES run — every compose profile — this is
+        off (`inline_drain`, set False for `app` in compose.yaml): a full inline
+        pass would hold the upload-finish request open for the whole library and
+        race the worker for the GPU. §5: app serves reads, worker owns writes.
         """
+        if not context().settings.inline_drain:
+            return
         drain_pass(context(), vocab)
 
     register_upload_api(app, context, drain_now)
@@ -196,14 +213,10 @@ def create_app(settings: Settings) -> FastAPI:
 
     def _search_page(ctx: AppContext, params: dict[str, str], query: str, offset: int) -> list:
         # Candidate generation via the retriever core (§9.2); facet/tag filters narrow the survivors.
-        # SigLIP is coordinated (§8.1): the SEARCH lease is SigLIP-only and shares
-        # the model with CHAT under the same "app" holder, so a search during a
-        # chat piggybacks rather than fighting it for residency.
-        client, _ = ctx.settings.build_inference_client()
-        coordinator = ctx.make_coordinator(client, "app")
-        with coordinator.require("SEARCH"):
-            embedder, _ = ctx.settings.build_embedder()
-            fused = candidates(ctx.conn, embedder, ctx.settings.owner_id, Query(text=query, k=200))
+        # SigLIP load/evict + GPU serialization are owned by the `models` service
+        # conveyor (plan 18); a search is just an HTTP embed call through it.
+        embedder, _ = ctx.settings.build_embedder()
+        fused = candidates(ctx.conn, embedder, ctx.settings.owner_id, Query(text=query, k=200))
         if not fused:
             return []
         where, where_params = _filter_where(ctx, params)
@@ -309,6 +322,8 @@ def create_app(settings: Settings) -> FastAPI:
             ctx.conn,
             planner_model=ctx.settings.planner_model or "fake",
             caption_model=ctx.settings.caption_model or "fake",
+            embed_model=ctx.settings.embed_model_name,
+            text_embed_model=ctx.settings.text_embed_model,
             models_client=ctx.settings.build_models_client(),
         ))
 
@@ -456,14 +471,13 @@ def create_app(settings: Settings) -> FastAPI:
                 app.state.memories_progress = {"done": done, "total": total}
 
             def run() -> None:
-                # ctx.conn is thread-local (§5): the coordinator must be built
-                # here, on the daemon thread that will hold the lease, not on
-                # the request thread above.
+                # ctx.conn is thread-local (§5): build the memories on this daemon
+                # thread's own connection. Model work goes through the `models`
+                # service conveyor (plan 18) — no coordinator here.
                 try:
-                    coordinator = ctx.make_coordinator(client, "app")
-                    with coordinator.require("MEMORY_REBUILD"):
-                        build_memories(ctx.conn, client, model, owner_id,
-                                       force=True, progress=on_progress)
+                    build_memories(ctx.conn, client, model, owner_id,
+                                   force=True, progress=on_progress,
+                                   use_captions=ctx.settings.similar_use_captions)
                 finally:
                     app.state.memories_building = False
 
@@ -510,11 +524,8 @@ def create_app(settings: Settings) -> FastAPI:
         owner = ctx.settings.owner_id
         query = params.get("q", "").strip()
         if query:
-            client, _ = ctx.settings.build_inference_client()
-            coordinator = ctx.make_coordinator(client, "app")
-            with coordinator.require("SEARCH"):
-                embedder, _ = ctx.settings.build_embedder()
-                fused = candidates(ctx.conn, embedder, owner, Query(text=query, k=200))
+            embedder, _ = ctx.settings.build_embedder()
+            fused = candidates(ctx.conn, embedder, owner, Query(text=query, k=200))
             where, where_params = _filter_where(ctx, params)
             if where and fused:
                 placeholders = ", ".join("?" for _ in fused)
@@ -572,6 +583,7 @@ def create_app(settings: Settings) -> FastAPI:
                         min_cosine=ctx.settings.similar_min_cosine,
                         caption_min=ctx.settings.similar_caption_min,
                         dimension_weights=vocab.dimension_weights,
+                        use_captions=ctx.settings.similar_use_captions,
                     )
                 ]
                 label = origin["ai_title"] or origin["caption"] or f"photo #{origin['id']}"
@@ -697,6 +709,7 @@ def create_app(settings: Settings) -> FastAPI:
             similarity = similarity_breakdown(
                 ctx.conn, ctx.settings.owner_id, collection["origin_id"], photo_id,
                 dimension_weights=vocab.dimension_weights,
+                use_captions=ctx.settings.similar_use_captions,
             )
 
         keep = {
@@ -741,6 +754,7 @@ def create_app(settings: Settings) -> FastAPI:
             min_cosine=ctx.settings.similar_min_cosine,
             caption_min=ctx.settings.similar_caption_min,
             dimension_weights=vocab.dimension_weights,
+            use_captions=ctx.settings.similar_use_captions,
         )
         params = _params(request)
         ctx_param = params.get("ctx")
@@ -788,11 +802,6 @@ def create_app(settings: Settings) -> FastAPI:
             "folders": list_folders(ctx.conn, ctx.settings.owner_id),
         }
 
-    BUSY_REPLY = (
-        "The library is busy processing photos right now — please try again "
-        "in a moment."
-    )
-
     def _memory_card_html(question: str) -> str | None:
         # The Organize memory card(s) for a "show me a memory / all my memories"
         # question, rendered as HTML so chat shows the memory ITSELF (mosaic + title
@@ -825,15 +834,19 @@ def create_app(settings: Settings) -> FastAPI:
         # "show me a memory" turn also re-renders its memory card, so the memory
         # survives reload just like the answer text does.
         ctx = context()
+        prefs = get_prefs(ctx.conn, ctx.settings.owner_id)
         session_id = current_session(ctx.conn, ctx.settings.owner_id)
         messages = session_messages(ctx.conn, session_id)
         for m in messages:
-            m["memory_html"] = _memory_card_html(m["question"])
+            # Memory cards are a direct-DB affordance (§10): re-render them only when
+            # "Direct answers" is on, so history matches how the turn was answered.
+            m["memory_html"] = _memory_card_html(m["question"]) if prefs.direct_answers else None
         return templates.TemplateResponse(
             request, "chat.html",
             {
                 "messages": messages,
                 "model": ctx.settings.planner_model or "fake",
+                "prefs": prefs,
             },
         )
 
@@ -841,6 +854,19 @@ def create_app(settings: Settings) -> FastAPI:
     def chat_new() -> RedirectResponse:
         ctx = context()
         new_session(ctx.conn, ctx.settings.owner_id)
+        return RedirectResponse("/chat", status_code=303)
+
+    @app.post("/chat/prefs")
+    def chat_prefs(
+        guardrails: str | None = Form(None), direct_answers: str | None = Form(None)
+    ) -> RedirectResponse:
+        # Global per-owner chat toggles (§10). An unchecked box omits its field, so
+        # presence == on. Persisted across every session; read on each stream turn.
+        ctx = context()
+        set_prefs(
+            ctx.conn, ctx.settings.owner_id,
+            guardrails=guardrails is not None, direct_answers=direct_answers is not None,
+        )
         return RedirectResponse("/chat", status_code=303)
 
     @app.get("/chat/stream")
@@ -861,40 +887,52 @@ def create_app(settings: Settings) -> FastAPI:
             # measured decode speed (tokens/sec) so the UI can show model info.
             return "event: done\ndata: " + json.dumps({"model": model, **stats}) + "\n\n"
 
+        prefs = get_prefs(ctx.conn, owner_id)
+
         def events():
-            # The direct-DB layer (§10): every question the DB can answer
-            # unambiguously — counts, memory show/list, periods — is answered
-            # straight from SQLite with NO model, so it takes NO CHAT lease and
-            # replies instantly even while ingest holds the caption model (§8.1),
-            # and NEVER reaches the weak planner (so a phrasing like "all" can't
-            # break it there). A "show me a memory" turn also streams the memory
-            # card, re-derived from the same question. Only when direct_answer
-            # DECLINES (returns None — semantic / relational) do we take the lease.
-            quick = direct_answer(ctx.conn, owner_id, q)
-            if quick is not None:
-                yield f"data: {json.dumps({'delta': quick})}\n\n"
-                add_message(ctx.conn, session_id, q, quick, [])
-                card = _memory_card_html(q)
-                if card is not None:
-                    yield "event: memory\ndata: " + json.dumps({"html": card}) + "\n\n"
-                yield _done()
-                return
-            # Per-request coordinator (§8.1): SigLIP (and the planner) load only
-            # for the lifetime of this turn, under the CHAT lease, on this
-            # generator's own thread/connection — never built eagerly up front,
-            # which used to crash chat on the Jetson before a question was even
-            # classified.
-            coordinator = ctx.make_coordinator(client, "app")
+            # Any failure below (most often the models service / llama-server being
+            # down — see §8.1) is streamed to the UI as a plain error turn, never a
+            # silent "(no answer)" bubble, and the partial answer + note is persisted.
+            parts: list[str] = []
             try:
-                with coordinator.require("CHAT"):
-                    # Agentic RAG (plan 17, §10): ONE routing decision picks a tool only
-                    # when the question is about the user's own photos/memories — general
-                    # knowledge / chit-chat is answered directly (chat is NOT photo-limited,
-                    # no off-topic gate). The photo tool is SigLIP image↔text
-                    # (`search_library`); memories via `search_memories`. `direct_answer`
-                    # (above) already served pure DB counts / memory-show / periods with no
-                    # model. Grounded answers cite [photo:ID]; general answers do not search.
+                # The direct-DB layer (§10) — ONLY when "Direct answers" is on (default).
+                # Every question the DB can answer unambiguously — counts, memory
+                # show/list, periods — is answered straight from SQLite with NO model,
+                # replies instantly even while ingest captions (§8.1), and NEVER reaches
+                # the weak planner. A "show me a memory" turn also streams the memory
+                # card. When the toggle is OFF, this whole step is skipped and the
+                # fully-agentic loop below handles those questions with real count tools.
+                if prefs.direct_answers:
+                    quick = direct_answer(ctx.conn, owner_id, q)
+                    if quick is not None:
+                        yield f"data: {json.dumps({'delta': quick})}\n\n"
+                        add_message(ctx.conn, session_id, q, quick, [])
+                        card = _memory_card_html(q)
+                        if card is not None:
+                            yield "event: memory\ndata: " + json.dumps({"html": card}) + "\n\n"
+                        yield _done()
+                        return
+                # One routing decision (plan 17, §10). Needed for the direct-ON one-shot
+                # path AND, when "Guardrails" is on, as the on-topic gate. The
+                # fully-agentic + guardrails-off case picks its own tools, so it needs no
+                # route. Model load/evict + GPU serialization live in the `models`
+                # conveyor (plan 18): the chat turn is a plain sequence of HTTP calls.
+                decision = None
+                if prefs.guardrails or prefs.direct_answers:
                     decision = route(client, model, q)
+                # Guardrails ON (§10): a message the router sends to `none` is off-topic —
+                # refuse with a fixed redirect, no generation, no search. Opt-in; off by
+                # default so chat stays a general assistant. App-specific questions (counts,
+                # memories, albums, uploads, tags…) are NEVER off-topic — `is_app_topic`
+                # overrides the weak router so app functionality is never turned away.
+                if prefs.guardrails and decision["tool"] == "none" and not is_app_topic(q):
+                    yield f"data: {json.dumps({'delta': GUARDRAIL_REFUSAL})}\n\n"
+                    add_message(ctx.conn, session_id, q, GUARDRAIL_REFUSAL, [])
+                    yield _done()
+                    return
+                if prefs.direct_answers:
+                    # Direct-ON one-shot path: SigLIP image↔text (search_library), memory
+                    # search, or a direct general answer. Grounded answers cite [photo:ID].
                     if decision["tool"] == "search_library":
                         embedder, _ = ctx.settings.build_embedder()
                         ids = search_library(
@@ -910,32 +948,44 @@ def create_app(settings: Settings) -> FastAPI:
                         messages = chat_messages(q, block)
                     else:  # general knowledge / chit-chat — answer directly, no search
                         messages = general_chat_messages(q)
-                    parts: list[str] = []
-                    started_at = None
-                    for delta in client.stream(model, messages, temperature=0):
-                        if started_at is None:  # clock starts at the first token, not the wait before it
-                            started_at = time.monotonic()
-                        parts.append(delta)
-                        yield f"data: {json.dumps({'delta': delta})}\n\n"
-                    # Chunk count is a close proxy for tokens with an OpenAI-style stream
-                    # (one token per chunk); good enough for a live decode-speed readout.
-                    elapsed = (time.monotonic() - started_at) if started_at else 0.0
-                    tok_per_sec = round(len(parts) / elapsed, 1) if elapsed > 0 else None
-                    answer = "".join(parts)
-                    add_message(ctx.conn, session_id, q, answer, cited_ids(answer))
-                    # No memory card here: a "show me a memory" turn is a direct-DB
-                    # question, answered above the lease — the semantic tail never
-                    # carries one (§10).
-                    yield _done(tok_per_sec=tok_per_sec, tokens=len(parts))
-            except (TimeoutError, RefusedError, LeaseBusyError):
-                # The coordinator can raise BEFORE any yield (over-budget model-set,
-                # or a background holder that still won't yield within the preempt
-                # window even after the caption abort) — without this, the SSE stream
-                # aborts with zero output and the UI shows nothing at all ("(no
-                # answer)", the bug this guards against). A coordinator failure still
-                # emits a graceful reply + done, same as every other turn.
-                yield f"data: {json.dumps({'delta': BUSY_REPLY})}\n\n"
-                yield _done()
+                else:
+                    # Fully-agentic RAG (§10): "Direct answers" off, so the model calls
+                    # REAL tools (count_photos / list_memories / count_periods / search) to
+                    # gather facts + candidate photos, then a grounded answer streams from
+                    # those facts. Memory-show is prose here (no card). Nothing gathered ->
+                    # answer from general knowledge.
+                    embedder, _ = ctx.settings.build_embedder()
+                    block, grounded = agentic_gather(
+                        ctx.conn, embedder, client, model, owner_id, q
+                    )
+                    messages = (
+                        agentic_answer_messages(q, block) if grounded
+                        else general_chat_messages(q)
+                    )
+                started_at = None
+                for delta in client.stream(model, messages, temperature=0):
+                    if started_at is None:  # clock starts at the first token, not the wait before it
+                        started_at = time.monotonic()
+                    parts.append(delta)
+                    yield f"data: {json.dumps({'delta': delta})}\n\n"
+                # Chunk count is a close proxy for tokens with an OpenAI-style stream
+                # (one token per chunk); good enough for a live decode-speed readout.
+                elapsed = (time.monotonic() - started_at) if started_at else 0.0
+                tok_per_sec = round(len(parts) / elapsed, 1) if elapsed > 0 else None
+                answer = "".join(parts)
+                add_message(ctx.conn, session_id, q, answer, cited_ids(answer))
+                yield _done(tok_per_sec=tok_per_sec, tokens=len(parts))
+            except Exception:
+                logger.exception("chat stream failed for q=%r", q)
+                note = (
+                    "⚠️ The assistant is unavailable right now — the model service "
+                    "could not be reached. Please try again in a moment."
+                )
+                # A break if partial text already streamed, so the note stays legible.
+                delta = ("\n\n" + note) if parts else note
+                yield f"data: {json.dumps({'delta': delta})}\n\n"
+                add_message(ctx.conn, session_id, q, "".join(parts) + delta, [])
+                yield _done(error=True)
 
         return StreamingResponse(events(), media_type="text/event-stream")
 

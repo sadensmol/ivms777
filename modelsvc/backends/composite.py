@@ -1,119 +1,174 @@
 """`CompositeBackend` — a `ModelBackend` assembled from independent
-sub-backends, one per concern (design §5.1, plan 15 task 2).
+sub-backends, one per concern (design §5.1), and the single funnel through
+which every model op passes the conveyor (plan 18).
 
-Task 2 wires only `embed` (SigLIP). Task 3 slots in `caption`, Task 4 slots
-in `text` — each without touching the others. A sub-backend not yet wired
-raises `NotImplementedError` instead of silently returning nonsense, so a
-premature call fails loudly at the call site.
+Each op acquires a scheduler slot (concurrency + priority) and asks the governor
+to make the models it needs resident, then runs. Interactive ops (search/chat)
+use `Priority.INTERACTIVE`; batch ingest captioning uses `Priority.BATCH`, so a
+chat preempts a queued caption on the single-slot Jetson. When no `scheduler` is
+injected (bare unit tests), ops run directly — same behaviour as before plan 18.
 
-Task 5 (§8.1) adds an optional `residency`: when given, `resources()` reports
-`residency.resident()` — what is ACTUALLY loaded — instead of the Task-2
-placeholder (`["siglip"]` whenever an embed sub-backend is wired).
+A sub-backend not yet wired raises `NotImplementedError` so a premature call
+fails loudly.
 """
 
 from collections.abc import Iterator
 
-import psutil
-
 from modelsvc.activity import Activity
-from modelsvc.gpu import read_gpu_pct
+from modelsvc.scheduler import Priority
 
 
 class CompositeBackend:
-    def __init__(self, *, embed, caption=None, text=None, residency=None) -> None:
+    def __init__(
+        self,
+        *,
+        embed,
+        caption=None,
+        text=None,
+        registry=None,
+        governor=None,
+        scheduler=None,
+        text_embed_needs: tuple[str, ...] = ("nomic",),
+    ) -> None:
         self._embed = embed
         self._caption = caption
         self._text = text
-        self._residency = residency
-        # The current in-flight op label, for the resource bar (§13). The service
-        # is the one place that sees every call, so "what is the box doing now" is
-        # tracked HERE — it replaces the removed cross-process lease workload.
+        self._registry = registry
+        self._governor = governor
+        self._scheduler = scheduler
+        self._text_embed_needs = text_embed_needs
+        # The current in-flight op label, for the resource bar (§13).
         self._activity = Activity()
 
+    # --- conveyor plumbing ---
+    def _run(self, needed, priority, label, fn):
+        def tracked():
+            with self._activity.track(label):
+                return fn()
+
+        if self._scheduler is None:
+            return tracked()
+        result = self._scheduler.run(list(needed), priority, tracked)
+        # A SigLIP/nomic op just ran; proactively unload gemma (either mode) if it has
+        # gone idle past its TTL, freeing GB for the rest of a long batch (no-op on
+        # mac/cloud).
+        if not any(n.startswith("gemma") for n in needed):
+            self._scheduler.reap_idle(["gemma", "gemma-vision"])
+        return result
+
+    # --- SigLIP ---
     def embed_image(self, images: list[bytes]) -> list[list[float]]:
-        with self._activity.track("embedding"):
-            return self._embed.embed_image(images)
+        return self._run(["siglip"], Priority.INTERACTIVE, "embedding",
+                         lambda: self._embed.embed_image(images))
 
     def embed_text(self, texts: list[str]) -> list[list[float]]:
-        with self._activity.track("embedding"):
-            return self._embed.embed_text(texts)
+        return self._run(["siglip"], Priority.INTERACTIVE, "embedding",
+                         lambda: self._embed.embed_text(texts))
 
     def tag(self, image: bytes, dimensions: list[str]) -> dict[str, list[str]]:
-        with self._activity.track("tagging"):
-            return self._embed.tag(image, dimensions)
+        return self._run(["siglip"], Priority.INTERACTIVE, "tagging",
+                         lambda: self._embed.tag(image, dimensions))
 
     def calibration(self) -> dict:
-        return self._embed.calibration()
+        return self._run(["siglip"], Priority.INTERACTIVE, "embedding",
+                         lambda: self._embed.calibration())
 
-    def caption(self, image: bytes, dimensions: list[str]) -> dict:
+    # --- captioning (gemma-vision, batch) ---
+    def caption(self, image: bytes) -> dict:
+        # The ONLY op that sends an image to gemma, so the ONLY one that needs the
+        # vision projector loaded (design §3.1). Chat/planner use text-only `gemma`.
         if self._caption is None:
-            raise NotImplementedError("caption backend wired in Task 3")
-        with self._activity.track("captioning"):
-            return self._caption.caption(image, dimensions)
+            raise NotImplementedError("caption backend not wired")
+        return self._run(["gemma-vision"], Priority.BATCH, "captioning",
+                         lambda: self._caption.caption(image))
 
+    # --- text generation (gemma) ---
     def text_complete(
-        self, model: str, messages: list[dict], json_schema: dict | None = None
+        self,
+        model: str,
+        messages: list[dict],
+        json_schema: dict | None = None,
+        *,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> str:
         if self._text is None:
-            raise NotImplementedError("text backend wired in Task 4")
-        with self._activity.track("planning"):
-            return self._text.text_complete(model, messages, json_schema=json_schema)
+            raise NotImplementedError("text backend not wired")
+        return self._run(["gemma"], Priority.INTERACTIVE, "planning",
+                         lambda: self._text.text_complete(
+                             model, messages, json_schema=json_schema,
+                             temperature=temperature, max_tokens=max_tokens))
 
     def text_stream(self, model: str, messages: list[dict]) -> Iterator[str]:
         if self._text is None:
-            raise NotImplementedError("text backend wired in Task 4")
-        # A generator: keep the activity marked for the whole stream, not just
-        # until the generator object is built — so the bar shows "chat" while the
-        # answer streams, then clears when the last token is consumed.
+            raise NotImplementedError("text backend not wired")
+
+        # A generator: hold the slot (and gemma) for the WHOLE stream, not just
+        # until the generator object is built, so gemma is not evicted mid-answer.
         def stream() -> Iterator[str]:
-            with self._activity.track("chat"):
+            if self._scheduler is None:
+                with self._activity.track("chat"):
+                    yield from self._text.text_stream(model, messages)
+                return
+            with self._scheduler.reserve(["gemma"], Priority.INTERACTIVE), self._activity.track("chat"):
                 yield from self._text.text_stream(model, messages)
 
         return stream()
 
     def text_embed(self, model: str, texts: list[str]) -> list[list[float]]:
         if self._text is None:
-            raise NotImplementedError("text backend wired in Task 4")
-        with self._activity.track("embedding"):
-            return self._text.text_embed(model, texts)
+            raise NotImplementedError("text backend not wired")
+        return self._run(list(self._text_embed_needs), Priority.INTERACTIVE, "embedding",
+                         lambda: self._text.text_embed(model, texts))
 
     def text_warm(self, model: str) -> None:
         if self._text is None:
-            raise NotImplementedError("text backend wired in Task 4")
+            raise NotImplementedError("text backend not wired")
         self._text.text_warm(model)
 
     def text_evict(self, model: str) -> None:
         if self._text is None:
-            raise NotImplementedError("text backend wired in Task 4")
+            raise NotImplementedError("text backend not wired")
         self._text.text_evict(model)
 
+    # --- conveyor control (plan 18, control API) ---
+    def models_state(self) -> dict:
+        if self._governor is None:
+            resident = list(self._registry.resident()) if self._registry is not None else []
+            return {"resident": resident, "budget_mb": 0, "free_mb": 0.0,
+                    "used_mb": 0, "active": self._activity.current()}
+        st = self._governor.state()
+        return {"resident": st.resident, "budget_mb": st.budget_mb, "free_mb": st.free_mb,
+                "used_mb": st.used_mb, "active": self._activity.current()}
+
+    def model_ensure(self, name: str) -> None:
+        if self._scheduler is not None:
+            self._scheduler.run([name], Priority.INTERACTIVE, lambda: None)
+        elif self._registry is not None:
+            self._registry.ensure(name)
+
+    def model_unload(self, name: str) -> None:
+        if self._registry is not None:
+            self._registry.unload(name)
+
     def resources(self) -> dict:
-        # Process-wide memory/CPU plus whichever sub-backends are actually
-        # wired. `resident` prefers the residency manager's own view of what
-        # is ACTUALLY loaded (§8.1); the Task-2 placeholder only applies when
-        # no residency was injected (e.g. tests constructing this directly).
-        vm = psutil.virtual_memory()
+        """What this service ALONE knows: which models are resident, and the op
+        in flight. No machine metrics — RAM/CPU/GPU-load/temperature are host-wide
+        sysfs/psutil reads that need no CUDA context, so `app` reads them itself
+        and the bar keeps working when this service is down (design §5.1, §13).
+        """
         active = self._activity.current()
-        if self._residency is not None:
-            resident = list(self._residency.resident())
+        if self._registry is not None:
+            resident = list(self._registry.resident())
         else:
             resident = ["siglip"] if self._embed is not None else []
-        # The text model (llama-server / vLLM) is a SEPARATE always-on process that
-        # keeps its one model loaded for its whole life and also serves captioning, so
-        # it is resident in EVERY state — show it always (idle, embedding, captioning,
-        # chat, planning), not only during a text op. (Under the old Ollama warm/unload
-        # model this was gated to chat/planning; there is no unload now — §13.)
-        if self._text is not None:
+        # The text model (gemma) is reported by the registry now (it is a managed
+        # model). When no registry is wired (bare tests), fall back to the text
+        # backend's own view so the resource bar still shows it.
+        if self._registry is None and self._text is not None:
             text_fn = getattr(self._text, "resident_models", None)
             if text_fn is not None:
                 for model in text_fn():
                     if model not in resident:
                         resident.append(model)
-        return {
-            "ram_used_mb": (vm.total - vm.available) / (1024 * 1024),
-            "ram_total_mb": vm.total / (1024 * 1024),
-            "cpu_pct": psutil.cpu_percent(),
-            "gpu_pct": read_gpu_pct(),
-            "resident": resident,
-            "active": active,
-        }
+        return {"resident": resident, "active": active}

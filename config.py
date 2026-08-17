@@ -14,14 +14,22 @@ Profile = Literal["mac", "jetson", "cloud"]
 # Override per-deploy with IVMS777_CAPTION_MODEL / IVMS777_PLANNER_MODEL.
 PROFILE_DEFAULTS: dict[Profile, dict[str, object]] = {
     "mac": {
-        # One gemma4-E2B GGUF on a host-native llama-server (Metal), reached from
-        # the containers at host.docker.internal:8080 (design §3.1, plan 16).
+        # One gemma4-E2B GGUF on a host-native llama-server (Metal), started by
+        # `make llama-mac` on :8080 (design §3.1, plan 16). The models service does
+        # NOT supervise it — it is an EXTERNAL server the service reuses (RemoteLlm),
+        # so `llm_managed` is False; spawning a second llama-server would clash on
+        # :8080. Docker Desktop has no GPU passthrough, hence host-native.
         "caption_model": "gemma4-E2B",
         "planner_model": "gemma4-E2B",
         "embed_device": "cpu",
         "inference_base_url": "http://host.docker.internal:8080/v1",
         "ram_budget_mb": 24000,
         "models_base_url": "http://models:9000",
+        "gpu_concurrency": 3,
+        "llm_managed": False,
+        "llm_idle_ttl_s": None,
+        "llm_ngl": 99,
+        "llm_ctx": 4096,
     },
     "jetson": {
         # One gemma4-E2B GGUF on a containerised sm_87 CUDA llama-server, text +
@@ -30,8 +38,24 @@ PROFILE_DEFAULTS: dict[Profile, dict[str, object]] = {
         "planner_model": "gemma4-E2B",
         "embed_device": "cuda",
         "inference_base_url": "http://inference:8080/v1",
-        "ram_budget_mb": 6000,
+        # 7.4 GB usable, and app+worker+OS hold ~1.9 GB of it (measured: app 647 MB,
+        # worker 625 MB, host ~600 MB). A 6000 budget over-commits the board before
+        # a single model loads — the governor thought it had headroom while `free`
+        # showed 461 MB and 1.2 GB had already gone to swap.
+        "ram_budget_mb": 5000,
         "models_base_url": "http://models:9000",
+        "gpu_concurrency": 1,
+        "llm_managed": True,
+        "llm_idle_ttl_s": 120,
+        # GPU-ONLY, ALWAYS: every layer on the GPU, never a CPU offload (design
+        # §3.1/§8.1). gemma is made to FIT instead — the conveyor evicts SigLIP +
+        # nomic, the KV context is 2048, and the vision projector is the Q8_0 build
+        # (~0.5 GB vs ~0.94 GB F16). If it still does not fit, llama-server aborts
+        # and the error is surfaced; we shrink the footprint, never spill to CPU.
+        "llm_ngl": 99,
+        # Smaller KV cache to shrink gemma's resident footprint on the 8 GB box
+        # (~0.5 GB less than 4096) — chat turns are short (design §3.1/§8.1).
+        "llm_ctx": 2048,
     },
     "cloud": {
         # cloud is unchanged by plan 16 — still vLLM (open item).
@@ -41,6 +65,9 @@ PROFILE_DEFAULTS: dict[Profile, dict[str, object]] = {
         "inference_base_url": "http://inference:8000/v1",
         "ram_budget_mb": 60000,
         "models_base_url": "http://models:9000",
+        "gpu_concurrency": 4,
+        "llm_managed": False,
+        "llm_idle_ttl_s": None,
     },
 }
 
@@ -82,14 +109,122 @@ class Settings(BaseSettings):
     # "Similar photos": min caption-embedding cosine to count two captions as
     # semantically matching (§9). Tune per embedding model.
     similar_caption_min: float = Field(default=0.6, ge=0.0, le=1.0)
+    # Kill switch for the caption-meaning signal in "similar photos" (§9.3). False
+    # drops it from BOTH halves — the candidate union and the scoring contribution —
+    # leaving tags + image look-alike. It exists to measure what the caption signal
+    # is actually worth (`scripts/caption_ablation.py`): if it earns nothing, the
+    # nomic text embedder can be dropped from the resident set entirely (§8.1).
+    similar_use_captions: bool = True
 
     embed_model_name: str = "siglip2-so400m-patch14-384"
     use_fake_embedder: bool = False
     use_fake_inference: bool = False
 
-    # Usable RAM budget for the model coordinator (design §8.1). A workload whose
-    # model-set exceeds this is refused, not loaded. Per-profile default below.
+    # Whether `/api/upload/finish` drains the ingest queue INLINE, in the app
+    # process (§5, §8). True is the single-process convenience: a bare `uvicorn`
+    # run and every test get a usable, searchable grid straight after upload
+    # without a `worker` to poll.
+    #
+    # It must be False wherever a `worker` container runs — which is every
+    # compose profile. The drain is a FULL pass over the whole queue, so with a
+    # worker present it (a) holds the finish request open for the entire
+    # library — minutes for a few hundred photos — and (b) puts a second drainer
+    # on the same jobs, doubling CPU and GPU contention. On the Jetson that
+    # showed up as `app` pinned at 100 % CPU for the whole ingest, racing the
+    # worker for a GPU that only has `gpu_concurrency: 1`. `compose.yaml` sets
+    # it False for `app`; §5's "app serves reads, worker owns writes" is the
+    # deployed behaviour.
+    inline_drain: bool = True
+
+    # Usable RAM budget for the model conveyor (design §8.1). The MemoryGovernor
+    # evicts resident models to keep the resident set within this ceiling AND
+    # within measured free RAM. Per-profile default below.
     ram_budget_mb: int | None = None
+
+    # --- Single model conveyor (design §5.1/§8.1, plan 18) ---
+    # Max GPU-heavy ops the scheduler runs at once: 1 on jetson (serialize the
+    # GPU), N on mac/cloud (parallel). Per-profile default below.
+    gpu_concurrency: int | None = None
+    # Whether the `models` service supervises `llama-server` as a child process
+    # (mac/jetson). False on cloud (remote vLLM, not supervised).
+    llm_managed: bool | None = None
+    # Unload gemma after this many idle seconds to free ~2 GB for SigLIP-heavy
+    # batches (jetson). None disables idle-unload (mac/cloud). Per-profile default.
+    llm_idle_ttl_s: int | None = None
+    # Rough resident cost of each managed model, for the governor's budget math.
+    # gemma is the containerised `llama-server` child: the Q4_K_M weights (~3.0 GB)
+    # + the Q8_0 mmproj (~0.5 GB) + KV/compute buffers + its own CUDA context.
+    # This MUST be accurate in BOTH directions:
+    #   - an UNDER-estimate makes the governor keep SigLIP resident and load gemma
+    #     on top → OOM kills the child → captions fail with "connection refused";
+    #   - an OVER-estimate does NOT just "evict more, which is safe". Once
+    #     `cost + headroom` exceeds `ram_budget_mb` the model can never load AT
+    #     ALL, on any amount of free RAM — the governor stops evicting and starts
+    #     refusing. `gemma-vision` sat at 5000 against a 5000 budget and a 512
+    #     headroom, so `5000 + 512 > 5000` raised InsufficientMemory on every
+    #     single caption; the whole stage failed on an idle board with 5.6 GB
+    #     free. `test_every_model_fits_its_profile_budget` now guards that.
+    # Both gemma figures are MEASURED on the board, like siglip/nomic — as the drop
+    # in `psutil.virtual_memory().available`, which is exactly what the governor's
+    # real-free guard reads, across loading each on an otherwise-idle Jetson:
+    #   gemma        3606 MB (peak RAM delta 3374) → declared 3800
+    #   gemma-vision 3936 MB (peak RAM delta 4047) → declared 4300
+    # `llama-server`'s RSS reads ~4967 MB for gemma-vision, but ~1.3 GB of that is
+    # the mmap'd GGUF already counted in page cache — RSS is the wrong unit here.
+    # The ~500 MB gap between the two is the Q8_0 projector, which is what it
+    # should be: the measurements corroborate each other.
+    # `gemma` is the TEXT-only child (chat/planner); `gemma-vision` adds the Q8_0
+    # projector for captioning (design §3.1). Mutually exclusive — never both, so
+    # vision MUST cost more than text-only or the swap logic is describing a
+    # model that does not exist.
+    # siglip/nomic are MEASURED on the board, not guessed — re-measured after the
+    # `device_map` fix (§8.1). Each figure is the CHILD's whole footprint (its torch
+    # import and CUDA context included), which is the right unit because evicting
+    # kills the child:
+    #   siglip 3.26 GB — loads with `device_map`, so no host copy. Was ~5.0 GB against
+    #     a declared 3400 before the fix: exactly the under-estimate this warns about.
+    #   nomic  2.14 GB — still loads with `.to()` (device_map breaks its custom remote
+    #     code), so it PAYS the host copy. Measured at 1.28 GB under device_map, which
+    #     is what it would cost if that ever becomes usable. NOT the "~0.3 GB" older
+    #     docs claim — nomic is the second-most expensive resident on this board.
+    # Since plan 20 each runs in a `TorchWorker` child, so `free` is a process kill
+    # and the eviction genuinely returns that memory to gemma (§8.1).
+    model_cost_mb: dict[str, int] = Field(
+        default_factory=lambda: {
+            "siglip": 3400,
+            "nomic": 2200,
+            "gemma": 3800,
+            "gemma-vision": 4300,
+        }
+    )
+    # Path to the `llama-server` binary the models service spawns when it SUPERVISES
+    # gemma (jetson: llm_managed=True). None → resolve `llama-server` from PATH. On
+    # mac gemma runs as an EXTERNAL host server (make llama-mac), so this is unused.
+    llm_bin: str | None = None
+    llm_port: int = 8080
+    # KV-cache context length for the supervised `llama-server` (`-c`). Smaller =
+    # less resident RAM; jetson uses 2048 (chat turns are short) to give the 8 GB
+    # box headroom, mac/cloud 4096. Per-profile default below (env: IVMS777_LLM_CTX).
+    llm_ctx: int | None = None
+    # The mmproj (vision projector) GGUF `llama-server` loads for captioning. Only
+    # used where the service SUPERVISES gemma (jetson); mac reuses an external server.
+    # Default is the **Q8_0** build (531 MB, `ggml-org/gemma-4-E2B-it-GGUF`) rather
+    # than F16 (985 MB): the projector is GPU-resident like everything else (no CPU
+    # offload, §3.1), and its CLIP tensor buffer is what OOM-aborted llama-server at
+    # F16. Q8 costs negligible caption quality and is the single biggest GPU-RAM
+    # saving on the 8 GB jetson. Override with IVMS777_MMPROJ_NAME.
+    mmproj_name: str = "mmproj-gemma-4-E2B-it-Q8_0.gguf"
+    # GPU layers for the supervised `llama-server` (`-ngl`). None → omit the flag so
+    # llama.cpp AUTO-FITS as many layers as free GPU RAM allows and offloads the rest
+    # to CPU — the jetson safety net: gemma (~5 GB) can exceed the ~4.3 GB free, and
+    # forcing `-ngl 99` makes llama.cpp ABORT at load ("failed to fit params …, abort")
+    # instead of degrading, killing the child (design §3.1/§8.1). An int pins that many
+    # GPU layers (mac: 99, Metal has ample RAM). Per-profile default below.
+    llm_ngl: int | None = None
+
+    @property
+    def llm_health_url(self) -> str:
+        return f"http://localhost:{self.llm_port}/health"
 
     @model_validator(mode="after")
     def _apply_profile_defaults(self) -> "Settings":

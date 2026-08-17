@@ -26,6 +26,9 @@ class FakeInferenceClient:
         self._responses = list(responses or [])
         self._streams = list(streams or [])
         self.calls: list[tuple[str, list[ChatMessage]]] = []
+        # Decode controls per `complete` call, so a test can assert a routing call is
+        # deterministic and capped (temp 0 + max_tokens), not free-running.
+        self.complete_kwargs: list[dict] = []
 
     def complete(
         self,
@@ -35,11 +38,13 @@ class FakeInferenceClient:
         json_schema: dict | None = None,
         timeout: float = 120.0,
         temperature: float | None = None,
+        max_tokens: int | None = None,
         should_stop: Callable[[], bool] | None = None,
     ) -> str:
         if should_stop is not None and should_stop():
             raise InferenceCancelled(model)   # mirrors the cancellable client path
         self.calls.append((model, messages))
+        self.complete_kwargs.append({"temperature": temperature, "max_tokens": max_tokens})
         assert self._responses, "FakeInferenceClient ran out of queued responses"
         return self._responses.pop(0)
 

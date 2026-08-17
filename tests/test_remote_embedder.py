@@ -14,6 +14,7 @@ don't pull it in themselves.
 
 import subprocess
 import sys
+from io import BytesIO
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -38,6 +39,44 @@ def test_embed_images_round_trips_through_the_fake_backend():
     vectors = embedder.embed_images([Image.new("RGB", (8, 8))])
     assert len(vectors) == 1
     assert len(vectors[0]) > 0
+
+
+def _captured_payload(images: list[Image.Image]) -> list[bytes]:
+    """Return the PNG bytes `embed_images` actually puts on the wire."""
+    client = _client()
+    sent: list[bytes] = []
+
+    def capture(payload, **kwargs):
+        sent.extend(payload)
+        return [[0.0]] * len(payload)
+
+    client.embed_image = capture
+    RemoteEmbedder(client, "fake").embed_images(images)
+    return sent
+
+
+def test_images_are_downscaled_to_siglips_384px_input_before_encoding():
+    # SigLIP 2 so400m/patch14-384 squashes every input to 384x384 (its own
+    # preprocessor_config.json: do_resize, size 384x384, resample BILINEAR), so
+    # sending the full-resolution original is pure waste: on the Jetson the PNG
+    # encode alone cost 5.7 s and a 15 MB body per photo, against ~10 ms of GPU
+    # (§8.1). Verified out-of-band against the real processor: pre-resizing with
+    # the same filter leaves `pixel_values` bit-identical, so the vectors are
+    # unchanged.
+    sent = _captured_payload([Image.new("RGB", (3024, 4032))])
+    assert len(sent) == 1
+    with Image.open(BytesIO(sent[0])) as encoded:
+        assert encoded.size == (384, 384)
+
+
+def test_downscaling_is_applied_to_every_image_in_a_batch():
+    sent = _captured_payload(
+        [Image.new("RGB", (4032, 3024)), Image.new("RGB", (800, 533))]
+    )
+    assert len(sent) == 2
+    for png in sent:
+        with Image.open(BytesIO(png)) as encoded:
+            assert encoded.size == (384, 384)
 
 
 def test_embed_texts_round_trips_through_the_fake_backend():

@@ -16,11 +16,10 @@ class CaptionResult:
     caption: str
     title: str
     description: str
-    tags: dict[str, list[str]]
 
 
 class Captioner(Protocol):
     name: str
     caption_model: str
 
-    def caption(self, image: bytes, dimensions: list[str]) -> CaptionResult: ...
+    def caption(self, image: bytes) -> CaptionResult: ...

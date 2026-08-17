@@ -34,6 +34,7 @@ class InferenceClient(Protocol):
         *,
         json_schema: dict | None = None,
         timeout: float = 120.0,
+        max_tokens: int | None = None,
         should_stop: Callable[[], bool] | None = None,
     ) -> str: ...
 
@@ -83,11 +84,18 @@ class OpenAICompatClient:
         json_schema: dict | None = None,
         timeout: float = 120.0,
         temperature: float | None = None,
+        max_tokens: int | None = None,
         should_stop: Callable[[], bool] | None = None,
     ) -> str:
         payload: dict = {"model": model, "messages": messages}
         if temperature is not None:
             payload["temperature"] = temperature
+        # A hard decode cap. A grammar-constrained call that never closes its JSON
+        # object runs to the context limit and comes back EMPTY (measured on the
+        # jetson: 1606 tokens, `truncated = 1`, 56 s, no output) — the cap turns that
+        # runaway into a cheap miss the caller can degrade from.
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
         if json_schema is not None:
             payload["response_format"] = {
                 "type": "json_schema",

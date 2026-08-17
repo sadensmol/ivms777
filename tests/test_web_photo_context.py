@@ -105,7 +105,7 @@ def test_memory_shown_in_chat_excludes_members_from_similar(settings):
     ).fetchone()["id"]
     for pid in (1, 2, 4):
         conn.execute(
-            "INSERT INTO photo_tags(photo_id, tag_id, score, source) VALUES (?, ?, 1.0, 'vlm')",
+            "INSERT INTO photo_tags(photo_id, tag_id, score, source) VALUES (?, ?, 1.0, 'siglip')",
             (pid, tid),
         )
     replace_memories(conn, 1, [Memory("Beach day", "desc", [1, 2, 3], "sig")])
@@ -143,7 +143,7 @@ def test_similar_strip_excludes_photos_already_in_the_memory(settings):
     ).fetchone()["id"]
     for pid in (1, 2, 4):  # 2 is a member, 4 is not — both share the subject 'dog'
         conn.execute(
-            "INSERT INTO photo_tags(photo_id, tag_id, score, source) VALUES (?, ?, 1.0, 'vlm')",
+            "INSERT INTO photo_tags(photo_id, tag_id, score, source) VALUES (?, ?, 1.0, 'siglip')",
             (pid, tid),
         )
     replace_memories(conn, 1, [Memory("Beach day", "desc", [1, 2, 3], "sig")])

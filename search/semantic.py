@@ -27,6 +27,10 @@ DEFAULT_SIMILAR_DIMENSION_WEIGHTS = {
     "light": 0.8, "season_weather": 0.8, "composition": 0.8, "palette": 0.5, "quality": 0.0,
 }
 _CAPTION_WEIGHT = 3.0   # a shared rare caption word ranks like a strong subject match
+# An unreachable caption cosine — the ablation switch (§9.3). Passed as `caption_min`
+# it makes every caption comparison fall below the bar, which is exactly "no caption
+# signal" for both the recall union and the scoring contribution.
+CAPTION_SIGNAL_OFF = 2.0
 _VECTOR_WEIGHT = 1.0    # holistic look, a mild tiebreak
 _DECAY = 0.6            # each extra reason counts less, so one strong match beats many weak
 # "Content" = what the photo IS. A candidate must share at least one content signal
@@ -127,6 +131,7 @@ def similar_photos(
     min_cosine: float = 0.5,
     caption_min: float = 0.6,
     dimension_weights: dict[str, float] | None = None,
+    use_captions: bool = True,
 ) -> list[dict]:
     """Photos similar to a given one, with the REASON each is similar (§9).
 
@@ -137,6 +142,11 @@ def similar_photos(
       * embedding only    -> visual neighbours (image-vector KNN, cosine floor);
       * + taxonomy        -> add shared tags, per-dimension weighted;
       * + captions        -> add caption-meaning similarity (text-embedding cosine).
+
+    `use_captions=False` (settings `similar_use_captions`, §9.3) removes the caption
+    signal from BOTH halves — the candidate union and the scoring contribution — so
+    the result is exactly "tags + image look-alike". It is the ablation switch for
+    measuring what the caption embedding is worth; it is not a tuning knob.
 
     Each facet is a scored **contribution** — a tag (`dimension_weight × agreement
     × idf`), the caption's semantic closeness (`_CAPTION_WEIGHT × caption cosine`),
@@ -160,6 +170,10 @@ def similar_photos(
     from search.retriever import Query, candidates, refine
 
     weights = dimension_weights or DEFAULT_SIMILAR_DIMENSION_WEIGHTS
+    # A cosine can never exceed 1.0, so an impossible floor silences the caption
+    # signal in `_caption_similarity` (recall) AND `caption_contribution` (scoring)
+    # without either of them growing a flag of its own.
+    caption_min = caption_min if use_captions else CAPTION_SIGNAL_OFF
     query = Query(seed_photo_id=photo_id, k=k, weights=weights, floor=None)
     ids = candidates(conn, None, owner_id, query, caption_min=caption_min)
     results = refine(
@@ -192,6 +206,7 @@ def similarity_breakdown(
     origin_id: int,
     current_id: int,
     dimension_weights: dict[str, float] | None = None,
+    use_captions: bool = True,
 ) -> list[dict]:
     """Full facet-by-facet explanation of why `current` is similar to `origin`
     (§9, §13). One row per shared facet — tag, caption word, or visual — showing
@@ -237,7 +252,10 @@ def similarity_breakdown(
             "contrib": weight * agreement * idf,
         })
 
-    o_capvec, c_capvec = read_caption_vector(conn, origin_id), read_caption_vector(conn, current_id)
+    # Mirrors `similar_photos`: with the signal off the panel must not claim a row
+    # that no longer drives the score (§9.3).
+    o_capvec = read_caption_vector(conn, origin_id) if use_captions else None
+    c_capvec = read_caption_vector(conn, current_id) if use_captions else None
     if o_capvec is not None and c_capvec is not None:
         cap_cos = max(0.0, sum(a * b for a, b in zip(l2_normalize(o_capvec), l2_normalize(c_capvec))))
         rows.append({"param": "caption (meaning)", "origin": "—", "current": "—",

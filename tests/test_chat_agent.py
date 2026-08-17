@@ -2,6 +2,7 @@ import json
 
 from chat.agent import (
     agent_retrieve,
+    agentic_gather,
     count_periods,
     count_photos,
     direct_answer,
@@ -214,3 +215,112 @@ def test_direct_answer_declines_a_relational_count(conn):
         _photo(conn, pid, f"photo {pid}")
     q = "how many similar photos to this dog one you found we have?"
     assert direct_answer(conn, owner_id=1, question=q) is None
+
+
+def test_agentic_gather_counts_via_the_count_tool(conn):
+    # Direct-OFF fully-agentic path: the model calls count_photos, so the gathered
+    # block carries the REAL total as a fact line (never inferred from candidates).
+    for pid in range(1, 6):
+        add_photo(conn, photo_id=pid, content_hash=f"h{pid}", thumb_key=f"{pid}.jpg")
+    fake = FakeInferenceClient(responses=[
+        json.dumps({"action": "count_photos", "query": "", "grain": None}),
+        json.dumps({"action": "answer", "query": None, "grain": None}),
+    ])
+    block, grounded = agentic_gather(conn, FakeEmbedder(), fake, "fake", 1, "how many photos?")
+    assert grounded is True
+    assert "count: 5" in block
+
+
+def test_agentic_gather_lists_memories_via_the_tool(conn):
+    from albums.memory_store import Memory, replace_memories
+    for pid in (1, 2):
+        add_photo(conn, photo_id=pid, content_hash=f"h{pid}", thumb_key=f"{pid}.jpg",
+                  shot_at=f"2023-12-0{pid}T10:00:00")
+    replace_memories(conn, 1, [Memory("Borjomi", "A day out.", [1, 2], "sig")])
+    fake = FakeInferenceClient(responses=[
+        json.dumps({"action": "list_memories", "query": None, "grain": None}),
+        json.dumps({"action": "answer", "query": None, "grain": None}),
+    ])
+    block, grounded = agentic_gather(conn, FakeEmbedder(), fake, "fake", 1, "what memories do I have?")
+    assert grounded is True
+    assert "Borjomi" in block
+
+
+def test_agentic_system_prompt_reserves_search_for_library_questions():
+    # `search` is the ONLY agentic tool that loads SigLIP, and on the Jetson SigLIP
+    # evicts gemma (§8.1) — so the prompt must tell the model to answer world
+    # questions with no tool, and to keep `search` for showing the user's own photos.
+    from chat.agent import _AGENTIC_SYSTEM
+
+    prompt = _AGENTIC_SYSTEM.lower()
+    assert "own photos" in prompt
+    assert "call no tool" in prompt
+    assert "regions are in russia" in prompt  # the worked negative example
+    assert "expensive" in prompt
+    # The no-tool branch is stated BEFORE the tool menu, so the model reads it first.
+    assert prompt.index("call no tool") < prompt.index('"action":"count_photos"')
+
+
+def test_agentic_turns_are_deterministic_and_token_capped(conn):
+    # A tool-selection turn emits ONE small JSON object. Uncapped and sampled, a
+    # grammar-constrained decode can run to the whole KV context and come back EMPTY
+    # (measured on the jetson: 1606 tokens, truncated, 56 s, no output).
+    from chat.agent import _ROUTING_MAX_TOKENS
+
+    fake = FakeInferenceClient(responses=[
+        json.dumps({"action": "count_photos", "query": "", "grain": None}),
+        json.dumps({"action": "answer", "query": None, "grain": None}),
+    ])
+    agentic_gather(conn, FakeEmbedder(), fake, "fake", 1, "how many photos?")
+
+    assert fake.complete_kwargs, "no completion was issued"
+    for kwargs in fake.complete_kwargs:
+        assert kwargs["temperature"] == 0
+        assert kwargs["max_tokens"] == _ROUTING_MAX_TOKENS
+
+
+def test_route_is_deterministic_and_token_capped():
+    from chat.agent import _ROUTING_MAX_TOKENS, route
+
+    fake = FakeInferenceClient(responses=[json.dumps({"tool": "none", "query": None})])
+    route(fake, "fake", "how many regions are in Russia?")
+
+    assert fake.complete_kwargs[0]["temperature"] == 0
+    assert fake.complete_kwargs[0]["max_tokens"] == _ROUTING_MAX_TOKENS
+
+
+def test_agentic_gather_general_question_is_not_grounded(conn):
+    # No tool call -> nothing gathered -> answer from general knowledge (empty block).
+    fake = FakeInferenceClient(responses=[
+        json.dumps({"action": "answer", "query": None, "grain": None}),
+    ])
+    block, grounded = agentic_gather(conn, FakeEmbedder(), fake, "fake", 1, "hi there")
+    assert grounded is False
+    assert block == ""
+
+
+def test_is_app_topic_covers_counts_memories_albums_and_features():
+    from chat.agent import is_app_topic
+    for q in [
+        "how many photos do I have?",
+        "number of memories",
+        "show me my memories",
+        "what albums do I have?",
+        "list my albums",
+        "how many months of photos?",
+        "how many pictures with dogs",
+        "what's in my library",
+        "how many uploads",
+    ]:
+        assert is_app_topic(q) is True, q
+
+
+def test_is_app_topic_false_for_genuinely_off_topic():
+    from chat.agent import is_app_topic
+    for q in [
+        "should I walk or drive to work?",
+        "what is the capital of France?",
+        "write me a python function",
+        "how do I bake bread?",
+    ]:
+        assert is_app_topic(q) is False, q

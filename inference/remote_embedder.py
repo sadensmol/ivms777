@@ -15,6 +15,24 @@ from PIL import Image
 
 from inference.models_client import ModelsClient
 
+# SigLIP 2 so400m/patch14-384's own preprocessor_config.json says
+# `do_resize: true`, `size: {384, 384}`, `resample: 2` (BILINEAR) — it squashes
+# EVERY input to exactly 384x384, ignoring aspect ratio. So resizing here, with
+# the same filter, is the operation the processor would do anyway: it makes the
+# processor's own resize an identity op and the vectors come out unchanged.
+#
+# It is also the difference between a working ingest and a stalled one. PNG is
+# lossless, so encoding a 3024x4032 original cost 5.7 s of CPU and a 15 MB
+# base64 body PER PHOTO on the Jetson, against ~10 ms of GPU — the embed stage
+# ran at 0.32 img/s with the GPU idle 96 % of the time (§8.1). At 384x384 the
+# encode is a few ms and the body is ~250 KB.
+#
+# NOTE: this holds only for a FIXED-resolution SigLIP checkpoint. SigLIP 2 also
+# ships NaFlex variants, which consume native resolution and aspect ratio — on
+# one of those this pre-resize would throw away real signal. Re-check
+# `preprocessor_config.json` before changing `embed_model_name`.
+_SIGLIP_INPUT_PX = 384
+
 
 class RemoteEmbedder:
     def __init__(self, client: ModelsClient, model_name: str) -> None:
@@ -27,7 +45,9 @@ class RemoteEmbedder:
         encoded = []
         for image in images:
             buffer = BytesIO()
-            image.save(buffer, "PNG")
+            image.resize(
+                (_SIGLIP_INPUT_PX, _SIGLIP_INPUT_PX), Image.Resampling.BILINEAR
+            ).save(buffer, "PNG")
             encoded.append(buffer.getvalue())
         return self._client.embed_image(encoded)
 

@@ -25,12 +25,17 @@ dependencies = [
 # default `uv sync` stays torch-free and their image is slim. `einops` is required
 # by the in-process caption-text embedder's custom modeling code
 # (nomic-embed-text-v1.5, design §4). Since plan 16 there is no in-process caption
-# VLM, so no bitsandbytes/accelerate anywhere.
+# VLM, so no bitsandbytes. `accelerate` IS needed — see the note on it below.
 [project.optional-dependencies]
 models = [
     "torch>=2.13.0",
     "transformers>=5.15.0",
     "einops>=0.8",
+    # Required by `from_pretrained(device_map=...)`, which is what keeps a model's
+    # weights from being materialised in HOST RAM before the copy to the GPU.
+    # Measured on the Jetson: `.to(device)` costs 5128 MB RSS, `device_map` 2940 MB —
+    # the 2.2 GB difference is a host copy that is never freed (design §8.1).
+    "accelerate>=1.0",
 ]
 
 [dependency-groups]

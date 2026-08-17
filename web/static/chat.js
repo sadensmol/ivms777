@@ -51,6 +51,10 @@ function initChat() {
       document.getElementById("chat-form").requestSubmit();
     }
   });
+  // The two global toggles persist immediately: any checkbox change posts the
+  // prefs form, which redirects back to /chat with the new state reflected (§10).
+  const prefs = document.getElementById("chat-prefs");
+  if (prefs) prefs.addEventListener("change", () => prefs.submit());
 }
 initChat();
 

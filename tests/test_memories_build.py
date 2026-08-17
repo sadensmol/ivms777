@@ -58,3 +58,28 @@ def test_stored_memory_shows_up_as_an_album(conn):
     assert albums[0].title == "Beach day"
     assert albums[0].cover_id in (1, 2, 3)
     assert albums[0].meta["kind"] == "memory"
+
+
+def test_one_failing_candidate_does_not_abort_the_whole_rebuild(conn):
+    # The rebuild runs on a bare daemon thread (§11), so an exception escaping
+    # build_memories killed it outright: "Exception in thread Thread-2". The
+    # remaining candidates were never tried and replace_memories never ran, so a
+    # single bad cluster left the library with ZERO memories.
+    _run(conn, (1, 2, 3), "2025-07-12T1{}:00:00")
+    _run(conn, (4, 5, 6), "2025-09-20T1{}:00:00")
+
+    class FlakyClient:
+        """Fails the first candidate, answers the second."""
+
+        def __init__(self):
+            self.calls = 0
+
+        def complete(self, *a, **k):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("500 Internal Server Error")
+            return _keep("Autumn trip")
+
+    n = build_memories(conn, FlakyClient(), "planner", owner_id=1)
+    assert n == 1                                            # the good one survived
+    assert [m.title for m in read_memories(conn, 1)] == ["Autumn trip"]

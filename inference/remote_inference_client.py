@@ -28,14 +28,18 @@ class RemoteInferenceClient:
         json_schema: dict | None = None,
         timeout: float = 120.0,
         temperature: float | None = None,
+        max_tokens: int | None = None,
         should_stop: Callable[[], bool] | None = None,
     ) -> str:
         # `should_stop` is ignored: no app/worker text caller passes it (caption
         # preemption, §8.1, is internal to the service now) — see Ruling R1/R5.
-        # `temperature` is accepted for interface parity; forwarding it through the
-        # models-service text endpoint is pending plan-15 gateway work.
+        # `temperature`/`max_tokens` ARE forwarded: this is the client `app` uses on the
+        # jetson, and silently dropping them left every routing call sampling at the
+        # backend default with no decode cap — one runaway grammar-constrained turn then
+        # ate the whole 2048-token context and returned an empty string.
         return self._client.text_complete(
-            model, messages, json_schema=json_schema, timeout=timeout
+            model, messages, json_schema=json_schema, timeout=timeout,
+            temperature=temperature, max_tokens=max_tokens,
         )
 
     def stream(

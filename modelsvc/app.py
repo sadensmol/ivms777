@@ -37,16 +37,14 @@ class TagRequest(BaseModel):
 
 class CaptionRequest(BaseModel):
     image: str  # base64
-    dimensions: list[str] = []
 
 
 class CaptionResponse(BaseModel):
     caption: str
     title: str
     description: str
-    tags: dict[str, list[str]]
-    # The ACTUAL model the backend used (jetson's in-process VLM tag differs from
-    # `settings.caption_model`) — the worker stores this, not the config value.
+    # The ACTUAL model the backend used — the worker stores this, not the config
+    # value. The caption model writes no tags; tags are SigLIP-only (design §7).
     model: str
 
 
@@ -54,6 +52,11 @@ class TextCompleteRequest(BaseModel):
     model: str
     messages: list[dict[str, Any]]
     json_schema: dict[str, Any] | None = None
+    # Decoding controls the CALLER owns. A routing/tool-selection call wants temp 0 and
+    # a small token cap; a chat answer wants neither. Both are optional so an existing
+    # caller that sends neither keeps the backend's defaults.
+    temperature: float | None = None
+    max_tokens: int | None = None
 
 
 class TextCompleteResponse(BaseModel):
@@ -80,12 +83,25 @@ class CalibrationResponse(BaseModel):
 
 
 class ResourcesResponse(BaseModel):
-    ram_used_mb: float
-    ram_total_mb: float
-    cpu_pct: float
-    gpu_pct: float | None = None
+    """Only what this service alone knows (design §5.1).
+
+    Deliberately NO machine metrics: RAM/CPU/GPU-load/temperature are host-wide
+    reads that need no CUDA context, so `app` takes them from psutil and sysfs
+    directly and the bar survives this service being down.
+    """
+
     resident: list[str]
     active: str | None = None  # current in-flight op for the bar (embedding/captioning/chat/…)
+
+
+class ModelsStateResponse(BaseModel):
+    """Conveyor state (plan 18) — what the governor holds resident vs its budget."""
+
+    resident: list[str]
+    budget_mb: int
+    free_mb: float
+    used_mb: int
+    active: str | None = None
 
 
 def create_models_app(backend: ModelBackend) -> FastAPI:
@@ -112,12 +128,15 @@ def create_models_app(backend: ModelBackend) -> FastAPI:
     @app.post("/caption", response_model=CaptionResponse)
     def caption(req: CaptionRequest) -> CaptionResponse:
         image = base64.b64decode(req.image)
-        return CaptionResponse(**backend.caption(image, req.dimensions))
+        return CaptionResponse(**backend.caption(image))
 
     @app.post("/text/complete", response_model=TextCompleteResponse)
     def text_complete(req: TextCompleteRequest) -> TextCompleteResponse:
         return TextCompleteResponse(
-            text=backend.text_complete(req.model, req.messages, json_schema=req.json_schema)
+            text=backend.text_complete(
+                req.model, req.messages, json_schema=req.json_schema,
+                temperature=req.temperature, max_tokens=req.max_tokens,
+            )
         )
 
     @app.post("/text/stream")
@@ -146,5 +165,19 @@ def create_models_app(backend: ModelBackend) -> FastAPI:
     @app.get("/resources", response_model=ResourcesResponse)
     def resources() -> ResourcesResponse:
         return ResourcesResponse(**backend.resources())
+
+    @app.get("/models", response_model=ModelsStateResponse)
+    def models_state() -> ModelsStateResponse:
+        return ModelsStateResponse(**backend.models_state())
+
+    @app.post("/models/{name}/ensure")
+    def model_ensure(name: str) -> dict:
+        backend.model_ensure(name)
+        return {}
+
+    @app.post("/models/{name}/unload")
+    def model_unload(name: str) -> dict:
+        backend.model_unload(name)
+        return {}
 
     return app

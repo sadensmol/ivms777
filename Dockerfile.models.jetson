@@ -1,33 +1,29 @@
 # syntax=docker/dockerfile:1
-# Jetson Orin Nano (JetPack 7) build of the `models` service — GPU SigLIP + the
-# in-process caption-text embedder (nomic). Since plan 16 there is NO in-process
-# caption VLM (captioning is an OpenAI call to the llama-server `inference`
-# service), so this image no longer ships bitsandbytes/accelerate or a C toolchain
-# — just cu132 torch for SigLIP + the text embedder. app/worker are torch-free
-# thin clients (Dockerfile); only this service loads models (design §5.1).
+# Jetson Orin Nano (JetPack 7, L4T r39.2, CUDA 13.2) build of the `models`
+# service — the SINGLE model process AND the owner of gemma's lifecycle (plan 18).
+# It ships SigLIP + the nomic text embedder on cu132 torch (embed_device=cuda) and
+# SPAWNS gemma's llama-server as a child process (text + vision). There is NO
+# separate `inference` container any more (design §3.1/§5.1).
 #
-# The `uv sync` / `uv pip install` steps use a BuildKit **cache mount** for uv's
-# download cache (see the `# syntax` directive on line 1), so the multi-GB
-# torch/transformers wheels are stored on the builder and REUSED on every rebuild
-# — a dependency change (or `--reinstall`) rebuilds the layer but no longer
-# re-downloads the wheels.
+# It does NOT recompile llama.cpp: the sm_87 `llama-server` binary + its ggml CUDA
+# libs are the ones already built once into the external `llamacpp` volume (mounted
+# at /llamacpp by compose); IVMS777_LLM_BIN points at it and IVMS777_LLM_LDPATH
+# adds its lib dir for the child. The only requirement of THIS image is the CUDA
+# runtime libs (libcudart/libcublas) the binary links against — hence the
+# nvidia/cuda runtime base instead of python:3.12-slim.
 #
-# The normal Dockerfile.models installs `torch` from PyPI, whose only aarch64
-# wheel is CPU-only, so `embed_device=cuda` would fail. On JetPack 7 (L4T r39,
-# CUDA 13.2) the Orin exposes SBSA, so upstream CUDA-13.2 torch wheels run on
-# the iGPU — no jetson-containers, no dusty-nv base, no autotag. JetPack 7
-# already ships system Python 3.12, so this image is the normal
-# python:3.12-slim image with ONE change: torch/torchvision come from the
-# cu132 index instead of the CPU PyPI wheel. The container reaches the iGPU
-# through the NVIDIA runtime (`runtime: nvidia`). See docs/design.md §3.1.
-FROM python:3.12-slim
+# torch cu132 bundles its OWN cu132 CUDA libs and only needs the cu132 driver
+# (injected by `runtime: nvidia`), so it runs regardless of the base's CUDA minor;
+# the two model processes (this one's torch, the llama-server child) never share a
+# CUDA context.
+FROM nvidia/cuda:13.2.0-runtime-ubuntu24.04
 
-# libheif1: HEIC decoding (pillow-heif). libjpeg62-turbo/zlib1g: Pillow
-# runtime. libsndfile1: transformers 5.x eagerly imports `soundfile` from its
-# processing utils, which dlopen()s libsndfile even for a vision-only model
-# like SigLIP; without it `AutoProcessor` import crashes.
+# python3.12: Ubuntu 24.04 base ships it. libheif1: HEIC (pillow-heif).
+# libjpeg-turbo8/zlib1g: Pillow runtime. libsndfile1: transformers 5.x dlopen()s
+# libsndfile even for vision-only SigLIP. libgomp1: llama.cpp OpenMP. curl: health.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      libheif1 libjpeg62-turbo zlib1g libsndfile1 \
+      python3.12 python3.12-venv \
+      libheif1 libjpeg-turbo8 zlib1g libsndfile1 libgomp1 ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
@@ -35,28 +31,36 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 WORKDIR /app
 COPY pyproject.toml uv.lock* README.md ./
 
-# Everything from pyproject's `models` extra (numpy 2.x, transformers, …)
-# minus the GPU torch: `uv sync --extra models` first brings the CPU torch,
-# then we reinstall torch+torchvision from the JetPack-7 CUDA-13.2 index. Both
-# come from the same index so the pair is ABI-compatible; the cu132 wheels are
-# built against NumPy 2.x, matching pyproject's `numpy>=2.5.2` floor (no
-# Jetson-specific numpy pin any more).
+# `models` extra minus the GPU torch, then reinstall torch+torchvision from the
+# cu132 index (same index → ABI-matched; cu132 wheels built against NumPy 2.x).
 RUN --mount=type=cache,target=/root/.cache/uv \
-      uv sync --no-dev --extra models --frozen || uv sync --no-dev --extra models
+      uv sync --no-dev --extra models --frozen --python python3.12 \
+      || uv sync --no-dev --extra models --python python3.12
 RUN --mount=type=cache,target=/root/.cache/uv \
       uv pip install --reinstall torch torchvision \
       --index-url https://download.pytorch.org/whl/cu132
 
-# Flat layout: only the modules the models service actually imports — it
-# never touches web/chat/ingest/search/storage/db/albums.
+# Flat layout: only the modules the models service imports.
 COPY config.py vocab.yaml ./
 COPY modelsvc ./modelsvc
 COPY embedding ./embedding
 COPY captioning ./captioning
 COPY inference ./inference
 
-ENV PYTHONUNBUFFERED=1 IVMS777_DATA_DIR=/data
-EXPOSE 9000
+# Drop CUDA forward-compat libs. The nvidia/cuda base ships /usr/local/cuda/compat_orin;
+# on Jetson forward-compat is never used (container CUDA 13.2 == host driver, torch cu132
+# bundles its own runtime). Worse, the nvidia-container-toolkit 1.19.1 `enable-cuda-compat`
+# CDI hook PANICS parsing that libcuda ("slice bounds out of range"), so any GPU container
+# with this dir fails `createContainer`. Removing it makes the hook find no compat dir and
+# return early. Kept last so the expensive torch/uv layers stay cached.
+RUN rm -rf /usr/local/cuda*/compat /usr/local/cuda*/compat_orin
+
+# gemma's actuator: the models service spawns THIS binary (from the mounted
+# llamacpp volume) on :8080. IVMS777_LLM_LDPATH is set in compose alongside the
+# volume mount (the binary's ggml libs live there).
+ENV PYTHONUNBUFFERED=1 IVMS777_DATA_DIR=/data \
+    IVMS777_LLM_BIN=/llamacpp/llama.cpp/build/bin/llama-server
+EXPOSE 9000 8080
 
 CMD ["uv", "run", "--no-sync", "uvicorn", "modelsvc.asgi:app_factory", "--factory", \
      "--host", "0.0.0.0", "--port", "9000"]

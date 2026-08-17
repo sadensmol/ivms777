@@ -9,9 +9,19 @@
         model: <strong>{{ model }}</strong><span id="chat-tps"></span>
       </div>
     </div>
-    <form method="post" action="/chat/new">
-      <button type="submit" class="new-session">New session</button>
-    </form>
+    <div class="chat-controls">
+      <form id="chat-prefs" method="post" action="/chat/prefs" class="chat-toggles">
+        <label title="Answer counts, memories, and periods straight from the database (fast). Off = the model answers them agentically with count tools.">
+          <input type="checkbox" name="direct_answers" {% if prefs.direct_answers %}checked{% endif %}> Direct answers
+        </label>
+        <label title="Restrict chat to your photos and this app; off-topic questions are declined.">
+          <input type="checkbox" name="guardrails" {% if prefs.guardrails %}checked{% endif %}> Guardrails
+        </label>
+      </form>
+      <form method="post" action="/chat/new">
+        <button type="submit" class="new-session">New session</button>
+      </form>
+    </div>
   </div>
   <div id="chat-log" class="chat-log">
     {% for m in messages %}

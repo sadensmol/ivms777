@@ -25,7 +25,10 @@ def test_upload_offers_a_reprocess_button_per_stage(client):
         assert f'name="from_stage" value="{stage}"' in body
         assert f'name="to_stage" value="{stage}"' in body
     # The caption button confirms first — it alone re-runs the slow vision model.
-    assert "can take hours" in body
+    # The confirm never quotes a duration in minutes/hours (all UI time is seconds).
+    assert "onsubmit=\"return confirm(" in body
+    assert "runs the captioner over the whole library" in body
+    assert "hours" not in body
 
 
 def test_reprocess_all_rebuilds_up_to_taxonomy_but_not_captions(client):
@@ -67,7 +70,7 @@ def test_photo_reprocess_requeues_only_that_photos_stage(client):
     )
     assert response.status_code == 303
     assert response.headers["location"] == "/photo/1?ctx=library"  # returns to the photo in place
-    status = lambda pid: conn.execute(  # noqa: E731
+    status = lambda pid: conn.execute(
         "SELECT status FROM jobs WHERE photo_id = ? AND stage = 'taxonomy'", (pid,)
     ).fetchone()["status"]
     assert status(1) == "pending"   # only this photo requeued

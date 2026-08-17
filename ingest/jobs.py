@@ -149,14 +149,16 @@ def requeue_stalled(conn: sqlite3.Connection) -> int:
 
 
 def format_speed(per_sec: float | None) -> str | None:
-    """Human-readable throughput label (§13). Fast stages read per second; a slow
-    stage like captioning (~30 s each) reads per minute instead of rounding to a
-    misleading `0.0/s`."""
+    """Human-readable throughput label (§13), ALWAYS per second — never per minute
+    or hour. A slow stage like captioning (~30 s each) keeps extra decimals so it
+    still reads a real rate (e.g. `0.033/s`) instead of rounding to `0.0/s`."""
     if not per_sec:
         return None
     if per_sec >= 1.0:
         return f"{per_sec:.1f}/s"
-    return f"{per_sec * 60:.1f}/min"
+    if per_sec >= 0.1:
+        return f"{per_sec:.2f}/s"
+    return f"{per_sec:.3f}/s"
 
 
 def stage_speed(conn: sqlite3.Connection, stage: str, window: int = 50) -> float | None:

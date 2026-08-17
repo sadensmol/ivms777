@@ -9,7 +9,6 @@ from inference.models_client import ModelsClient
 from ingest.jobs import enqueue
 from ingest.taxonomy import reindex_fts
 from ingest.thumbs import thumb_key
-from ingest.vocab import tag_id_map
 from ingest.worker import StageHandler
 from storage.base import Storage
 
@@ -17,13 +16,14 @@ from storage.base import Storage
 def caption_handler(
     derived: Storage,
     models_client: ModelsClient,
-    dimensions: list[str],
     detail_px: int,
     should_preempt: Callable[[], bool] = lambda: False,
 ) -> StageHandler:
     """The caption stage: one HTTP call per photo to the `models` service's
-    `/caption` (design §5.1, plan 15 task 3) -> caption, AI title/description, and
-    vlm tags, written straight to the DB. It does NOT embed the caption: the
+    `/caption` (design §5.1, plan 15 task 3) -> caption + AI title/description,
+    written straight to the DB. It writes NO tags — the caption model no longer
+    picks from the vocabulary; tags are owned by the SigLIP taxonomy stage (§7).
+    It does NOT embed the caption: the
     caption-vector (§9) is a SEPARATE, batched step (`backfill_caption_vectors`,
     pipeline group 2c) that embeds captions with the dedicated text embedder
     (`nomic-embed-text`, in-process in the `models` service) — a different model,
@@ -47,13 +47,12 @@ def caption_handler(
         # Prefer the detail thumbnail; fall back to the grid one the photo already has.
         image_key = detail_key if derived.exists(detail_key) else row["thumb_key"]
         image = derived.read(image_key)
-        result = models_client.caption(image, dimensions)
+        result = models_client.caption(image)
 
         conn.execute(
             "UPDATE photos SET caption=?, caption_model=?, ai_title=?, ai_description=? WHERE id=?",
             (result["caption"], result["model"], result["title"], result["description"], photo_id),
         )
-        _write_vlm_tags(conn, photo_id, result["tags"])
         reindex_fts(conn, photo_id)
 
     return handle
@@ -86,24 +85,6 @@ def backfill_caption_vectors(
     for row, vector in zip(rows, vectors):
         write_caption_vector(conn, row["id"], l2_normalize(vector))
     return len(rows)
-
-
-def _write_vlm_tags(conn: sqlite3.Connection, photo_id: int, tags: dict) -> None:
-    ids = tag_id_map(conn)
-    conn.execute(
-        "DELETE FROM photo_tags WHERE photo_id = ? AND source = 'vlm'", (photo_id,)
-    )
-    rows = [
-        (photo_id, ids[(dimension, label)], 1.0, "vlm")
-        for dimension, labels in tags.items()
-        for label in labels
-        if (dimension, label) in ids  # only labels that are in the vocabulary
-    ]
-    conn.executemany(
-        "INSERT INTO photo_tags(photo_id, tag_id, score, source) VALUES (?, ?, ?, ?)"
-        " ON CONFLICT(photo_id, tag_id, source) DO UPDATE SET score = excluded.score",
-        rows,
-    )
 
 
 def backfill_captions(conn: sqlite3.Connection) -> int:

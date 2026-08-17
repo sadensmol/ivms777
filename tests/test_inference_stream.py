@@ -7,7 +7,6 @@ import pytest
 from inference.client import InferenceCancelled, OpenAICompatClient
 from inference.fakes import FakeInferenceClient
 
-
 _SSE_BODY = (
     'data: {"choices":[{"delta":{"content":"Hel"}}]}\n\n'
     'data: {"choices":[{"delta":{"content":"lo"}}]}\n\n'

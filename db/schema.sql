@@ -138,3 +138,13 @@ CREATE TABLE IF NOT EXISTS chat_messages (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS chat_messages_session ON chat_messages(session_id, id);
+
+-- Global per-owner chat toggles (§10): guardrails (off) restricts chat to the
+-- library and refuses off-topic questions; direct_answers (on) keeps the
+-- deterministic direct-DB step. Applied across every session, not per-session.
+-- Their defaults reproduce today's pipeline exactly.
+CREATE TABLE IF NOT EXISTS chat_prefs (
+  owner_id       INTEGER PRIMARY KEY,
+  guardrails     INTEGER NOT NULL DEFAULT 0,
+  direct_answers INTEGER NOT NULL DEFAULT 1
+);

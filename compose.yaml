@@ -10,6 +10,10 @@ services:
     environment:
       IVMS777_PROFILE: ${IVMS777_PROFILE:-mac}
       IVMS777_DATA_DIR: /data
+      # The `worker` below owns ingest (§5). Without this the upload-finish
+      # handler drains the whole queue inline too, holding the request open for
+      # minutes and racing the worker for the GPU (config.inline_drain).
+      IVMS777_INLINE_DRAIN: "false"
     volumes:
       - ivms777-data:/data           # uploads, db, thumbnails — Docker volume only
     ports:

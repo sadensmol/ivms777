@@ -1,8 +1,10 @@
 import json
+import re
 
 import pytest
 from fastapi.testclient import TestClient
 
+from chat.prefs import set_prefs
 from config import Settings
 from embedding.fakes import FakeEmbedder
 from embedding.store import write_caption_vector, write_vector
@@ -10,6 +12,10 @@ from embedding.vectors import l2_normalize
 from inference.fakes import FakeInferenceClient
 from tests.factories import add_photo
 from web.app import create_app
+
+
+def _input(body, name):
+    return re.search(rf'<input[^>]*name="{name}"[^>]*>', body).group(0)
 
 
 @pytest.fixture
@@ -233,27 +239,32 @@ def test_memory_card_survives_reload_in_history(settings, monkeypatch):
     assert 'class="msg-memory"' in page
 
 
+def test_stream_surfaces_error_instead_of_silent_no_answer(settings, monkeypatch):
+    # When generation fails (the models service / llama-server is down — the jetson
+    # OOM bug, §8.1), the UI must get a REAL error turn, never a silent "(no answer)".
+    # Route resolves, then the stream raises (empty stream queue stands in for the
+    # RemoteProtocolError the down llama-server produces).
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    fake = FakeInferenceClient(responses=['{"tool": "none", "query": null}'], streams=[])
+    monkeypatch.setattr(Settings, "build_inference_client", lambda self: (fake, "fake"))
+    app = create_app(settings)
+    with TestClient(app) as tc:
+        body = tc.get("/chat/stream?q=should+I+walk+or+drive").text
+        assert "unavailable" in body.lower()   # a real error delta streamed to the UI
+        assert "event: done" in body           # the stream still closes cleanly
+        # the failed turn is persisted, so reload shows the error, not an empty bubble
+        assert "unavailable" in tc.get("/chat").text.lower()
+
+
 def test_count_question_streams_answer_not_no_answer(chat_client):
     body = chat_client.get("/chat/stream?q=how many images in my library?").text
     assert "data:" in body and "event: done" in body   # streamed → not "(no answer)"
 
 
-def test_count_question_answers_without_taking_the_model_lease(settings, monkeypatch):
-    # A count/aggregate question is answered straight from the DB (§8.1) — it must
-    # NOT take the CHAT lease, so "how many photos?" answers instantly even while
-    # ingest holds the caption model. The coordinator here refuses to hand over the
-    # lease; the count must still come back (not "busy").
-    from web.deps import AppContext
-
+def test_count_question_answers_from_the_db_without_a_model(settings):
+    # A count/aggregate question is answered straight from the DB (§10) — no model,
+    # no search. "how many photos?" comes back instantly with the real total.
     settings.data_dir.mkdir(parents=True, exist_ok=True)
-
-    class _NeverGivesLease:
-        def require(self, workload):
-            raise AssertionError("a count question must not require the model lease")
-
-    monkeypatch.setattr(
-        AppContext, "make_coordinator", lambda self, client, holder: _NeverGivesLease()
-    )
     app = create_app(settings)
     conn = app.state.context.conn
     for pid in range(1, 4):
@@ -261,33 +272,6 @@ def test_count_question_answers_without_taking_the_model_lease(settings, monkeyp
     with TestClient(app) as tc:
         body = tc.get("/chat/stream", params={"q": "how many photos do I have?"}).text
     assert "3" in body                       # the real total, from the DB
-    assert "busy" not in body.lower()         # never fell into the lease-busy path
-    assert "event: done" in body
-
-
-def test_chat_stream_never_aborts_when_the_coordinator_lease_times_out(settings, monkeypatch):
-    # §8.1 FIX I2: coordinator.require("CHAT") can raise TimeoutError (or
-    # RefusedError / LeaseBusyError) BEFORE any yield — a background workload
-    # that won't yield the lease within 30s, or an over-budget model-set. Without
-    # a guard the SSE stream aborts with zero output — the "(no answer)" bug.
-    # This must never recur: the stream always emits >=1 `data:` + `event: done`.
-    from web.deps import AppContext
-
-    settings.data_dir.mkdir(parents=True, exist_ok=True)
-
-    class _TimeoutCoordinator:
-        def require(self, workload):
-            raise TimeoutError(f"could not acquire model lease for {workload} within 30.0s")
-
-    monkeypatch.setattr(
-        AppContext, "make_coordinator",
-        lambda self, client, holder: _TimeoutCoordinator(),
-    )
-    app = create_app(settings)
-    with TestClient(app) as tc:
-        body = tc.get("/chat/stream?q=beach").text
-    assert "data:" in body
-    assert "busy" in body.lower()
     assert "event: done" in body
 
 
@@ -308,3 +292,109 @@ def test_off_topic_question_is_answered_generally(settings, monkeypatch):
         history = tc.get("/chat").text
         assert "should I walk or drive" in history         # the turn is saved
         assert "Walking is fine." in history               # persisted joined answer
+
+
+# --- Global toggles: guardrails + direct-answer (§10) -------------------------
+
+def test_chat_page_shows_toggles_with_defaults(chat_client):
+    body = chat_client.get("/chat").text
+    assert 'name="guardrails"' in body and 'name="direct_answers"' in body
+    # direct answers ON by default (checked); guardrails OFF (unchecked)
+    assert "checked" in _input(body, "direct_answers")
+    assert "checked" not in _input(body, "guardrails")
+
+
+def test_prefs_post_persists_and_reflects(chat_client):
+    chat_client.post("/chat/prefs", data={"guardrails": "on"})  # direct omitted -> off
+    body = chat_client.get("/chat").text
+    assert "checked" in _input(body, "guardrails")
+    assert "checked" not in _input(body, "direct_answers")
+
+
+def test_guardrails_on_refuses_off_topic(settings, monkeypatch):
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    fake = FakeInferenceClient(responses=['{"tool": "none", "query": null}'])  # route -> none
+    monkeypatch.setattr(Settings, "build_inference_client", lambda self: (fake, "fake"))
+    app = create_app(settings)
+    set_prefs(app.state.context.conn, settings.owner_id, guardrails=True, direct_answers=True)
+    with TestClient(app) as tc:
+        body = tc.get("/chat/stream?q=should+I+walk+or+drive").text
+    assert "only answer questions about your photos" in body.lower()
+    assert "event: done" in body
+
+
+def test_guardrails_off_answers_off_topic_generally(settings, monkeypatch):
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    fake = FakeInferenceClient(
+        responses=['{"tool": "none", "query": null}'], streams=[["Walking ", "is ", "fine."]]
+    )
+    monkeypatch.setattr(Settings, "build_inference_client", lambda self: (fake, "fake"))
+    app = create_app(settings)
+    with TestClient(app) as tc:
+        body = tc.get("/chat/stream?q=should+I+walk+or+drive").text
+    assert "Walking" in body
+    assert "only answer questions about your photos" not in body.lower()
+
+
+def test_direct_off_counts_go_through_the_agentic_count_tool(settings, monkeypatch):
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    fake = FakeInferenceClient(
+        responses=[
+            '{"action": "count_photos", "query": "", "grain": null}',
+            '{"action": "answer", "query": null, "grain": null}',
+        ],
+        streams=[["You have ", "7 ", "photos."]],
+    )
+    monkeypatch.setattr(Settings, "build_inference_client", lambda self: (fake, "fake"))
+    app = create_app(settings)
+    conn = app.state.context.conn
+    for pid in range(1, 8):
+        add_photo(conn, photo_id=pid, content_hash=f"h{pid}", thumb_key=f"{pid}.jpg")
+    set_prefs(conn, settings.owner_id, guardrails=False, direct_answers=False)
+    with TestClient(app) as tc:
+        body = tc.get("/chat/stream?q=how+many+photos+do+I+have").text
+    assert "event: done" in body
+    # the REAL count reached the final grounded prompt as a fact line
+    final_msgs = fake.calls[-1][1]
+    assert "count: 7" in final_msgs[1]["content"]
+
+
+def test_direct_off_memory_show_has_no_card(settings, monkeypatch):
+    # whole direct-DB step skipped -> memory-show is prose, no rendered card event
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    fake = FakeInferenceClient(
+        responses=['{"action": "answer", "query": null, "grain": null}'],
+        streams=[["You have some memories."]],
+    )
+    monkeypatch.setattr(Settings, "build_inference_client", lambda self: (fake, "fake"))
+    app = create_app(settings)
+    set_prefs(app.state.context.conn, settings.owner_id, guardrails=False, direct_answers=False)
+    with TestClient(app) as tc:
+        body = tc.get("/chat/stream?q=show+me+my+memories").text
+    assert "event: memory" not in body
+    assert "event: done" in body
+
+
+def test_guardrails_on_never_refuses_an_app_count_question(settings, monkeypatch):
+    # App-specific questions (counts, memories, albums) are NEVER off-topic, even
+    # when the weak router mislabels them `none` and Guardrails is on (§10). With
+    # Direct answers off, the count is answered by the agentic count tool instead.
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    fake = FakeInferenceClient(
+        responses=[
+            '{"tool": "none", "query": null}',                       # router mislabels it
+            '{"action": "count_photos", "query": "", "grain": null}',
+            '{"action": "answer", "query": null, "grain": null}',
+        ],
+        streams=[["You have ", "4 ", "photos."]],
+    )
+    monkeypatch.setattr(Settings, "build_inference_client", lambda self: (fake, "fake"))
+    app = create_app(settings)
+    conn = app.state.context.conn
+    for pid in range(1, 5):
+        add_photo(conn, photo_id=pid, content_hash=f"h{pid}", thumb_key=f"{pid}.jpg")
+    set_prefs(conn, settings.owner_id, guardrails=True, direct_answers=False)
+    with TestClient(app) as tc:
+        body = tc.get("/chat/stream?q=how+many+photos+do+I+have").text
+    assert "only answer questions about your photos" not in body.lower()  # NOT refused
+    assert "count: 4" in fake.calls[-1][1][1]["content"]                  # real count gathered

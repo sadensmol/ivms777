@@ -13,12 +13,22 @@
 # three app processes (the host llama-server keeps running — `make llama-stop`).
 # The compose.*.yaml files still describe the deployed stack for jetson/cloud.
 #
-# First run builds llama.cpp and downloads the gemma GGUF (~2 GB) once.
+# First run builds llama.cpp and downloads the gemma GGUF (~2 GB) once, into
+# ~/.llama (NOT the library dir), so `make clean` keeps them and `make up` never
+# rebuilds. `make llama-rebuild` is the only thing that wipes that cache.
 
 # --- host llama-server (mac) -------------------------------------------------
-LLAMA_DIR    ?= $(HOME)/.ivms777/llama.cpp        # checkout + build tree
-LLAMA_BIN    := $(LLAMA_DIR)/build/bin/llama-server
-LLAMA_MODELS ?= $(HOME)/.ivms777/models           # GGUF cache
+# The llama.cpp checkout+build AND the gemma GGUF live OUTSIDE the library dir,
+# under $(LLAMA_HOME) (default ~/.llama). They are built/downloaded ONCE and
+# `make clean` NEVER touches them, so `make up` never rebuilds. Only the explicit
+# `make llama-rebuild` wipes and re-creates them.
+# NOTE: no inline `# comments` on these assignments — GNU Make keeps the spaces
+# before the `#` as part of the value, which silently created dirs named
+# "llama.cpp   " / "models   ". Keep values bare.
+LLAMA_HOME   ?= $(HOME)/.llama
+LLAMA_SRC    := $(LLAMA_HOME)/llama.cpp
+LLAMA_BIN    := $(LLAMA_SRC)/build/bin/llama-server
+LLAMA_MODELS ?= $(LLAMA_HOME)/models
 LLAMA_GGUF   ?= gemma-4-E2B-it-Q4_K_M.gguf
 LLAMA_MMPROJ ?= mmproj-F16.gguf
 LLAMA_REPO   ?= unsloth/gemma-4-E2B-it-GGUF
@@ -34,7 +44,7 @@ JETSON_CAPTION_MODEL ?= gemma4-E2B
 JETSON_PLANNER_MODEL ?= gemma4-E2B
 
 .DEFAULT_GOAL := help
-.PHONY: up run-jetson stop-jetson clean-jetson test lint llama-mac llama-stop clean help
+.PHONY: up set-maxn-jetson run-jetson stop-jetson clean-jetson test lint llama-mac llama-stop llama-rebuild clean help
 
 up: llama-mac ## Ensure host llama-server, then run models + worker + app NATIVELY → http://localhost:8000
 	@mkdir -p "$$HOME/.ivms777"
@@ -53,10 +63,12 @@ up: llama-mac ## Ensure host llama-server, then run models + worker + app NATIVE
 llama-mac: ## Build (if needed) + start the host-native llama-server (Metal) on :$(LLAMA_PORT)
 	@command -v cmake >/dev/null || { echo "  cmake not found — run: brew install cmake"; exit 1; }
 	@if [ ! -x "$(LLAMA_BIN)" ]; then \
-	  echo "  building llama.cpp (Metal) — one time…"; \
-	  [ -d "$(LLAMA_DIR)/.git" ] || git clone --depth 1 https://github.com/ggml-org/llama.cpp "$(LLAMA_DIR)"; \
-	  cmake -S "$(LLAMA_DIR)" -B "$(LLAMA_DIR)/build" -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF; \
-	  cmake --build "$(LLAMA_DIR)/build" --target llama-server -j; \
+	  echo "  building llama.cpp (Metal) — one time; cached in $(LLAMA_SRC) (survives 'make clean')…"; \
+	  [ -d "$(LLAMA_SRC)/.git" ] || git clone --depth 1 https://github.com/ggml-org/llama.cpp "$(LLAMA_SRC)"; \
+	  cmake -S "$(LLAMA_SRC)" -B "$(LLAMA_SRC)/build" -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF; \
+	  cmake --build "$(LLAMA_SRC)/build" --target llama-server -j; \
+	else \
+	  echo "  reusing cached llama-server ($(LLAMA_BIN)) — no build."; \
 	fi
 	@mkdir -p "$(LLAMA_MODELS)"
 	@[ -s "$(LLAMA_MODELS)/$(LLAMA_GGUF)" ]   || { echo "  downloading $(LLAMA_GGUF) (~2 GB, one time)…"; curl -fL --progress-bar -o "$(LLAMA_MODELS)/$(LLAMA_GGUF)"   "https://huggingface.co/$(LLAMA_REPO)/resolve/main/$(LLAMA_GGUF)"; }
@@ -76,16 +88,53 @@ llama-mac: ## Build (if needed) + start the host-native llama-server (Metal) on 
 llama-stop: ## Stop the host-native llama-server started by `make llama-mac`
 	@pkill -f "llama-server .*--port $(LLAMA_PORT)" && echo "  llama-server stopped." || echo "  no llama-server running on :$(LLAMA_PORT)."
 
-run-jetson: ## Run ON THE JETSON: set MAXN, build + start the containerised stack → http://<jetson>:8000
-	@echo "  power mode : setting MAXN_SUPER (nvpmodel -m 2 + jetson_clocks — needs sudo)…"
-	@sudo nvpmodel -m 2 && sudo jetson_clocks || echo "  ⚠️  could not set MAXN — inference will be ~8× slower (docs/design.md §3.1)"
-	@echo "  models     : gemma4-E2B on llama-server (text + vision, GPU) · caption=$(JETSON_CAPTION_MODEL) planner=$(JETSON_PLANNER_MODEL)"; \
+llama-rebuild: ## Force a from-scratch llama.cpp build + GGUF re-download (wipes $(LLAMA_HOME) — the ONLY thing that deletes the cache)
+	@echo "  removing $(LLAMA_HOME) (llama.cpp build + GGUF cache)…"; rm -rf "$(LLAMA_HOME)"
+	@$(MAKE) llama-mac
+
+# nvpmodel persists the mode ITSELF — it records `pmode:0002` in
+# /var/lib/nvpmodel/status and re-applies it at boot (the `PM_CONFIG DEFAULT` in
+# /etc/nvpmodel.conf is only the fallback for when no status file exists), so the
+# power mode already survives a reboot. `jetson_clocks` does NOT: it writes the
+# clock rails directly and they reset on boot. The unit below is what closes that
+# gap; it runs AFTER nvpmodel.service so the clocks are pinned on top of the
+# restored power mode, never underneath it.
+set-maxn-jetson: ## Run ON THE JETSON (needs sudo): set MAXN_SUPER power mode + pin max clocks, both surviving reboot (docs/design.md §3.1)
+	@echo "  setting MAXN_SUPER power mode (nvpmodel -m 2)…"
+	sudo nvpmodel -m 2
+	@echo "  pinning max clocks (jetson_clocks)…"
+	sudo jetson_clocks
+	@echo "  installing jetson_clocks boot unit (jetson_clocks alone does NOT survive reboot)…"
+	@printf '%s\n' \
+	  '[Unit]' \
+	  'Description=Pin max Jetson clocks at boot (ivms777)' \
+	  'After=nvpmodel.service' \
+	  'Wants=nvpmodel.service' \
+	  '' \
+	  '[Service]' \
+	  'Type=oneshot' \
+	  'ExecStart=/usr/bin/jetson_clocks' \
+	  'RemainAfterExit=yes' \
+	  '' \
+	  '[Install]' \
+	  'WantedBy=multi-user.target' \
+	  | sudo tee /etc/systemd/system/ivms777-jetson-clocks.service > /dev/null
+	sudo systemctl daemon-reload
+	sudo systemctl enable ivms777-jetson-clocks.service
+	@echo "  done. Power mode AND max clocks now survive reboot."
+	@echo "  NOTE: MAXN_SUPER is the hottest setting. 'sudo nvpmodel -m 0' (15W) or '-m 1' (25W)"
+	@echo "        run cooler; sustained captioning holds the GPU at ~99%. Undo the clock pin with:"
+	@echo "        sudo systemctl disable --now ivms777-jetson-clocks.service"
+
+run-jetson: ## Run ON THE JETSON: build + start the containerised stack → http://<jetson>:8000 (run 'make set-maxn-jetson' once for max speed)
+	@echo "  models     : gemma4-E2B on an sm_87 cu132 llama-server the models container SPAWNS (text + vision, GPU); SigLIP + nomic in-process · caption=$(JETSON_CAPTION_MODEL) planner=$(JETSON_PLANNER_MODEL)"; \
 	 IVMS777_CAPTION_MODEL="$(JETSON_CAPTION_MODEL)" \
 	 IVMS777_PLANNER_MODEL="$(JETSON_PLANNER_MODEL)" \
 	 docker compose $(JETSON_COMPOSE) up --build -d
-	@echo "  waiting for the inference (llama-server) container… (first run downloads the GGUF ~2 GB; the sm_87 binary is REUSED from the llamacpp volume — no recompile)"
+	@echo "  waiting for the models service (first build compiles cu132 llama.cpp — slow once, then cached)…"
 	@for i in $$(seq 1 120); do \
-	  curl -sf http://localhost:8080/health >/dev/null 2>&1 && break; sleep 3; done
+	  docker compose $(JETSON_COMPOSE) exec -T models curl -sf http://localhost:9000/models >/dev/null 2>&1 && break; sleep 3; done
+	@echo "  note       : gemma loads ON DEMAND (first chat/caption, or POST /models/gemma/ensure) and idle-unloads after IVMS777_LLM_IDLE_TTL_S (plan 18)."
 	@gpu=$$(docker compose $(JETSON_COMPOSE) exec -T models uv run --no-sync python -c "import torch,numpy;print(torch.cuda.is_available(),numpy.__version__)" 2>/dev/null || true); \
 	 echo "  preflight   : cuda numpy = $${gpu:-<models not ready>}"; \
 	 case "$$gpu" in \
@@ -98,7 +147,6 @@ run-jetson: ## Run ON THE JETSON: set MAXN, build + start the containerised stac
 	 echo "    on this Jetson : http://localhost:8000"; \
 	 echo "    from your Mac  : http://$${ip:-<jetson-ip>}:8000   (or http://$$(hostname).local:8000)"; \
 	 echo "    logs           : docker compose $(JETSON_COMPOSE) logs -f worker"
-	@echo "  NOTE: jetson_clocks does NOT survive reboot — install a boot unit to re-apply MAXN (docs/design.md §3.1)."
 
 stop-jetson: ## Run ON THE JETSON: stop the containerised stack (data + models kept)
 	docker compose $(JETSON_COMPOSE) down
@@ -119,8 +167,10 @@ test: ## Run the test suite natively
 lint: ## Run ruff
 	uv run ruff check .
 
-clean: ## DANGER: DELETE $HOME/.ivms777 (removes uploaded photos + index)
-	rm -rf "$$HOME/.ivms777"
+clean: ## DANGER: wipe the LIBRARY only (db + uploads + thumbs). Keeps the llama.cpp build + GGUF cache in $(LLAMA_HOME).
+	@rm -rf "$$HOME/.ivms777/ivms777.db" "$$HOME/.ivms777/ivms777.db-wal" "$$HOME/.ivms777/ivms777.db-shm" \
+	        "$$HOME/.ivms777/originals" "$$HOME/.ivms777/thumbs"
+	@echo "  library wiped (db + originals + thumbs). Kept: llama.cpp build + GGUF cache in $(LLAMA_HOME) (use 'make llama-rebuild' to wipe those)."
 
 help: ## List targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \

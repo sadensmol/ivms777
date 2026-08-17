@@ -36,6 +36,22 @@ def test_progress_shows_per_stage_throughput(client):
     assert "1.0/s" in client.get("/upload/progress").text
 
 
+def test_progress_shows_slow_stage_in_seconds_never_per_minute(client):
+    # A slow stage (two captions 60s apart -> 0.0167/s) must still read per SECOND —
+    # never "/min" or "/hour". The label keeps decimals so it is not a bare 0.0/s.
+    conn = client.app.state.context.conn
+    for pid, when in ((1, "2026-01-01T00:00:00"), (2, "2026-01-01T00:01:00")):
+        add_photo(conn, photo_id=pid, content_hash=f"h{pid}", thumb_key=f"{pid}.jpg")
+        conn.execute(
+            "INSERT INTO jobs(photo_id, stage, status, updated_at)"
+            " VALUES (?, 'caption', 'done', ?)",
+            (pid, when),
+        )
+    body = client.get("/upload/progress").text
+    assert "0.017/s" in body
+    assert "/min" not in body and "/hour" not in body
+
+
 def test_upload_page_remembers_the_current_folder_across_restarts(client):
     conn = client.app.state.context.conn
     # A completed upload from a folder — the persisted `uploads` row is what a

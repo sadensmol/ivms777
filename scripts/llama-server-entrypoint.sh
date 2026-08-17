@@ -12,10 +12,14 @@ set -eu
 LLAMA_BIN="${LLAMA_BIN:-llama-server}"
 MODEL_DIR="${LLAMA_MODEL_DIR:-/models}"
 GGUF="${LLAMA_GGUF:-gemma-4-E2B-it-Q4_K_M.gguf}"
-MMPROJ="${LLAMA_MMPROJ:-mmproj-F16.gguf}"
+# Q8_0 projector (531 MB), NOT F16 (985 MB): everything stays on the GPU (design
+# §3.1), and the F16 projector's CLIP buffer is what OOM-aborted llama-server on the
+# 8 GB board. It ships in ggml-org's repo, not unsloth's — hence a separate repo var.
+MMPROJ="${LLAMA_MMPROJ:-mmproj-gemma-4-E2B-it-Q8_0.gguf}"
 REPO="${LLAMA_GGUF_REPO:-unsloth/gemma-4-E2B-it-GGUF}"
+MMPROJ_REPO="${LLAMA_MMPROJ_REPO:-ggml-org/gemma-4-E2B-it-GGUF}"
 GGUF_URL="${LLAMA_GGUF_URL:-https://huggingface.co/${REPO}/resolve/main/${GGUF}}"
-MMPROJ_URL="${LLAMA_MMPROJ_URL:-https://huggingface.co/${REPO}/resolve/main/${MMPROJ}}"
+MMPROJ_URL="${LLAMA_MMPROJ_URL:-https://huggingface.co/${MMPROJ_REPO}/resolve/main/${MMPROJ}}"
 
 mkdir -p "$MODEL_DIR"
 fetch() {  # fetch <url> <dest> — reuse if present; curl or wget, whichever exists

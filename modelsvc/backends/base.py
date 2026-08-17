@@ -36,18 +36,27 @@ class ModelBackend(Protocol):
         """
         ...
 
-    def caption(self, image: bytes, dimensions: list[str]) -> dict:
-        """A caption + structured tags for one image.
+    def caption(self, image: bytes) -> dict:
+        """A caption sentence for one image (no tags — tags are SigLIP-only, §7).
 
-        Returns a dict with keys `caption`, `title`, `description`, `tags`.
+        Returns a dict with keys `caption`, `title`, `description`, `model`.
         """
         ...
 
     def text_complete(
-        self, model: str, messages: list[dict], json_schema: dict | None = None
+        self,
+        model: str,
+        messages: list[dict],
+        json_schema: dict | None = None,
+        *,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> str:
         """Non-streaming text generation — query planner, agentic chat turns,
-        `is_photo_question` (design §5.1, plan 15 task 4)."""
+        `is_photo_question` (design §5.1, plan 15 task 4).
+
+        `temperature`/`max_tokens` are the caller's decoding controls, passed straight
+        to the backend; `None` leaves the backend default alone."""
         ...
 
     def text_stream(self, model: str, messages: list[dict]) -> Iterator[str]:
@@ -75,4 +84,17 @@ class ModelBackend(Protocol):
         service is the only process with GPU access, §5.1), and `resident`
         (list of resident model names).
         """
+        ...
+
+    def models_state(self) -> dict:
+        """Conveyor state for the control API (plan 18): keys `resident`,
+        `budget_mb`, `free_mb`, `used_mb`, `active`."""
+        ...
+
+    def model_ensure(self, name: str) -> None:
+        """Make a managed model resident now (evicting others to fit)."""
+        ...
+
+    def model_unload(self, name: str) -> None:
+        """Unload a managed model now, freeing its memory."""
         ...

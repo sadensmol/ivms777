@@ -19,34 +19,110 @@ from modelsvc.backends.text_backend import TextBackend
 def build_backend(settings) -> ModelBackend:
     if settings.use_fake_embedder:
         return FakeBackend()
-    # Board-only: constructs but does not load anything (SiglipBackend and the
-    # in-process text embedder are both lazy, and the captioner is a remote HTTP
-    # call), so this branch only pulls torch/transformers when a request actually
-    # hits the relevant endpoint. ONE shared inference client for both caption
-    # (OpenAICaptioner) and text — the single llama-server/vLLM gateway (§5.1).
+    # Board-only, but torch-free to CONSTRUCT: SigLIP/nomic/gemma all register
+    # lazy-importing load/free callables, so this branch pulls torch/transformers
+    # (or spawns llama-server) only when a request actually loads a model. ONE
+    # shared inference client for both caption and text — the single gateway (§5.1).
+    import psutil
+
     from inference.client import OpenAICompatClient
-    from modelsvc.residency import Residency
+    from modelsvc.governor import MemoryGovernor
+    from modelsvc.llm_process import build_llm_process
+    from modelsvc.registry import ModelRegistry, ModelSpec
+    from modelsvc.scheduler import Scheduler
+    from modelsvc.torch_process import TorchWorker
 
     inf = OpenAICompatClient(settings.inference_base_url or "")
-    # ONE residency manager per service instance (§8.1), used by the only heavy
-    # in-process model left — SigLIP. Since plan 16 removed the in-process caption
-    # VLM, nothing contends with SigLIP for the GPU, so residency is always
-    # non-exclusive (an idempotent ensure-loaded; no eviction, no preemption).
-    residency = Residency(exclusive=False)
-    embed = SiglipBackend(settings.embed_model_name, settings.embed_device, residency=residency)
-    caption = build_caption_backend(settings, inf)
-    # Caption-meaning text embeddings (§9) run in-process here on mac/jetson
-    # (llama-server has no embedding backend); cloud (vLLM) keeps the OpenAI
-    # `/embeddings` path (text_embed_model=None → client fallback).
+    llm = build_llm_process(settings)
+    costs = settings.model_cost_mb
+
+    # Caption-meaning text embeddings (§9) run in-process on mac/jetson (nomic);
+    # cloud (vLLM) keeps the OpenAI `/embeddings` path (text_embed_model=None).
     text_embed_model = None if settings.profile == "cloud" else settings.text_embed_model
+
+    registry = ModelRegistry()
+
+    # SigLIP and nomic run in KILLABLE children (plan 20, §8.1): freeing a torch
+    # model in-process leaves ~2.7 GB of CUDA-context RSS behind — precisely the RAM
+    # gemma then cannot have — so `free` is a process kill, and `alive` lets the
+    # registry respawn a child that died on its own.
+    siglip_worker = TorchWorker(
+        "embedding.siglip:SiglipEmbedder", (settings.embed_model_name, settings.embed_device)
+    )
+    registry.register(
+        ModelSpec(
+            "siglip",
+            siglip_worker.start,
+            siglip_worker.stop,
+            costs["siglip"],
+            alive=siglip_worker.is_alive,
+        )
+    )
+
+    text_worker = None
+    if text_embed_model is not None:
+        text_worker = TorchWorker(
+            "embedding.text_embedder:TextEmbedder",
+            (text_embed_model, settings.embed_device),
+            warm="warm",  # this encoder loads lazily; resident must mean resident
+        )
+        registry.register(
+            ModelSpec(
+                "nomic",
+                text_worker.start,
+                text_worker.stop,
+                costs["nomic"],
+                alive=text_worker.is_alive,
+            )
+        )
+
+    # gemma is registered TWICE (design §3.1/§8.1): `gemma` is text-only (chat,
+    # planner) and `gemma-vision` adds the ~531 MB projector for captioning. They are
+    # ONE llama-server child on ONE port, so they are mutually exclusive — loading
+    # either evicts the other, keeping the registry's resident set honest.
+    def _load_gemma(vision: bool) -> None:
+        sibling = "gemma" if vision else "gemma-vision"
+        registry.unload(sibling)  # no-op unless the other mode is resident
+        llm.load(vision=vision)
+
+    # `alive` is the child's real state: llama-server aborts on its own when a CUDA
+    # malloc fails (an image decode on the 8 GB board), and without this probe the
+    # registry keeps claiming gemma is resident and every request hits a dead port
+    # (§8.1). SigLIP/nomic need no probe — an in-process model cannot die alone.
+    registry.register(
+        ModelSpec(
+            "gemma", lambda: _load_gemma(False), llm.free, costs["gemma"], alive=llm.is_loaded
+        )
+    )
+    registry.register(
+        ModelSpec(
+            "gemma-vision",
+            lambda: _load_gemma(True),
+            llm.free,
+            costs.get("gemma-vision", costs["gemma"]),
+            alive=llm.is_loaded,
+        )
+    )
+
+    governor = MemoryGovernor(
+        registry,
+        measure_free_mb=lambda: psutil.virtual_memory().available / (1024 * 1024),
+        budget_mb=settings.ram_budget_mb,
+    )
+    scheduler = Scheduler(
+        governor, concurrency=settings.gpu_concurrency, idle_ttl_s=settings.llm_idle_ttl_s
+    )
+
+    embed = SiglipBackend(siglip_worker)
+    caption = build_caption_backend(settings, inf)
     return CompositeBackend(
         embed=embed,
         caption=caption,
-        text=TextBackend(
-            inf, text_embed_model=text_embed_model, device=settings.embed_device,
-            model_name=settings.planner_model,
-        ),
-        residency=residency,
+        text=TextBackend(inf, text_worker=text_worker, model_name=settings.planner_model),
+        registry=registry,
+        governor=governor,
+        scheduler=scheduler,
+        text_embed_needs=() if text_embed_model is None else ("nomic",),
     )
 
 

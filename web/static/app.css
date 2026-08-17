@@ -210,6 +210,10 @@ button.danger:hover { background: #925017; }
   border-radius: 8px; padding: 6px 12px; cursor: pointer; }
 .new-session:hover { background: #262626; color: #fff; }
 .chat-head { flex: 0 0 auto; }
+.chat-controls { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }
+.chat-toggles { display: flex; gap: 14px; font-size: 0.8em; opacity: 0.75; }
+.chat-toggles label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
+.chat-toggles input { cursor: pointer; }
 .chat-log { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden;
   display: flex; flex-direction: column; gap: 14px; margin: 14px 0; padding-right: 8px;
   scrollbar-width: thin; scrollbar-color: #3a3a3a transparent; }

@@ -82,144 +82,63 @@ source-built `sm_87` llama.cpp runs the gemma vision projector on the GPU (§4).
 vLLM earns its place only under `cloud`, where continuous batching genuinely helps
 with concurrent users.
 
-**Jetson sizing.** The Orin Nano Super has 8 GB shared between CPU and GPU at
-102 GB/s (~7.4 GB usable after firmware). A **fixed ~1.5 GB baseline is gone
-before we load anything** — measured on an idle board (JetPack 7.2, no
-containers): ~1.1 GB kernel + iGPU/firmware carveout reserved by L4T at boot,
-~155 MB kernel slab, ~230 MB system daemons (dockerd, containerd, systemd). This
-baseline is **not reclaimable** — it is set in the device tree, not held by any
-process, so killing services claws back only tens of MB (headless mode a few
-hundred at most; not worth chasing). That leaves roughly **5.8 GB** as the real
-model budget. Since plan 16 the pieces that share it are: the gemma4-E2B GGUF on
-`llama-server` (~2 GB weights + a CUDA context), SigLIP (~1.6 GB) inside the
-`models` service, and the small in-process caption-text embedder (nomic, ~0.3 GB)
-— all comfortably inside ~5.8 GB. The one heavy in-process model in the `models`
-service is now **SigLIP alone**: the caption VLM that used to share the GPU with
-it is gone (captioning is a remote call to `llama-server`). So the residency
-manager (§8.1, `modelsvc/residency.py`) collapses to an **ensure-loaded** guard —
-`use("siglip", HIGH)` loads SigLIP once and reports it for the resource bar; there
-is nothing to evict, swap, or preempt it against. At MAXN_SUPER expect ~5–6
-s/photo for captioning (§4).
+**Jetson sizing.** After the real, non-reclaimable baseline (kernel + firmware
+carveout + system daemons **plus the `app`/`worker`/`models` Python containers**,
+~3 GB in practice — higher than the ~1.5 GB kernel-only figure), only **~4.3 GB**
+is free for models. gemma4-E2B on the `llama-server` child measures **~5.0 GB**
+resident — Q4_K_M weights (~3.1 GB) + the F16 mmproj (~1 GB) + KV/compute buffers +
+its own CUDA context — far larger than the SigLIP (~1.6 GB) + nomic (~0.3 GB) torch
+models the `models` service hosts in its `TorchWorker` children (§8.1). So **gemma and SigLIP CANNOT be
+resident together**: the memory governor (§8.1) evicts SigLIP before it loads gemma
+and reloads it afterwards — they **swap** across the embed↔caption stage boundary.
+The governor's per-model cost estimates (`IVMS777_MODEL_COST_MB`) must track these
+real figures: an under-estimate for gemma makes it skip the eviction and load gemma
+on top of SigLIP → OOM.
 
-**Jetson device facts (`lockbox-nv`) — verified on the live board 2026-08-16.**
-The one target device, for tuning reference:
+Everything model-related runs **on the GPU — never the CPU. There is no CPU
+offload, on any profile.** gemma must therefore fit **entirely** in GPU RAM:
+`llama-server` is launched with **`-ngl 99` (every layer on the GPU)**, and the
+conveyor makes room by evicting SigLIP + nomic first (§8.1).
 
-| Field | Value |
-|---|---|
-| Board | Jetson Orin Nano **Super** (Engineering Reference Dev Kit) |
-| SoC / GPU | Ampere iGPU, **compute capability `sm_87`**, 1024 CUDA cores, 32 tensor cores; GPU clock max **918 MHz** |
-| CPU | 6-core Arm Cortex-**A78AE**, max **1.728 GHz** (L1 384 KiB, L2 1.5 MiB, L3 4 MiB) |
-| AI perf (spec) | **67 INT8 TOPS** — relevant to *prefill / batched / vision* (compute-bound), **not** single-stream chat decode |
-| Memory | **8 GB** 128-bit LPDDR5, **102 GB/s** peak (EMC max **3199 MHz**); ~7.4 GB usable, **~5.8 GB** model budget after the fixed baseline |
-| Storage | NVMe **Crucial P310** (`CT1000P310SSD8`) 1 TB; `/` on a 915 GB ext4, ~22% used |
-| OS | **Ubuntu 24.04.4 LTS** (noble) |
-| L4T / JetPack | **L4T r39.2** (`nvidia-l4t-core 39.2.0`) = **JetPack 7.2** |
-| Kernel | **6.8.12-1021-tegra** aarch64, PREEMPT |
-| CUDA on host | **runtime only** — `libcuda.so.1` from `/opt/nvidia/l4t-gpu-libs/nvgpu`; **no toolkit, no `nvcc`, no `cmake`/`g++`**. All CUDA/toolchain (cu132) is per-container. |
-| Container CUDA | **CUDA 13.2** (cu132) inside images |
-| Docker | **29.6.2**, `default-runtime = nvidia` (so `runtime: nvidia` is implicit), overlay2, cgroup v2 |
-| Python (host) | 3.12.3 |
-| Power modes | `nvpmodel` IDs: **`0`=15W, `1`=25W, `2`=MAXN_SUPER**. `jetson_clocks` then locks max clocks. |
-| Access | `lockbox@192.168.100.8` (`lockbox-nv.local`); **passwordless SSH**, but **`sudo` needs a password** |
+**gemma has two spawn modes, and the vision projector is loaded ONLY for
+captioning** — it is the model's vision half, useless to a text turn:
 
-**Power mode is the single dominant lever — set MAXN_SUPER.** The board ships in
-**`25W` (ID 1)**, which throttles the GPU to ~306 MHz and the memory controller
-(EMC) to ~2133 MHz (~68 GB/s), even though thermals are cool (~49 °C).
-`sudo nvpmodel -m 2 && sudo jetson_clocks` switches to **MAXN_SUPER**: GPU locks
-to **1020 MHz** and EMC to **3199 MHz** (full 102 GB/s). The `nvpmodel` mode
-persists across reboot; **`jetson_clocks` does not** — a small boot service must
-re-apply it. Fix this before blaming any stack.
-
-**Benchmark (verified 2026-08-16, `qwen2.5:3b` 4-bit, single-stream decode,
-server-reported tok/s):**
-
-| Engine / config (single-stream) | 25 W | **MAXN_SUPER** | scaling |
+| mode | registry name | spawn | used by |
 |---|---|---|---|
-| **vLLM `0.22` tuned — AWQ-Marlin + CUDA graphs** | — | **36.3** | winner |
-| **`gemma4:e2b`** (Ollama stock, 1.8 GB resident) | — | **26.1** | — |
-| **Ollama** `qwen2.5:3b` `Q4_K_M` (stock) | 3.0 | **23.5** | **7.8×** |
-| Ollama `qwen2.5:3b` + flash-attn (f16 KV) | — | 23.5 | — |
-| Ollama `qwen2.5:3b` + flash-attn + `q8_0` KV | — | 22.9 | — |
-| vLLM `0.22` (bnb, `--enforce-eager`) | 5.7 | 7.0 | 1.2× |
-| `models` image transformers (bnb-nf4) | 4.6 | 5.7 | 1.2× |
+| text | `gemma` | `-m gemma.gguf -ngl 99` | chat, planner |
+| vision | `gemma-vision` | text **+ `--mmproj`** | captioning |
 
-Ollama **config tuning does not add text speed**: `OLLAMA_FLASH_ATTENTION=1`
-(23.5, unchanged) and `+OLLAMA_KV_CACHE_TYPE=q8_0` (22.9, slightly slower) only
-cut attention/KV memory — a tiny slice of a batch-1 3B decode, which is bound on
-reading the ~2 GB of weights per token. So stock Ollama is already at its
-single-stream ceiling; those knobs are **memory savers, not speedups**. Going
-faster needs a **smaller model** (`gemma4:e2b` = 26.1) or a **different engine**
-(tuned vLLM = 36.3), not Ollama flags.
+The two are **mutually exclusive** — one `llama-server` child, one port — so loading
+either frees the other. Chat therefore never pays the projector's ~531 MB, which on
+the 8 GB board is the difference between ~170 MB and ~700 MB of headroom.
 
-Two independent findings:
+The projector is the **Q8_0** build — `mmproj-gemma-4-E2B-it-Q8_0.gguf` (531 MB) from
+`ggml-org/gemma-4-E2B-it-GGUF`, the default since the F16 projector (985 MB) is what
+OOM-aborted `llama-server`: its CLIP tensor buffer (589 MiB) was the allocation that
+failed. The weights still come from `unsloth/…`, so the projector has its own repo
+var (`LLAMA_MMPROJ_REPO`). A small KV context (`IVMS777_LLM_CTX`, jetson 2048) keeps
+the rest down. If a pinned all-GPU load still does not fit, `llama-server` aborts at
+model load (`failed to fit params to free device memory … abort`) — that is a **hard,
+surfaced error** (`app` streams an error turn to the chat UI), and the only fix is
+to **shrink the GPU footprint** (smaller KV context, Q8 projector, smaller model
+weights), **never** to spill layers to the CPU. mac keeps `-ngl 99` (Metal, ample
+RAM). At MAXN_SUPER expect ~5–6 s/photo for captioning with gemma fully on the GPU.
 
-- **Power mode is the ~8× lever.** Ollama scales 3.0 → 23.5 with MAXN because
-  llama.cpp's *fused* GGUF kernels are **memory-bandwidth bound**, so unlocking
-  EMC clocks lifts it straight to **~40% of the ~56 tok/s ceiling** (4-bit 3B ÷
-  102 GB/s) — *usable* chat, no code change. The earlier "Ollama kernels are
-  unoptimized" guess was wrong; it was throttled.
-- **Engine tuning is the second lever.** The bnb + `--enforce-eager` vLLM/
-  transformers rows are **software-overhead-bound** (per-token dequant + Python
-  dispatch, GPU mostly idle), so the clock unlock barely helps them (1.2×). Swap
-  bnb → **AWQ-Marlin** and turn **CUDA graphs on** and vLLM becomes hardware-
-  bound too: **36.3 tok/s, ~1.5× Ollama** (verified; AWQ-Marlin + CUDA graphs
-  both run on Orin `sm_87`, no error). transformers stays slow — torch-2.13's
-  Triton-eager routing (the `sm_87` note below) — and is a dead end for text.
-
-**But speed is not the only axis on 8 GB.** vLLM reserves VRAM *statically* and
-has a hard floor: at `--gpu-memory-utilization 0.45` (~3.3 GB) it still runs full
-speed (**35.8 tok/s** with CUDA graphs), but **0.40 (~3.0 GB) and below OOM** —
-weights + the CUDA-graph pool + minimum KV do not fit. You **cannot** trade that
-graph memory back for footprint: `--enforce-eager` at the same util drops it to
-**16.6 tok/s**, so graphs *are* the speed. **vLLM's fast floor is ~3.3 GB and it
-cannot reach Ollama's ~2.1 GB.** That fed the earlier Ollama-for-text choice, but
-plan 16 supersedes it: a source-built `sm_87` `llama-server` running the single
-gemma4-E2B GGUF does text **and** vision on the GPU at ~2 GB resident (30 tok/s
-text, sub-second vision — §4), beating both Ollama's 26.1 and its broken
-CPU-projector vision, and leaving SigLIP (~1.6 GB) + the nomic embedder (~0.3 GB)
-room inside ~5.8 GB. So the **standing recommendation is MAXN_SUPER + one
-gemma4-E2B on `llama-server`** (§4); tuned vLLM (35.8 tok/s text-only) stays a
-cloud-side option. Single-stream decode is bandwidth-bound, so 4-bit (fewer
-bytes/token) is the *fast* choice and the 67 INT8 TOPS does not help chat latency;
-power mode is the first lever, and the `sm_87` build is what unlocks GPU vision.
-
-**GPU vision IS achievable — via a source-built `sm_87` llama.cpp (verified
-2026-08-16).** Stock Ollama runs the vision projector (CLIP/`mmproj`) on **CPU**
-(~190–211 s/image — the reason captioning went in-process). But a `llama.cpp`
-built `-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=87` (inside the
-`ghcr.io/nvidia-ai-iot/ollama:…cu130` image, which carries nvcc/cmake; the cu130
-binary runs on the cu132 driver, no crash), run with the projector **on GPU**
-(default offload) + `-ngl 99 --flash-attn on --jinja -c 4096`, measures — one
-GGUF serving **both** text and vision:
-
-| Model (`sm_87` llama.cpp, GPU, MAXN) | Text tok/s | Vision (image encode) |
-|---|---|---|
-| **`gemma4-E2B`** (Q4_K_M + f16 mmproj) | **30.0** | **0.57 s/img** |
-| `Qwen2.5-VL-3B` (Q4_K_M + Q8 mmproj) | 23.5 | 13.8 s/img |
-
-`gemma4-E2B` wins on **both** axes: faster text than Ollama (30 vs 26.1) and
-far faster vision (0.57 s *encode* vs Qwen's 13.8 s — Qwen emits ~2048 image
-tokens, gemma ~256). End-to-end per caption is ~5–6 s for gemma vs ~20 s for Qwen
-(add generation). CPU projector (`--no-mmproj-offload`) is ~149 s for Qwen, so GPU
-offload is ~10–370×.
-
-Two gemma4 config requirements (verified 2026-08-16):
-- **`--jinja`** — its chat template aborts otherwise (the earlier "empty caption").
-- **`--chat-template-kwargs '{"enable_thinking":false}'`** — without it gemma4
-  dumps a verbose chain-of-thought instead of a caption; `--reasoning-budget 0`
-  is *not* enough. With thinking off + a captioning system prompt, gemma4-E2B
-  **reads in-image text and fine detail at Qwen2.5-VL quality** (bake-off on a bus
-  photo: both read the route/EMT/"cero emisiones" text; gemma also caught the
-  wrought-iron balconies) — so gemma's speed does **not** cost quality.
-
-This is the basis of plan `16` (single Gemma on a `llama-server`, text + vision on
-GPU, replacing qwen-text + the in-process VLM, and dropping Ollama on jetson).
+**The empirical reference — device facts, the MAXN_SUPER power-mode lever, the
+single-stream decode benchmark, and the GPU-vision benchmark that proved a
+source-built `sm_87` `llama.cpp` runs the gemma projector on the GPU (0.57 s/img)
+— lives in [`docs/jetson-tuning.md`](jetson-tuning.md).** That measurement is the
+basis of plan 16: one gemma4-E2B GGUF on `llama-server` doing text (~30 tok/s) and
+vision on the GPU, replacing qwen-text + the in-process VLM, and dropping Ollama
+on jetson.
 
 The shipping default on both `mac` and `jetson` is the single **`gemma4-E2B`
 GGUF** served by `llama-server` for both roles. It is not an Ollama tag or an HF
 `transformers` load any more — `llama-server` loads the GGUF (`-m` + `--mmproj`)
 that the entrypoint fetches into the mounted volume on first run (jetson) or
-`make llama-mac` downloads to `$HOME/.ivms777/models` (mac). `IVMS777_CAPTION_MODEL`
+`make llama-mac` downloads to `$HOME/.llama/models` (mac) — a persistent cache
+outside the library dir, so `make clean` keeps both the GGUF and the built
+`llama.cpp`; only `make llama-rebuild` wipes them. `IVMS777_CAPTION_MODEL`
 / `IVMS777_PLANNER_MODEL` override the name used for storage/display; the actual
 weights are whichever GGUF `llama-server` was pointed at. Published benchmark
 scores do not settle the captioner choice on their own — the phase 1 bake-off
@@ -251,29 +170,17 @@ sync --extra models` from `pyproject.toml` and then reinstalls
 brought. `numpy` stays on `pyproject`'s `>=2.5.2` — the cu132 wheels are built
 against NumPy 2.x, so no Jetson-specific numpy pin is needed.
 
-**Captioning + text both run on the sm_87 `llama-server`; nothing captions
-in-process.** Ollama's CUDA build shipped no Orin `sm_87` vision kernels, so on
-JetPack 7 a vision request silently ran CLIP on the CPU (~200 s/image) — the
-reason captioning used to be in-process. Plan 16 fixes the root cause instead of
-working around it: a **source-built `sm_87` `llama.cpp`** (`-DGGML_CUDA=ON
--DCMAKE_CUDA_ARCHITECTURES=87`) runs the gemma projector **on the GPU** (0.57 s
-encode, §4). That binary is **built once** and reused: on the target board the
-`inference` compose service runs the prebuilt `llama-server` from the `llamacpp`
-volume under the cu130 image (no in-image recompile), and `Dockerfile.llamacpp.jetson`
-is the reproducible from-scratch builder for a fresh board. So captioning is a
-plain OpenAI `/v1/chat/completions`
-call to the `inference` container with the image as an `image_url` — no
-`transformers` VLM, no `bitsandbytes`/`accelerate`, no C toolchain in
-`Dockerfile.models.jetson`. The `models` service on jetson now loads only SigLIP
-and the small nomic caption-text embedder on the cu132 GPU; text and vision both
-live in `llama-server`.
-
-> **NOTE — Orin `sm_87` cubins.** The generic cu132 torch wheels **do not** ship
-> `sm_87` cubins, so torch kernels JIT from PTX or fall back — historically the
-> cause of slow in-process decode. This no longer affects inference (gemma text +
-> vision runs on the `sm_87`-native `llama-server`, not torch); it can still slow
-> **SigLIP** in the `models` service. If SigLIP throughput matters, pin a torch
-> build that carries `sm_87` cubins or use an NVIDIA Jetson wheel index.
+**Captioning + text both run on the `sm_87` `llama-server`; nothing captions
+in-process.** Both roles are one source-built `sm_87` `llama.cpp` (the
+GPU-vision rationale is in [`docs/jetson-tuning.md`](jetson-tuning.md)). That
+binary is **built once** and reused: on the target board the `inference` compose
+service runs the prebuilt `llama-server` from the `llamacpp` volume under the
+cu130 image (no in-image recompile), and `Dockerfile.llamacpp.jetson` is the
+reproducible from-scratch builder for a fresh board. Captioning is therefore a
+plain OpenAI `/v1/chat/completions` call to the `inference` container with the
+image as an `image_url` — no `transformers` VLM, no `bitsandbytes`/`accelerate`,
+no C toolchain in `Dockerfile.models.jetson`. The `models` service on jetson
+loads only SigLIP and the small nomic caption-text embedder on the cu132 GPU.
 
 ### 3.2 Multi-tenancy
 
@@ -384,98 +291,27 @@ restarts and never blocks the UI. This is the Outbox pattern.
 
 ## 4. Models
 
-**All of these run inside the one `models` service (§5.1), loaded once — never in
-`app`/`worker`.** The "where it runs" column is the *service's* backend for each.
+The app runs a small, fixed roster, all inside the one `models` service (§5.1),
+loaded once — never in `app`/`worker`. **The exact role→model→backend table,
+per-profile wiring, download mechanics, and the settled caption-embedding
+decision live in [`docs/models.md`](models.md).** The selection:
 
-| Role | Model | Backend (inside the `models` service) |
-|---|---|---|
-| Image and text embeddings, zero-shot tags | SigLIP 2 `so400m-patch14-384` | in-process `transformers` — CPU (mac) / CUDA (jetson) |
-| Captions and structured tags | `gemma4-E2B` GGUF (mac/jetson) · `qwen2.5vl:7b` (cloud) | OpenAI `/v1` call to `llama-server` (mac/jetson) / vLLM (cloud) |
-| Query planning, chat answers | `gemma4-E2B` GGUF (mac/jetson) · `qwen2.5:3b` (cloud) | OpenAI `/v1` call to `llama-server` (mac/jetson) / vLLM (cloud) |
-| Caption text embeddings (§9 similar) | `nomic-embed-text-v1.5` (dedicated text embedder) | **in-process** `transformers` — CPU (mac) / CUDA (jetson) |
+- **SigLIP 2** does image + text embeddings and zero-shot tags, in a `TorchWorker`
+  child of the models service (CPU on mac, CUDA on jetson) — neither `llama-server`
+  nor vLLM exposes an image-embedding endpoint, so it cannot move behind them.
+- **One `gemma4-E2B` GGUF on `llama-server`** does **both** captioning (vision) and
+  planner/chat (text) on mac/jetson — one model, one process, on the GPU (§3.1).
+  `cloud` keeps Qwen2.5 (vLLM). Prompts are a per-model template registry, so
+  adding a model is a template, not pipeline surgery.
+- **A dedicated text embedder (`nomic-embed-text`)** embeds caption text for §9
+  similarity, NOT SigLIP — SigLIP's text tower is trained image↔text, so text↔text
+  has no separation (measured). The `caption_vec` it produces is a **top-k KNN**
+  retrieval index, never a fixed cosine floor. Full rationale + benchmarks:
+  [`docs/models.md`](models.md).
 
-Since plan 16, captioning and text generation are the **same** `gemma4-E2B` GGUF on
-`llama-server` (mac/jetson) — one model, text + vision, on the GPU. Captioning goes
-through a **`captioning.Captioner` adapter** (`OpenAICaptioner`) that POSTs an
-OpenAI `/v1/chat/completions` request with the image as an `image_url` data-URI,
-constrained to `CAPTION_SCHEMA`; the `models` service's `CaptionBackend`
-(`modelsvc/backends/caption_backend.py`, §5.1) wraps it into the caption dict. The
-ingest `caption` stage (§8) never touches a `Captioner` — it calls the service's
-`/caption` over HTTP. There is no in-process caption VLM and no per-profile caption
-branch any more (the old `caption_backend` / `caption_model_id` settings are gone).
-
-The caption text is embedded by a **dedicated text embedder, `nomic-embed-text-v1.5`**
-(`config.text_embed_model`), with the model's required `search_query:` /
-`search_document:` task prefixes (`embedding/caption_text.py`). NOT the planner (a
-chat model has no embedding head) and NOT SigLIP (its text tower is trained
-image↔text, so text↔text has no separation — measured). Since plan 16 dropped
-Ollama, it has no server, so it runs **in-process in the `models` service**
-(`embedding/text_embedder.py`, `TextBackend.text_embed`), on CPU (mac) / CUDA
-(jetson). `nomic` was chosen by a benchmark on real captions (below); it ties the
-alternatives on recall while being the smallest and fastest. The resulting
-`caption_vec` is a **text-meaning retrieval index**, consumed as **top-k KNN**
-(never a fixed cosine floor — see §10 and the decision box).
-
-> **DECISION — caption embeddings are the scalable semantic-retrieval index; do not relitigate.**
-> `caption_vec` exists to **vector-search meaning-similar captions** (top-k KNN) so a query
-> pulls a handful of candidates out of a library of millions **without the LLM ever looping
-> over rows**. It is NOT an LLM "read each caption and decide" step, and NOT a rerank
-> guardrail — it is the retrieval index. Consequences, settled and measured:
->
-> 1. **Embedder = a dedicated text embedder (`nomic-embed-text`), with the required
->    `search_query:` / `search_document:` prefixes.** SigLIP's text tower was tried and
->    **measured inadequate**: it is trained for *image↔text*, so *text↔text* cosines collapse
->    into a ~0.2–0.45 band with no separation (an ideal "red jacket" match scored 0.41 vs an
->    irrelevant "police car" 0.32). nomic ranks the ideal match clearly on top. **Do not go
->    back to SigLIP for caption text.** SigLIP stays for image↔text search and visual similarity.
->    Benchmarked on the real caption corpus, `nomic` / `mxbai-embed-large` / `bge-m3` **tie on
->    retrieval** (recall@5 0.80, recall@10 0.93, MRR ~1.0); `nomic` wins on **size (274 MB)** and
->    **latency (~46 ms/cap)**, decisive for the 8 GB Jetson — so it is the default.
-> 2. **Consume as top-k KNN, NOT a fixed cosine floor.** nomic has a high baseline cosine
->    (unrelated captions ≈ 0.4–0.5), so a fixed floor like `RERANK_FLOOR = 0.4` is meaningless
->    here — rank by similarity and take the nearest k; let the agent/LLM verify that shortlist.
-> 3. Runs **in-process in the `models` service** (`embedding/text_embedder.py`) on mac and
->    jetson via `transformers`, reached over the models gateway (`/text/embed`) with the same
->    `InferenceClient.embed` call shape as before. Since plan 16 there is no Ollama to serve it;
->    it is tiny (~0.3 GB) and rides alongside SigLIP inside the ~5.8 GB Jetson budget. On cloud
->    (vLLM) it keeps the OpenAI `/embeddings` path.
->
-> Status: **implemented** — `caption_vec` is written by `backfill_caption_vectors`
-> (pipeline group 2c) with `nomic-embed-text-v1.5` and now feeds **§9 "similar photos"**
-> (caption-meaning between two photos) and the `/library` search fusion signal.
-> **Chat photo-search no longer uses it** — per **plan 17** chat finds photos with SigLIP
-> **image↔text** (`search_photos`, §10), which needs no captions; captions embed the whole
-> scene, so caption-text search interleaved scene-neighbours (an SUV beside the real match).
-
-Since plan 16, **`mac` and `jetson` run `gemma4-E2B`** for both caption and
-planner/chat (one GGUF on `llama-server`, §3.1); `cloud` stays on Qwen2.5 (vLLM).
-Caption and planner prompts live in a per-model template registry in
-`inference/prompts.py`, keyed by model name, with a shared JSON schema all
-templates must satisfy. Adding a model means adding a template, not touching the
-pipeline.
-
-Gemma 3 is dominated on every axis — Gemma 4 12B beats Gemma 3 27B by roughly 20
-MMMU-Pro points at a third of the memory — and is not used.
-
-SigLIP 2 outperforms OpenCLIP on zero-shot and retrieval. It stays in-process
-rather than behind the inference service because neither `llama-server` nor vLLM
-exposes an image-embedding endpoint. On `mac` it runs on CPU inside the container:
-roughly 1 s/photo, so about 1.5 hours one-time for 5,000 photos, and about 30 ms
-per search query. That one-time cost is the price of containerising the app on a
-Mac.
-
-**Model download.** On `mac`/`jetson`, the gemma GGUF (+ mmproj) is fetched once
-into a volume/dir — by the `inference` container's entrypoint on jetson, by `make
-llama-mac` on mac (§3.1). SigLIP and the nomic text embedder are fetched from
-Hugging Face into a mounted cache the first time they are used. On `cloud`, vLLM
-fetches its model from Hugging Face. All these caches survive restarts.
-
-**Bake-off gate.** A script runs candidate caption models over the same real
-photos and reports seconds per photo, memory high-water mark, and side-by-side
-captions (an open item is to widen it — dense text, low light, many objects —
-before the first bulk ingest). Because published benchmarks are either close or
-not directly comparable, the bake-off is how the default is actually chosen. The
-winner becomes the default in config, not in code.
+Gemma 4 is used over the dominated Gemma 3. The default caption model is chosen by
+a **bake-off** on real photos, not published benchmarks — the winner is a config
+default, not code.
 
 ## 5. Architecture
 
@@ -497,7 +333,7 @@ flowchart TB
     subgraph gpu["The GPU box · docker compose"]
         app["app · FastAPI + Jinja + HTMX<br/>UI · read queries · upload receipt · /api/manifest<br/>NO models, NO torch — a thin client of the models service"]
         worker["worker · ingest pipeline (primary writer)<br/>facets · thumbs · taxonomy · caption · memories · deletions<br/>NO models, NO torch — a thin client of the models service"]
-        models["models · THE ONE INFERENCE GATEWAY (§5.1)<br/>the only process that imports torch/transformers AND the only client of the inference server<br/>loads SigLIP + the nomic caption-text embedder in-process · ensure-loaded residency<br/>HTTP: /embed/image · /embed/text · /tag · /caption · /plan · /chat · /resources"]
+        models["models · THE ONE INFERENCE GATEWAY (§5.1)<br/>the only process that imports torch/transformers AND the only client of the inference server<br/>hosts SigLIP + nomic in KILLABLE TorchWorker children (parent imports no torch) · memory governor swaps SigLIP↔gemma under budget (§8.1)<br/>HTTP: /embed/image · /embed/text · /tag · /caption · /plan · /chat · /resources"]
         infer["inference · llama.cpp llama-server (mac/jetson) | vLLM (cloud)<br/>ONE gemma4-E2B GGUF — text (planner/chat) AND vision (caption), on the GPU<br/>reached ONLY by the models service · (host on mac, container on jetson/cloud)"]
         db[("SQLite WAL<br/>sqlite-vec + FTS5 · named volume")]
         store[("Storage<br/>originals + thumbnails")]
@@ -555,8 +391,8 @@ needs no new component.
 
 ### 5.1 The `models` service — the one inference gateway
 
-**Every model, LLM, embedder, and heavy AI library lives in exactly one process:
-the `models` service.** It is the only process that imports `torch`/`transformers`,
+**Every model, LLM, embedder, and heavy AI library lives in exactly one service:
+the `models` service.** It is the only service that touches `torch`/`transformers`,
 the only one that loads SigLIP or the caption-text embedder, and the only client of
 the inference server (`llama-server` / vLLM). `app`, `worker`, and the CLI hold
 **no models and no torch** — they are thin HTTP clients of this service (CLAUDE.md
@@ -564,9 +400,26 @@ the inference server (`llama-server` / vLLM). `app`, `worker`, and the CLI hold
 the 8 GB unified-memory Jetson a duplicated SigLIP plus two torch CUDA contexts is
 exactly what exhausted memory.
 
+**The service owns three supervised children, and its own process holds no model.**
+gemma is the `llama-server` child (§3.1); SigLIP and nomic are one `TorchWorker`
+child each (§8.1, `modelsvc/torch_process.py`). The FastAPI parent imports **no**
+torch at all — it starts, calls, and **kills** children, because ending the process
+is the only way a CUDA context's memory comes back. This is the one-model-process
+rule, not an exception to it: one owner, one copy of each model, everyone else on
+HTTP.
+
 **HTTP surface** (the whole app's inference vocabulary):
 
-- `POST /embed/image` — SigLIP image embeddings (ingest `embed`, "similar").
+- `POST /embed/image` — SigLIP image embeddings (ingest `embed`, "similar"). The
+  caller (`RemoteEmbedder`) resizes each image to SigLIP's **384×384** input,
+  bilinear, before the PNG encode. That is exactly what the model's processor
+  does to any input it is given (`do_resize`, `size: 384×384`, `resample:
+  BILINEAR`), so the vectors are bit-identical — but it is the difference
+  between a working ingest and a stalled one: PNG-encoding a full-resolution
+  original cost 5.7 s of CPU and a 15 MB base64 body per photo on the Jetson,
+  against ~10 ms of GPU, pinning the embed stage at 0.32 img/s with the GPU idle
+  96 % of the time. Only valid for a **fixed-resolution** SigLIP checkpoint —
+  a NaFlex variant consumes native resolution and would lose signal here.
 - `POST /embed/text` — SigLIP **text** embeddings for search/chat query vectors
   (same joint space as the image vectors).
 - `POST /tag` — SigLIP zero-shot scoring against `vocab.yaml` (ingest `taxonomy`).
@@ -574,188 +427,74 @@ exactly what exhausted memory.
   `logit_bias`); `RemoteEmbedder` fetches and caches this once so taxonomy
   scoring (§9) can stay client-side (ingest keeps computing tag probabilities
   itself, over `embed_text` + this calibration — nothing server-side changes).
-- `POST /caption` — a caption + structured tags for one image (OpenAI `/v1` call
-  to `llama-server` with the image as an `image_url`, §4).
+- `POST /caption` — a caption sentence (title/description) for one image (OpenAI
+  `/v1` call to `llama-server` with the image as an `image_url`, §4). It returns
+  **no tags** — tags are SigLIP-only (§7).
 - `POST /plan`, `POST /chat` — text generation (query planner, chat answers).
-- `POST /text/embed` — caption-meaning text embeddings (§9) from the **in-process
-  dedicated text embedder `nomic-embed-text-v1.5`** (`TextBackend`,
+- `POST /text/embed` — caption-meaning text embeddings (§9) from the **dedicated
+  text embedder `nomic-embed-text-v1.5`**, in its own worker child (`TextBackend`,
   `embedding/text_embedder.py`) — NOT `/embed/text` (that is SigLIP, image↔text
   only). Consumed as top-k KNN (§10).
-- `GET /resources` — what is resident + memory + **GPU load** (this is the only
-  process with GPU access, so it is the one that reads it), for the resource bar (§13).
+- `GET /resources` — **only what the service alone knows**: which models are
+  resident, and the current in-flight op. It reports **no machine metrics**.
+  RAM/CPU/GPU-load/temperature are host-wide numbers that any process can read
+  from `psutil` and the kernel's own sysfs counters — reading them is not
+  "touching the GPU" in the sense of the one-model-process rule (§5.1), it needs
+  no CUDA context, no driver library and no `runtime: nvidia`. So `app` reads
+  them **itself**, locally, and the bar keeps showing them even when the `models`
+  service is down or still starting (§13).
 
 **Backends, chosen by profile inside the service (one implementation, both
 platforms):**
 
-- **SigLIP** in-process — `embed_device=cpu` on mac, `cuda` on jetson/cloud.
+- **SigLIP** in a `TorchWorker` child — `embed_device=cpu` on mac, `cuda` on
+  jetson/cloud. Image **bytes** cross the worker pipe; the child does the decode.
 - **Captioning** — an OpenAI `/v1/chat/completions` call to `llama-server`
   (mac/jetson) / vLLM (cloud); the same gemma4-E2B GGUF that answers text also does
   vision on the GPU (§3.1/§4). No in-process caption VLM.
 - **Text** (`/plan`, `/chat`) — the same OpenAI-compatible inference server, via a
-  shared `OpenAICompatClient`. **Caption-meaning text embeddings** run in-process
-  (`nomic`, `embedding/text_embedder.py`) on mac/jetson because `llama-server` has
-  no embedding endpoint; cloud (vLLM) keeps the OpenAI `/embeddings` path.
+  shared `OpenAICompatClient`. **Caption-meaning text embeddings** run in their own
+  `TorchWorker` child (`nomic`, `embedding/text_embedder.py`) on mac/jetson because
+  `llama-server` has no embedding endpoint; cloud (vLLM) keeps the OpenAI
+  `/embeddings` path and has no worker.
 
 **Residency is coordinated in-process here** — there is no cross-process DB lease.
-Since plan 16 removed the in-process caption VLM, **SigLIP is the only heavy
-in-process model**, so residency (`modelsvc/residency.py`) is a simple
-**ensure-loaded** guard: SigLIP loads once and stays resident; there is nothing to
-evict, swap, or preempt it against. On the 8 GB Jetson the gemma GGUF (~2 GB) lives
-in `llama-server`, SigLIP (~1.6 GB) and the nomic embedder (~0.3 GB) in this
-process — all local, so the budget is real and no second process holds a hidden
-copy.
+A `MemoryGovernor` (`modelsvc/governor.py`, driven by the `Scheduler`) makes the
+models an op needs resident, evicting non-needed, non-pinned residents (LRU) when
+either the `budget_mb` ceiling or the measured free RAM says they will not fit. On
+the 8 GB Jetson the gemma child (~5.0 GB in `llama-server`) and SigLIP (~1.6 GB) +
+nomic (~0.3 GB, in this process) do **not** fit together, so the governor **swaps**:
+it evicts SigLIP to load gemma for a caption/chat and reloads it for the next embed.
+Everything is local, so the budget is real and no second process holds a hidden copy.
 
 This **retires the earlier cross-process model lease** (`model_lease`) and the
 two-process `ModelCoordinator`: with models in one process, residency is an
-in-process concern (§8.1, `modelsvc/residency.py`), and `app`/`worker` need no
-coordination because they hold nothing to coordinate. `models/coordinator.py`
-keeps only a torch-free no-op stub (`NoopCoordinator`) so `app`/`worker` call
-sites need no edit; it never loads, refuses, or leases anything.
+in-process concern (§8.1, `modelsvc/governor.py`), and `app`/`worker` need no
+coordination because they hold nothing to coordinate — they reach every model over
+HTTP and load nothing themselves.
 
 ## 6. Data model
 
-```sql
--- one row per distinct image, keyed by its bytes
-photos (
-  id              INTEGER PRIMARY KEY,
-  owner_id        INTEGER NOT NULL,
-  content_hash    TEXT NOT NULL,      -- sha256 of file bytes; the identity
-  storage_key     TEXT NOT NULL,      -- where the original lives in Storage
-  phash           TEXT,               -- perceptual hash, near-duplicate groups
-  bytes           INTEGER,
-  width           INTEGER,
-  height          INTEGER,
-  shot_at         TEXT,               -- EXIF DateTimeOriginal, ISO-8601
-  camera          TEXT,
-  lens            TEXT,
-  gps_lat         REAL,
-  gps_lon         REAL,
-  thumb_key       TEXT,
-  caption         TEXT,
-  caption_model   TEXT,
-  caption_vec     BLOB,               -- caption text embedding, for §9 similarity
-  embedding_model TEXT,
-  exif_json       TEXT,               -- full EXIF as captured, for reference
-  created_at      TEXT NOT NULL,
-  updated_at      TEXT NOT NULL,
-  UNIQUE(owner_id, content_hash)
-);
-CREATE INDEX photos_owner_shot ON photos(owner_id, shot_at);
+The library is one SQLite file. **The full DDL — every table and index, the
+`sqlite-vec` (`photo_vec`) and FTS5 (`photo_fts`) virtual tables — lives in
+[`docs/data-model.md`](data-model.md).** The shape that matters for the design:
 
--- every local path these bytes arrived from; >1 row means a duplicate on disk
-photo_sources (
-  id          INTEGER PRIMARY KEY,
-  photo_id    INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
-  upload_id   INTEGER NOT NULL REFERENCES uploads(id) ON DELETE CASCADE,
-  rel_path    TEXT NOT NULL,          -- path relative to the selected root
-  filename    TEXT NOT NULL,
-  mtime       REAL,
-  UNIQUE(photo_id, rel_path)
-);
-CREATE INDEX photo_sources_photo ON photo_sources(photo_id);
+- **`photos`** — one row per distinct image, identified by its `content_hash`
+  (sha256 of the bytes). All derived state hangs off it: EXIF, caption,
+  `caption_vec`, and the SigLIP vector in the `photo_vec` sqlite-vec table.
+- **`photo_sources`** — every local path the bytes arrived from (many-to-one); more
+  than one row is a duplicate on disk (§6.1).
+- **`photo_facets`** — EXIF-derived facets in their own table, so a *fact* is never
+  diluted by a model *guess* (§6.2). **`photo_tags`** holds the model-derived tags,
+  each with a `score` (0..1) and a `source`, so the UI can show why a tag is present.
+- **`jobs`** — one row per (photo, stage): the resumable ingest queue (§8).
+- **`groups` / `group_photos`** — a many-to-many junction backing Memories, so a
+  photo may belong to any number of memories (§11).
+- **`uploads`**, **`chat_sessions` / `chat_messages`** — the folder list (§3.2c) and
+  the persisted chat transcript (§10).
 
--- EXIF-derived facets: exact, queryable, never model-guessed
-photo_facets (
-  photo_id   INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
-  key        TEXT NOT NULL,           -- camera_make, iso, year, time_of_day, ...
-  value_text TEXT,                    -- set for categorical facets
-  value_num  REAL,                    -- set for numeric facets, enables ranges
-  PRIMARY KEY (photo_id, key)
-);
-CREATE INDEX photo_facets_lookup ON photo_facets(key, value_text);
-CREATE INDEX photo_facets_range  ON photo_facets(key, value_num);
-
--- sqlite-vec virtual table; rowid joins to photos.id
-CREATE VIRTUAL TABLE photo_vec USING vec0(
-  embedding float[1152]
-);
-
-tags (
-  id        INTEGER PRIMARY KEY,
-  dimension TEXT NOT NULL,
-  label     TEXT NOT NULL,
-  UNIQUE(dimension, label)
-);
-
-photo_tags (
-  photo_id INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
-  tag_id   INTEGER NOT NULL REFERENCES tags(id),
-  score    REAL NOT NULL,             -- 0..1
-  source   TEXT NOT NULL,             -- siglip | vlm | exif | pixel | user
-  PRIMARY KEY (photo_id, tag_id, source)
-);
-CREATE INDEX photo_tags_tag ON photo_tags(tag_id);
-
-jobs (
-  photo_id   INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
-  stage      TEXT NOT NULL,           -- thumbnail | embed | taxonomy | caption
-  status     TEXT NOT NULL,           -- pending | running | done | failed
-  attempts   INTEGER NOT NULL DEFAULT 0,
-  error      TEXT,
-  updated_at TEXT NOT NULL,
-  PRIMARY KEY (photo_id, stage)
-);
-CREATE INDEX jobs_pending ON jobs(stage, status);
-
-groups (
-  id          INTEGER PRIMARY KEY,
-  owner_id    INTEGER NOT NULL,
-  kind        TEXT NOT NULL,          -- event | cluster | duplicate | memory
-  name        TEXT NOT NULL,          -- AI-written title for a memory
-  description TEXT,                   -- AI-written story for a memory
-  params      TEXT,                   -- JSON, how it was generated; carries the
-                                      -- library signature a memory was built from
-  status      TEXT NOT NULL,          -- suggested | accepted | dismissed
-  created_at  TEXT NOT NULL
-);
-
-group_photos (
-  group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
-  photo_id INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
-  rank     REAL,
-  PRIMARY KEY (group_id, photo_id)
-);
-
-uploads (
-  id            INTEGER PRIMARY KEY,
-  owner_id      INTEGER NOT NULL,
-  root_label    TEXT NOT NULL,         -- the folder name the user picked
-  started_at    TEXT NOT NULL,
-  finished_at   TEXT,
-  files_offered INTEGER DEFAULT 0,     -- hashes probed
-  files_sent    INTEGER DEFAULT 0,     -- bytes actually transferred
-  files_failed  INTEGER DEFAULT 0
-);
-
--- Persisted chat transcript (§10). A session groups a conversation; "New
--- session" starts a fresh one. The current session is the owner's latest.
-chat_sessions (
-  id         INTEGER PRIMARY KEY,
-  owner_id   INTEGER NOT NULL,
-  created_at TEXT NOT NULL
-);
-
-chat_messages (
-  id         INTEGER PRIMARY KEY,
-  session_id INTEGER NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
-  question   TEXT NOT NULL,
-  answer     TEXT NOT NULL,
-  sources    TEXT,                     -- JSON array of cited photo ids
-  created_at TEXT NOT NULL
-);
-```
-
-Plus an FTS5 virtual table `photo_fts(caption, tags_text)`, its rows keyed by
-`photos.id` and refreshed by the taxonomy and caption stages. Because `tags_text`
-is derived from many `photo_tags` rows, the stage rebuilds the row explicitly
-(delete-then-insert) rather than through per-row triggers.
-
-`tags` is a shared vocabulary and deliberately has no `owner_id`; ownership
-comes from the joined photo. Every user-scoped query filters on `owner_id`, and
-a repository-layer helper makes omitting it awkward.
-
-Storing every tag with a `score` and a `source` lets the UI show why a tag is
-present, and lets thresholds be tuned per dimension without re-running models.
+`tags` is a shared vocabulary with no `owner_id`; every user-scoped query filters on
+`owner_id`.
 
 ## 6.1 Exact duplicates
 
@@ -791,17 +530,10 @@ Model output is a guess. EXIF is a fact. The two are kept in separate tables so
 the UI can be honest about which is which, and so a filter on "shot at ISO 3200"
 is never diluted by a model's opinion.
 
-Every photo's full EXIF is stored verbatim in `exif_json`. From it, a fixed set
-of **facets** is derived into `photo_facets`, each either categorical
-(`value_text`) or numeric (`value_num`, so ranges work):
-
-| Group | Facets |
-|---|---|
-| Camera | `camera_make`, `camera_model`, `lens`, `software` |
-| Exposure | `iso`, `aperture`, `shutter_speed`, `focal_length`, `exposure_bias`, `flash`, `exposure_program`, `metering_mode`, `white_balance` |
-| Time | `year`, `month`, `weekday`, `hour`, `time_of_day` (night/dawn/morning/afternoon/evening), `is_weekend` |
-| Place | `has_gps`, `gps_lat`, `gps_lon`, `place_city`, `place_country` (reverse-geocoded, §11) |
-| Image | `megapixels`, `orientation`, `aspect` (portrait/landscape/square) |
+Every photo's full EXIF is stored verbatim in `exif_json`. From it, a fixed set of
+**facets** is derived into `photo_facets`, each either categorical or numeric (so
+ranges work) — the exact key set (Camera / Exposure / Time / Place / Image groups)
+is in [`docs/data-model.md`](data-model.md#exif-facet-keys).
 
 Facets are used four ways:
 
@@ -823,222 +555,159 @@ means by "evening shots". It is not recomputed from GPS and UTC.
 
 ## 7. Taxonomy
 
-Ten dimensions, defined in an editable `vocab.yaml`. Users add or remove labels
-without touching code. Re-scoring a changed dimension only re-runs the SigLIP
-stage, which is cheap.
+**Ten dimensions, defined in an editable `vocab.yaml`** (subject, setting, vibe,
+emotion, light, season_weather, composition, palette, occasion, quality). Users add
+or remove labels without touching code; re-scoring a changed dimension only re-runs
+the (cheap) SigLIP stage. **The label lists, exact per-dimension sources, and the
+tuning knobs are in [`docs/taxonomy.md`](taxonomy.md).**
 
-| Dimension | Example labels |
-|---|---|
-| `subject` | portrait, group of people, pet, food, architecture, nature, vehicle, document, artwork |
-| `setting` | indoor, outdoor, beach, mountain, forest, city street, restaurant, home, office, water, snow |
-| `vibe` | cozy, energetic, serene, moody, festive, nostalgic, dramatic, minimal, chaotic, romantic |
-| `emotion` | joyful, sad, tense, affectionate, playful, contemplative, neutral |
-| `light` | golden hour, blue hour, night, harsh midday, overcast, backlit, neon, candlelit |
-| `season_weather` | summer, autumn, winter, spring, rain, snow, fog, clear sky |
-| `composition` | close-up, wide shot, aerial, shallow depth of field, symmetry, silhouette, leading lines |
-| `palette` | warm, cool, pastel, vivid, monochrome, dark, bright, high contrast |
-| `occasion` | birthday, wedding, travel, hike, concert, holiday, everyday, work |
-| `quality` | sharp, blurry, noisy, overexposed, underexposed |
+The scoring design:
 
-Sources per dimension:
-
-- `palette` and `quality` come from cheap pixel statistics first (mean
-  saturation, Laplacian variance, histogram clipping). SigLIP refines them.
-- All ten get SigLIP zero-shot scores against prompt templates
-  (`"a photo with a {label} mood"`). SigLIP is a **per-dimension classifier**,
-  not an absolute detector: its raw sigmoid probabilities are tiny (~1e-4) and
-  the same across every label, so an absolute floor tags nothing. Instead each
-  dimension is scored by a **softmax over its own labels**, and the winning
-  label (plus any runner-up within `select_ratio` of it, capped at
-  `max_per_dim`) is kept with that softmax probability as its score. Every
-  dimension therefore contributes its best guess, and the stored score is a real
-  0..1 confidence comparable within the dimension.
-- The caption model (Qwen2.5-VL today, §4) returns a JSON object with a caption
-  plus its own picks from the same vocabulary, stored with `source='vlm'`.
-- `shot_at`, `camera`, and GPS come from EXIF with `source='exif'`.
-
-`max_per_dim` and `select_ratio` live in `vocab.yaml`. They start at permissive
-defaults (top label always, runners-up within half the top's probability, three
-labels max) and are tuned against a small hand-labeled dev set of ~100 photos
-built during phase 2.
+- **SigLIP is a per-dimension classifier, not an absolute detector** — raw sigmoid
+  probabilities are tiny and flat, so tags are chosen by a **softmax over each
+  dimension's own labels** (top label + runners-up within `select_ratio`, capped at
+  `max_per_dim`), storing a real within-dimension 0..1 confidence.
+- **Captions write NO tags** (decision) — a flat-`1.0` free-text VLM guess used to
+  override SigLIP's honest scores and mislabel photos. Tags come only from SigLIP +
+  pixel stats (`palette`/`quality`) + EXIF.
 
 ### 7.1 Vocabulary mining
 
-The starting vocabulary cannot anticipate one particular library. A batch job
-reads every caption, extracts recurring noun phrases, and drops any that an
-existing label already covers (cosine similarity between SigLIP text embeddings
-above a threshold). What remains is ranked by frequency and offered in the UI as
-"suggested tags", each with the photos that triggered it.
-
-Accepting a suggestion appends the label to `vocab.yaml` and queues a re-run of
-the taxonomy stage for that dimension only. That stage is SigLIP-only, so a new
-label costs seconds across the whole library, not hours. This is how the tag
-vocabulary grows into the collection instead of being guessed up front.
+The starting vocabulary cannot anticipate one library, so a batch job mines
+recurring noun phrases from captions, drops any an existing label already covers,
+and offers the rest as "suggested tags". Accepting one appends it to `vocab.yaml`
+and re-runs that dimension's (SigLIP-only, seconds-fast) taxonomy stage — the
+vocabulary grows into the collection instead of being guessed up front. Mechanics
+in [`docs/taxonomy.md`](taxonomy.md#vocabulary-mining).
 
 ## 8. Ingest pipeline
 
-Stages run per photo, each recorded in `jobs`. The worker drains pending jobs
-stage by stage. Killing the container and restarting resumes exactly where it
-stopped.
+Every photo flows through a **resumable, per-stage job queue** (`jobs`, §6):
+`receive` → `facets` → `thumbnail` → `embed` → `taxonomy` → `caption`. `receive`
+runs synchronously in `app`; everything after is drained by the `worker`, and
+killing/restarting the container resumes exactly where it stopped. **The exact
+per-stage mechanics, reprocess endpoints, and failure handling are in
+[`docs/ingest-pipeline.md`](ingest-pipeline.md).**
 
-0. **receive** — `app` accepts an uploaded file, verifies its SHA-256 against
-   the hash the client declared, stores the original under a content-addressed
-   key, reads EXIF, and inserts the `photos` row plus its `photo_sources` row.
-   A hash that already exists adds only the source row and queues nothing. This
-   stage runs in `app`, synchronously with the request, and is the only work not
-   driven by the job queue — everything after it is.
-1. **facets** — derive queryable facets from the stored EXIF (section 6.2).
-2. **thumbnail** — two sizes (320 px grid, 1600 px detail) written to storage.
-   HEIC via `pillow-heif`.
-3. **embed** — SigLIP 2 image embedding, batched, written to `photo_vec`.
-4. **taxonomy** — SigLIP zero-shot scoring against `vocab.yaml`, plus pixel
-   statistics. Fast, runs immediately after embed.
-5. **caption** — the `worker` calls the `models` service's `POST /caption`
-   (§5.1) with one photo's thumbnail; the service's `CaptionBackend`
-   (`OpenAICaptioner`, §4) POSTs an OpenAI `/v1/chat/completions` request with the
-   image to `llama-server` (mac/jetson) / vLLM (cloud) and returns a caption
-   sentence and a JSON tag object, written straight to the DB. Slowest stage,
-   runs last.
+The design decisions that matter:
 
-   The caption's §9 text embedding is a **separate step, not part of this stage**
-   (pipeline group 2c): `backfill_caption_vectors` embeds every captioned photo that
-   still has no vector, in ONE batch, with the dedicated text embedder
-   (`nomic-embed-text-v1.5`, in-process in the `models` service, §4) into
-   `photos.caption_vec`. It is its own step (a different model from SigLIP and from
-   the caption call) so it is never interleaved per-photo with captioning. A caption
-   written this pass gets its vector this pass or the next; a library captioned
-   before the column existed backfills the same way — no re-caption needed.
+- **Stages drain library-wide in order, not per photo** — every photo is embedded
+  and tagged before any is captioned. On the 8 GB Jetson this is what keeps SigLIP
+  and the captioner from being needed at once, and it means search + "similar" work
+  across the whole collection minutes after upload, while captions fill in over
+  hours. The caption's text embedding (`caption_vec`, §9) is a separate batch step,
+  never interleaved per photo.
+- **Degrade, never crash.** A drain pass runs the GPU-free stages (thumbnail, place
+  facets, deletions) first, then the inference stages; if the `models` service is
+  down the inference group is skipped and retried next pass, so photos still appear
+  in the library and the upload receipt still returns.
+- **Reprocess & self-heal.** Originals are kept, so any stage can be re-run — per
+  library range or per photo — without re-uploading, and self-healing backfills
+  queue any missing derived state each drain.
+- **The manifest gate.** `/api/manifest` marks the library `complete` only when no
+  job is pending/running; `ivms777-sync` refuses an incomplete manifest without
+  `--allow-incomplete` (§12).
 
-**Stages are drained in order across the whole library, not per photo.** Every
-photo is embedded and scored before any photo is captioned. This is what keeps
-the Jetson profile viable: the SigLIP-using stages (`embed`, `taxonomy`) call
-`/embed/image` and `/tag`, and the `caption` stage calls `/caption` — two calls
-that **never hold the GPU at once** inside the `models` service, so 8 GB never
-has to hold both SigLIP and the captioner. Draining embed/taxonomy first means
-search and "show similar" work across the entire collection within minutes of
-the upload finishing, while captions fill in over the following hours. Which
-model is resident when is no longer a property of *this* loop's ordering — it
-is decided by the `models` service's **in-process residency manager (§8.1)**,
-the single place that loads and unloads models.
+### 8.1 In-process residency — the memory governor (swap under budget)
 
-### 8.1 In-process residency — SigLIP ensure-loaded
+All model work lives in the one `models` service (§5.1), so residency is an
+**in-process** concern, not a cross-process lease. A **`MemoryGovernor`**
+(`modelsvc/governor.py`), driven by the `Scheduler` (`modelsvc/scheduler.py`),
+makes the models each op needs resident and **evicts** non-needed, non-pinned
+residents (LRU, oldest first) whenever the `budget_mb` ceiling *or* the measured
+free RAM says they will not fit. Each model registers a `load`/`free` pair and a
+**resident cost** (`IVMS777_MODEL_COST_MB`); that cost must track the model's real
+footprint, because the eviction guard is `free >= cost + headroom` — an
+under-estimate loads a model on top of one that should have been evicted and OOMs
+the box (the gemma "connection refused" bug).
 
-All model work lives in the one `models` service (§5.1), so deciding which
-heavy model is loaded right now is an **in-process** concern —
-`modelsvc/residency.py::Residency` — not a cross-process DB lease. The earlier
-`model_lease` table and `models/coordinator.py::ModelCoordinator` (a DB row,
-heartbeat thread, and stale-reclaim logic that coordinated the separate `app`
-and `worker` processes, back when each loaded its own SigLIP) are gone.
-`models/coordinator.py` keeps only a torch-free no-op stub — `RefusedError`
-and `LeaseBusyError` (kept only so existing `except (...)` clauses need no
-edit) and `NoopCoordinator.require()`, a nullcontext — so `app`/`worker` call
-sites (`ctx.make_coordinator(...).require("CHAT")`, `.require("SEARCH")`,
-`.require("MEMORY_REBUILD")`, `_lease(coordinator, "INGEST_EMBED")`, §10/§11)
-need no edit even though there is nothing left for them to coordinate: `app`
-and `worker` hold no models, so `require()` now loads nothing, refuses
-nothing, and never raises.
+gemma is registered **twice** — `gemma` (text: chat/planner) and `gemma-vision`
+(text + the ~531 MB projector: captioning only). They are one `llama-server` child on
+one port, so they are **mutually exclusive**: making either resident frees the other
+(§3.1). A text chat never loads the vision half.
 
-Since plan 16 removed the in-process caption VLM (captioning is now a remote
-OpenAI call to `llama-server`), **SigLIP is the only heavy in-process model** in
-the service. Nothing contends with it for the GPU, so residency is no longer a
-swap/preempt arbiter — it is a plain **ensure-loaded** guard. A sub-backend never
-loads its model directly; it wraps its call in `residency.use(name)` and the
-manager loads it once:
+**Residency is a claim about the world, not a note to self.** gemma lives in a
+separate process that can die without asking us — `llama-server` aborts (SIGABRT) the
+moment a `cudaMalloc` fails, including *mid-request* at image decode. So every model
+that can die behind our back registers an `alive` probe alongside `load`/`free`, and
+`ModelRegistry.ensure()` **re-checks it**: a model the bookkeeping calls resident but
+whose probe says dead is dropped and **loaded again**. Without that probe the registry
+keeps asserting a dead gemma is resident and every caption posts to a closed port —
+`connection refused`, forever, until the container is restarted. SigLIP and nomic
+carry the same probe for the same reason — they are child processes too (below).
 
-```python
-with residency.use("siglip", priority=HIGH):
-    ...            # SigLIP is loaded once, then reused
-```
+On the 8 GB Jetson gemma (~3.5 GB text / ~4.0 GB with vision, in the `llama-server`
+child) and SigLIP (~3.3 GB) + nomic (~2.1 GB) do **not** fit together, so the governor
+**swaps** them across the embed↔caption boundary: SigLIP is evicted to load gemma for a
+caption/chat, and reloaded for the next embed. Those two figures are each child's WHOLE
+footprint — its torch import and CUDA context included — because eviction kills the
+child, and they are what `IVMS777_MODEL_COST_MB` must carry.
 
-`SiglipBackend` wraps every `/embed/image`, `/embed/text`, `/tag`, and
-`/embed/calibration` call in `use("siglip", priority=HIGH)` — search, chat, memory
-rebuild, and ingest embed/taxonomy all look identical from here, an HTTP request
-against the same endpoint, so there is no per-caller workload taxonomy the way the
-old coordinator needed one. `priority` is retained as a readability hint only;
-with a single registered model there is nothing to prioritise against, so `use()`
-loads once and never evicts or preempts. Captioning is not registered with
-`Residency` at all — it is a remote call. Neither is the in-process `nomic`
-text embedder (tiny, ~0.3 GB, loaded once by `TextBackend`).
+**A model is loaded with `device_map=<device>`, NEVER `.to(device)`.** `.to()`
+materialises every weight in host RAM first, and that copy is never released: measured
+on the board, SigLIP's child sat at **5128 MB** RSS loaded with `.to("cuda")` versus
+**2940 MB** with `device_map` — a 2.2 GB host copy on a 7.4 GB machine. It is not
+un-returned allocator arena, so `gc` + `torch.cuda.empty_cache()` + `malloc_trim`
+reclaim **nothing** (all three measured, zero change); the tensors stay referenced.
+`device_map` streams the checkpoint shard-by-shard straight onto the device so the host
+copy never exists, and it is why `accelerate` is a dependency of the `models` extra.
+This applies to every model the service loads, present and future — **with one measured
+exception**: `nomic-embed-text` ships custom remote modeling code that `device_map`
+splits across devices (`embed_texts` then fails with "index is on cuda:0, different
+from other tensors on cpu"), so it keeps `.to()` and pays the host copy — 2.14 GB
+resident instead of the 1.28 GB it would cost. That makes the caption-text embedder the
+second-most expensive resident on the board, not the "~0.3 GB" earlier notes claimed.
 
-Because captioning left the GPU-sharing picture, the whole caption-preemption
-path is gone too: no `should_preempt`, no `CaptionPreempted`/503, no
-`ModelsCaptionPreempted`. A caption is a plain HTTP call that either returns or
-errors (and retries like any stage). This removes the `StoppingCriteria` +
-`threading.Condition` machinery the two-model swap used to need.
+**A torch model is evicted by ENDING ITS PROCESS, never in-process.** Freeing a torch
+model in-process frees its tensors but **not** its process footprint. Measured on the
+board: SigLIP takes the process to ~5.3 GB anonymous RSS, and after a full in-process
+release (cache clear + `gc` + `empty_cache` + `ipc_collect`) it still holds **~2.7 GB**,
+with the CUDA driver reporting only ~2.4 GB device-free —
+`torch.cuda.memory_reserved()` is ~20 MB at that point, so torch has let go and the
+CUDA context has not. `malloc_trim` plus clearing the cuBLAS workspaces recover ~50 MB
+between them. That residue is exactly the RAM gemma-vision (~3.9 GB measured) needs, so the
+in-process swap did not work: `llama-server` aborted at load or at image decode and
+every caption failed until the container was restarted.
 
-What is resident (`residency.resident()` — `["siglip"]` once loaded, **plus the
-llama-server / vLLM text model**, e.g. `gemma4-E2B`, which is a separate always-on
-process serving both text and captioning, so it is reported in EVERY state — the bar
-shows it during captioning/idle too, not only chat/planning), the models-process RAM,
-the **GPU load**, and the **current in-flight op** (`active` — `embedding` / `tagging`
-/ `captioning` / `planning` / `chat`, or `null` when idle; tracked by
-`modelsvc/activity.py` since the service is the one place that sees every call) are all
-reported by `CompositeBackend.resources()` on `GET /resources`, which `/api/resources`
-proxies for the **resource bar (§13)**. The `active` step is ground truth of what the
-GPU is doing, not a declared intent.
+So SigLIP and nomic each run in a **`TorchWorker` child process**
+(`modelsvc/torch_process.py`, spawn — never fork), the registry's `load` is
+`start()` and its `free` is `terminate()`, and `alive` is the child's liveness. The
+`models` parent therefore **never imports torch** and never holds a CUDA context;
+`app`/`worker` are unchanged thin HTTP clients, and no model is loaded twice — this is
+the one-model-process rule, applied the same way gemma already was. Rejected, with
+measurements: SigLIP on the **CPU** (residue drops to ~0.7 GB) costs **54×** throughput
+(9.64 img/s GPU → 0.18 img/s CPU); `--parallel 1` on llama-server saves ~20 MB; `-ub
+256` breaks vision outright (`n_ubatch >= n_tokens` is required by the non-causal image
+encoder). Batch ingest runs stage-by-stage (all embeds, then all
+captions), so this costs only a couple of swaps per run, not one per photo. The
+scheduler also gives interactive ops (search/chat) priority over batch captioning
+on the single Jetson slot, so a chat preempts a queued caption. The service reports
+what is resident and the current in-flight op on `GET /resources` for the resource
+bar (§13) — and nothing else; the machine metrics beside them in the bar are read
+by `app` itself (§5.1).
 
-Failed jobs retry up to 3 times with the error recorded, then stay `failed` and
-are listed in the UI. One bad file never stalls the queue.
+The governor never *refuses* a load whose declared cost **fits** the budget — it
+evicts SigLIP + nomic so a single gemma has the GPU to itself. But "within budget"
+means `model_cost_mb[name] + headroom_mb <= ram_budget_mb`, and a model that breaks
+that inequality can **never** load, on any amount of free RAM: eviction cannot help,
+so the governor refuses every time. **An over-estimated cost is therefore NOT the
+safe direction** — past a point it is fatal. `gemma-vision` was declared at 5000
+against a 5000 jetson budget and a 512 MB headroom, so `5000 + 512 > 5000` raised
+`InsufficientMemory` on every caption and the entire stage failed on an idle board
+with 5.6 GB free. Every entry in `model_cost_mb` must satisfy that inequality for
+its profile; `tests/test_config.py::test_every_model_fits_its_profile_budget`
+enforces it, and the costs are **measured** (as the drop in
+`psutil.virtual_memory().available`, which is what the guard reads), never guessed. gemma always loads **fully on the GPU** (`-ngl
+99`, vision projector included) — **the platform never degrades to the CPU** (§3.1).
+If the all-GPU load still cannot fit (the non-evictable baseline leaves < gemma's GPU
+footprint), `llama-server` aborts at load and `app` streams a plain error turn to the
+chat UI; the only fix is to **shrink gemma's GPU footprint** so it fits — a smaller KV
+context, a Q8 vision projector (§3.1), smaller weights — **never** a CPU offload. A
+"(no answer)" bubble is a bug, not an outcome.
 
-**A backend outage never blocks the GPU-free stages, and never fails an upload.**
-A drain pass (`ingest/pipeline.py::drain_pass`, shared by the `worker` loop and the
-app's inline drain) runs in two groups: first the **GPU/inference-free** stages —
-thumbnail, EXIF place facets, folder deletions — then the **embedder/inference**
-stages (embed, taxonomy, caption). The embedder (`RemoteEmbedder`, an HTTP
-shim over the `models` service, §5.1) is built **inside the pass**, not
-eagerly at process start; if a call through it fails — e.g. the `models`
-service is unreachable, or its own CUDA init fails on jetson (the previously
-observed `RuntimeError 801`, now inside that service rather than the worker) —
-the model group is skipped for that pass and retried on the next, while
-thumbnails still run. So an uploaded photo
-**appears in the library** (the grid shows photos with a `thumb_key`) even while the
-GPU is down, and the `worker` keeps looping instead of crashing on startup. For the
-same reason the **upload receipt is decoupled from processing**: `/api/upload/finish`
-records the upload and returns even if its best-effort inline drain fails — the
-bytes are stored, the jobs are queued, and the `worker` drains them regardless
-(§5). The receipt succeeding is not a claim that processing is done.
-
-A file rejected at **receive** — hash mismatch, unreadable image, unsupported
-format — never becomes a `photos` row. It is counted in `uploads.files_failed`
-and reported to the client, which lists it on the upload screen so a failed
-transfer is visible rather than silently missing.
-
-**Reprocessing.** Originals are kept (§3.2b), so the derived state — thumbnails,
-embeddings, tags, captions — can be rebuilt without re-uploading. `POST
-/reprocess` resets a **range** of stages (`from_stage` through an optional
-`to_stage`, inclusive) to `pending` for the owner's photos; the `worker` re-runs
-them in `STAGES` order on its next poll. The `/upload` UI puts a **Reprocess**
-button on **every stage row** — `thumbnail`, `embed`, `taxonomy`, `caption` —
-and each re-runs **only that one stage** (`from=to=stage`). So re-tagging after a
-`vocab.yaml` change never rebuilds thumbnails, and re-embedding never
-re-captions; each stage is re-run in isolation, exactly when it is the one that
-changed. The `caption` button is styled as a destructive action and confirms
-first ("can take hours"), since it alone re-runs the slow vision model.
-
-The endpoint still accepts any range, so a multi-stage re-run — `from=embed`
-`to=taxonomy` for a new embedding model — is one POST away.
-
-**Per-photo reprocess.** `POST /photo/{id}/reprocess` re-runs a single model
-stage for one photo — `taxonomy` (re-tag) or `caption` (re-caption) — resetting
-just that photo's job to `pending`. It is exposed on the `/photo` page (§13) so a
-single bad tagging or caption can be redone without touching the rest of the
-library. Only the model-derived stages are offered; `thumbnail` and `embed` are
-static (the bytes never change) and are not re-runnable per photo. It redirects
-back to the photo with its collection query intact.
-Every stage handler is idempotent — it
-overwrites its own output — so a reprocess is safe to trigger at any time.
-Self-healing backfills run automatically each drain: they queue `thumbnail` for a
-photo still without one, `embed` for one missing a vector, `taxonomy` for an
-embedded-but-untagged photo, and `caption` for a thumbnailed-but-uncaptioned one —
-so a library predating a stage, or a photo whose thumbnail once failed, heals with
-no manual action. A photo that genuinely can't be thumbnailed is skipped by the
-later stages rather than crashing them.
-
-**The manifest gate.** Stage 2 must not run against a half-processed library, so
-`/api/manifest` reports the collection as `complete` only when no `pending` or
-`running` job rows remain for the owner. It still serves a manifest while
-incomplete, marked as such, and `ivms777-sync` refuses to `apply` one unless
-`--allow-incomplete` is passed.
+Implementation detail — the `use()` guard, the retired caption-preemption path, and
+the `/resources` fields — is in
+[`docs/ingest-pipeline.md`](ingest-pipeline.md#in-process-residency--siglip-ensure-loaded).
 
 ## 9. Retrieval
 
@@ -1111,60 +780,24 @@ core's `refine()` (§9.2) — `similar_photos` is a thin wrapper over
 `refine(candidates(Query(seed_photo_id=...)))` — so what follows describes the
 core's seed-query scoring, not a separate mechanism:
 
-| A photo has… | Similar is computed from… |
-|---|---|
-| no embedding yet | nothing — it can't be compared |
-| embedding only | image-vector KNN (cosine ≥ `similar_min_cosine`, default 0.8) |
-| + taxonomy | ⊕ shared **tags across every dimension**, each weighted by that dimension's importance |
-| + captions | ⊕ **caption meaning** (caption text-embedding cosine) |
+Three signals fuse and degrade with the pipeline: image-vector **look-alike**
+(before anything else), shared **tags across all dimensions** (per-dimension
+weighted — `subject` heaviest, `quality` ignored), and **caption meaning** (cosine
+between caption embeddings, which catches a dog-in-a-car that SigLIP tagged
+`vehicle`). **The exact weights, thresholds, and scoring formula are in
+[`docs/retrieval.md`](retrieval.md#similar-photo-scoring).**
 
-Every matching facet is a scored **contribution**:
+**Content gate.** A candidate is "similar" ONLY if it shares a **content** signal: a
+`subject` tag, a caption that means the same, or a genuine visual near-dup.
+Style/scene facets (composition, vibe, palette, light, …) **only rerank** content
+matches — they never make two photos similar on their own. Two photos both shot
+top-down in cool overcast light are not "the same thing".
 
-1. **Shared tags — all dimensions, per-dimension weighted.** A photo is more than
-   its subject, so `vibe`/`emotion`/`setting` all count — but not equally. Each
-   shared tag contributes `dimension_weight × agreement × idf`, where the
-   **per-dimension weight** lives in `vocab.yaml` (`similar_dimension_weights`:
-   `subject` 3.0, `setting`/`occasion` 1.5, mood/light ~1.0, `palette` 0.5,
-   `quality` **0 — ignored**). `agreement` is the weaker of the two confidences and
-   `idf` (0–1) damps common tags. This is what stops a rare `palette=earthy` from
-   outweighing the actual subject.
-2. **Caption meaning.** SigLIP tagging is single-label and picks the *dominant*
-   subject, so a dog riding in a car is tagged `vehicle` and never shares
-   `subject=dog` with a dog on a rooftop. So each caption is embedded with a text
-   model (§4) when it is written, and similarity is the **cosine between caption
-   embeddings** — the *whole sentence's* meaning: "a dog on a rooftop" ≈ "a dog in
-   a car", while "a small teddy bear" ≠ "a small domino tile". This replaced a
-   crude single-shared-word match that let a generic word like "small" fake a
-   match. Contributes above `similar_caption_min` (default 0.6) at a high weight.
-3. **Image-vector cosine.** Contributes a mild look-alike signal (cosine ≥
-   `similar_min_cosine`, default **0.8**) — how alike the two photos *look*
-   (scene/colour/framing), not what they are — and is the sole signal before
-   taxonomy exists. The floor is high because SigLIP image cosines have a high
-   baseline: any two photos sit ~0.5–0.65, so a lower floor admits noise (a teddy
-   bear "looks alike" a selfie at 0.63 — both warm, indoor, close-up), while
-   genuinely-alike photos are 0.85–0.98.
-
-**Content gate.** A candidate is "similar" ONLY if it shares a **content** signal:
-a `subject` tag, a caption that means the same, or a genuine visual near-dup.
-Style/scene facets (composition, vibe, palette, light, season, occasion, setting,
-emotion, quality) **only rerank** content matches — they never make two photos
-similar on their own. Two photos both shot top-down in cool overcast light are not
-"the same thing".
-
-A candidate's score is its contributions **sorted high-to-low and summed with a
-decay** (each further facet counts less), so **one strong match — a shared
-`subject` — beats a pile of weak ones**. This replaced an earlier flat sum that
-let quantity of weak facets win, and a `caption × 3` hack that papered over it.
-Each result carries the **reasons** it was chosen, each with a match percentage
-(the *weaker* of the two photos' confidences — a 0.71 close-up matching a 1.00
-close-up agree at 71%, never the candidate's raw score). The UI shows the **top 3**
-reasons **sorted by relevance** (contribution = importance × rarity × match, so a
-generic `composition: top-down` sinks below a subject/caption match even at a
-higher raw %), overlaid on each enlarged thumbnail (§13). Pure image-vector KNN as
-the *primary* signal was rejected: it matches overall scene/composition, so a dog
-on a rooftop returned other rooftops rather than the other dog. An LLM reranker
-was also rejected for this interactive path — it reintroduces per-click latency
-that §9.1 forbids.
+Contributions are **sorted high-to-low and summed with a decay**, so **one strong
+match — a shared `subject` — beats a pile of weak ones**. Each result carries its
+**top-3 reasons** with a match % (§13). Pure image-vector KNN as the *primary*
+signal was rejected (a dog on a rooftop returned other rooftops); so was an LLM
+reranker for this interactive path — it reintroduces per-click latency §9.1 forbids.
 
 **Similar-photo flow.** Degrades with the pipeline; the content gate is mandatory.
 
@@ -1186,27 +819,14 @@ flowchart TB
 
 ### 9.1 Query planner
 
-The planner model (Qwen2.5-3B today, §4) converts a natural-language query into a
-`QuerySpec` in one call:
-
-```
-"moody shots of the dog at the beach last summer, shot wide open at night"
-  -> {"semantic": "dog on a beach",
-      "date_from": "2025-06-01", "date_to": "2025-08-31",
-      "tags": {"vibe": ["moody"], "setting": ["beach"]},
-      "facets": {"time_of_day": ["night"], "aperture": {"lte": 2.0}}}
-```
-
-The `facets` block maps directly onto `photo_facets` — categorical keys take a
-list of accepted values, numeric keys take `gte`/`lte` bounds. Because these are
-exact, a wrong facet guess is visible and removable as a chip rather than
-silently skewing the ranking.
-
-Concretely, a free-text query is planned once and its predicates are
-materialized into the same filter params the sidebar uses (`f_`/`n_`/`t_`, plus
-`date_from`/`date_to` over `shot_at`); the chips are those params, so removing a
-chip simply drops a predicate and re-runs the ordinary filtered search — the
-planner does not run again until a new query is typed.
+The planner model (§4) converts a natural-language query into a `QuerySpec` in one
+call — a `semantic` string plus `date_from`/`date_to`, categorical `tags`, and
+`facets` (numeric `gte`/`lte` or categorical lists) that map directly onto
+`photo_facets`. Its predicates are materialized into the same filter params the
+sidebar uses, so the parsed filters show as **removable chips**; removing one drops a
+predicate and re-runs the ordinary filtered search, and the planner does not run
+again until a new query is typed. **Example spec + the exact param mapping:
+[`docs/retrieval.md`](retrieval.md#query-planner-output).**
 
 A single structured-output call, not an agent loop. A multi-step tool-calling
 agent would cost seconds per step to query one SQLite table, which is a bad
@@ -1230,37 +850,13 @@ visible and correctable.
 consumer — `/library` search, `/photo` similar, chat, memory — is a caller of
 it; nothing else in the codebase scores, fuses, narrows, or floors photos.
 
-```python
-Query = {
-  text: str | None            # NL query — search, chat, theme discovery
-  seed_photo_id: int | None   # a photo — similar, memory "more like this"
-  hard_filters: dict          # EXIF facets + explicit date — EXACT, gates (§6.2)
-  soft_tags: dict             # {dimension: [label, ...]} — planner hints, SCORE only
-  k: int
-  weights: dict[str, float] | None   # per-dimension importance, vocab.yaml
-  floor: float | None         # caller-set relevance floor; None = rank, don't cut
-}
-```
+**The `Query` shape, the `candidates()`/`refine()` signatures, and the async-paint
+detail are in [`docs/retrieval.md`](retrieval.md).**
 
-Exactly one of `text` / `seed_photo_id` is set. The core exposes its two
-stages separately so an interactive caller can paint fast, then refine:
-
-```python
-candidates(conn, embedder, owner_id, query) -> [id]                 # phase 1 — FAST
-refine(conn, embedder, client, owner_id, query, ids) -> [{id, score, reasons}]  # phase 2 — graceful
-retrieve(...) = refine(candidates(...))                              # synchronous convenience
-```
-
-**Two tiers, one core.** The **fast tier** — `/library` search and `/photo`
-similar — calls the core directly, no agent, no per-click latency (§9.1): search
-uses `candidates()`'s fused ranking, similar uses the full `refine(candidates())`.
-The **agentic-RAG tier** — chat (§10) and memory (§11) — is layered *on top* of
-the same core: it calls `candidates()`/`refine()` as its retrieval tool (to seed
-the loop, and again mid-loop for `search`/`similar`/`nearby`), then adds
-judgement (verify, curate, decide membership) that the core itself never
-performs. Neither tier re-implements ranking, fusion, or a floor — the agent
-loop's job is judgement over what the core already returned, not a second
-retrieval pass.
+**Two tiers, one core.** The **fast tier** (`/library` search, `/photo` similar)
+calls the core directly — no agent, no per-click latency (§9.1). The **agentic-RAG
+tier** (chat §10, memory §11) layers judgement — verify, curate, decide membership —
+*on top* of the same `candidates()`/`refine()`, never a second retrieval pass.
 
 ```mermaid
 flowchart TB
@@ -1280,22 +876,9 @@ flowchart TB
 that scores, fuses, narrows, or floors photos, that is a bug against this
 design — `candidates()`/`refine()` are the only two stages, everywhere.
 
-**Shipped: `/photo` paints instantly, the similar strip loads async (plan 12,
-task 3b).** `/photo/{id}` no longer waits on `similar_photos` to render — the
-image, EXIF, tags, sources, and collection collage are all cheap and render on
-the first response. The "Similar photos" section ships as an HTMX placeholder
-(`hx-trigger="load"`) that fires a follow-up `GET /photo/{id}/similar` the
-moment the page loads; that route runs the full `similar_photos` (i.e.
-`refine(candidates())`, with the same collection-member exclusion as the main
-route) and returns the strip as a fragment, which swaps into place. First paint
-never waits on the full-library scan.
-
-**Still future: splitting that fragment into KNN-paint-then-refine.** The
-`/photo/{id}/similar` route above still runs the *whole* `refine(candidates())`
-in one call — it does not yet separate phase-1 instant KNN order from a
-phase-2 reasoned reorder. The core's `candidates()`/`refine()` split exists to
-make that finer two-phase (KNN list first, reasons swapped in a second later
-request) possible without a new code path; that split has not landed.
+`/photo` already paints instantly with the similar strip loading async; splitting
+that fragment into KNN-paint-then-refine is still future — see
+[`docs/retrieval.md`](retrieval.md#async-paint-photo).
 
 ## 10. Ask-your-library chat
 
@@ -1305,108 +888,84 @@ on the dashboard" with no dog) because a semantic KNN always returns *k*
 neighbours — there was no "nothing matches". The path is now precise, cheapest
 layer first — and the deterministic questions never touch the model at all:
 
-0. **Direct-DB layer — answer everything structural before touching a model.** Every
-   question the DB can answer *unambiguously* — the whole-library total, a subject
-   FTS count, the memory count, the month/year span, and **showing a memory or all
-   memories** — is answered straight from SQLite by `direct_answer`, with **no
-   model call at all**: it replies instantly even while ingest is captioning
-   inside the `models` service (§8.1), and the phrasing **never reaches the weak
-   planner**. Each matcher is
-   **conservative** — it fires only when confident and otherwise returns `None` to
-   fall through to the agent, so an unrecognised phrasing degrades to the agent,
-   never to a confidently-wrong answer. This is the rule that kills the "all" class
-   of bug (a matcher that fired *and* answered wrong): quantifiers (`all`/`every`/
-   `my`) are never search terms, and the whole boundary is pinned by a routing
-   matrix (`tests/test_chat_routing.py`) of every class × many adversarial phrasings
-   (typos, negatives like "show me sunset pictures" that must **not** read as a
-   memory-show, relational counts that must decline). A relational count ("how many
-   *similar to this dog*?") the DB cannot compute is declined here and answered by
-   the agent — never the meaningless library total. A memory-show turn also renders
-   the matched memory (or, for a plural/all request, **every** memory) as the same
-   Organize memory card — re-derived from the question (deterministic, so history
-   reload needs no stored state), each cover linked with `ctx=chat-memory:<key>`
-   (§13.1) so opening one pages **within that memory** and "close" returns to the
-   conversation.
-1. **Route — one agentic decision (plan 17).** A single schema-constrained call to the
-   planner model (`chat/agent.py::route`, temperature 0) classifies the message into
-   ONE tool, using the user's own photos/memories ONLY when the message is about them:
-   `search_library` (they want photos OF something — a person, animal, object, place,
-   scene), `search_memories` (a saved memory/trip/album by name or theme), or `none`
-   (general knowledge, chit-chat — **anything else**). There is **no off-topic gate**:
-   chat is a general assistant, so a `none` message is answered from the model's own
-   knowledge, not refused. Any routing failure falls back to `none`.
-2. **Run the tool (only for a library/memory question).**
-   - `search_library` → **SigLIP image↔text** (`search_photos`, §9.2): the query text
-     embedded by SigLIP's text tower, matched against each photo's **image** vector.
-     This is what SigLIP is built for and is the photo finder. Captions / `caption_vec`
-     are **not** used here (plan 17): a lossy text↔text hop that ranked scene-neighbours
-     (an SUV photo whose caption shared "car/sign") next to the real match. Returns the
-     top-k photos.
-   - `search_memories` → memories whose name/theme matches (`memories_for_show`).
-   - `none` → no retrieval.
-3. **Answer — grounded or general, streamed at temperature 0.** For a tool result the
-   model is given ONLY those photos/memories (per photo: id, date, caption, top tags,
-   EXIF facts — camera, lens, ISO, aperture, shutter, focal length, coords — ~60 tokens)
-   and answers **strictly from them**, citing `[photo:ID]`; the grounding prompt forbids
-   inventing a subject not written in a caption and says to report none when the results
-   do not match (honest-empty). For `none`, the model answers from general knowledge with
-   no library mention. Counts / memory-show / periods never reach here — `direct_answer`
-   (step 0) served them straight from SQLite with no model. The answer **streams** over
-   SSE, each `[photo:ID]` rendered as a clickable thumbnail.
+Cheapest layer first, and the deterministic questions never touch the model:
 
-**Agentic RAG flow.** Direct-DB first (no model); the semantic tail degrades to
-plain fusion at every stage.
+0. **Direct-DB layer.** Everything the DB can answer *unambiguously* — the library
+   total, a subject FTS count, the memory count, a month/year span, and **showing a
+   memory / all memories** — is answered straight from SQLite by `direct_answer`,
+   with **no model call**. Each matcher is **conservative**: it fires only when
+   confident, else falls through to the agent, so an odd phrasing degrades to the
+   agent, never to a confidently-wrong answer (the boundary is pinned by a routing
+   matrix of adversarial phrasings). A memory-show also renders the Organize card(s),
+   linked `ctx=chat-memory:<key>` so opening one pages within the memory and closes
+   back to the conversation (§13.1).
+1. **Route (plan 17).** One schema-constrained planner call (temp 0) classifies the
+   message into `search_library`, `search_memories`, or `none` (general
+   knowledge/chit-chat). Failure falls back to `none`.
+2. **Run the tool.** `search_library` → **SigLIP image↔text** (`search_photos`, §9.2:
+   query text vs each photo's *image* vector — NOT captions, plan 17);
+   `search_memories` → name/theme match; `none` → no retrieval.
+3. **Answer (streamed, temp 0).** A tool result grounds the model on ONLY those
+   photos/memories (id, date, caption, top tags, EXIF), citing `[photo:ID]`; the
+   prompt forbids inventing a subject and reports none when nothing matches
+   (honest-empty). `none` answers from the model's own knowledge — chat is a general
+   assistant, not photo-limited.
+
+**Only a library question may load SigLIP.** `search`/`search_library` is the one chat
+op that runs the SigLIP text encoder, and on the Jetson SigLIP cannot be co-resident
+with gemma (§8.1) — a single stray search evicts gemma and pays a llama-server respawn
+mid-turn. So **both** paths decide on-topic BEFORE any tool: `route` returns `none` for
+anything about the world, and the fully-agentic loop's first instruction is to answer
+with no tool unless the message is about the user's own photos/memories. `search` is
+reserved for "show me my photos of X" — never for a count, never for general knowledge.
+
+**Two per-owner toggles (`chat_prefs`), defaults reproducing the pipeline above:**
+**Direct answers** (on) — off skips the direct-DB step and runs a fully-agentic tool
+loop (`count_photos` / `list_memories` / `count_periods` / `search`) instead; and
+**Guardrails** (off) — on turns the router's `none` verdict into an on-topic gate
+(fixed refusal, no generation), except app-topic questions, which are never refused.
+The two are independent. **Full mechanics — matchers, tool schemas, grounding budget,
+guardrail specifics — in [`docs/chat.md`](chat.md).**
+
+**Agentic RAG flow.** Direct-DB first when *Direct answers* is on (no model); the
+semantic tail degrades to plain fusion at every stage.
 
 ```mermaid
 flowchart TB
-    quest["User question · /chat"] --> direct{"Direct-DB answerable?<br/>direct_answer — total · subject FTS · memory count · memory show/list · periods<br/>conservative: declines when unsure"}
+    quest["User question · /chat"] --> dpref{"chat_prefs.direct_answers?"}
+    dpref -->|on| direct{"Direct-DB answerable?<br/>direct_answer — total · subject FTS · memory count · memory show/list · periods<br/>conservative: declines when unsure"}
+    dpref -->|off| lease2["Take CHAT lease"]
     direct -->|yes| dbans["Answer straight from SQLite<br/>NO model call · memory-show also renders the Organize card(s) (event: memory)<br/>covers link ctx=chat-memory:key → page within the memory, close → /chat"]
-    direct -->|declines| route{"1 · Route — planner, temp 0, schema (plan 17)<br/>is it about the user's OWN photos/memories?"}
+    direct -->|declines| gpre{"chat_prefs.guardrails ON?"}
+    lease2 --> gpre
+    gpre -->|on| route{"1 · Route — planner, temp 0, schema (plan 17)<br/>is it about the user's OWN photos/memories?"}
+    gpre -->|off · direct on| route
+    gpre -->|off · direct off| agentic
+    route -->|none & guardrails on & NOT app-topic| refuse["Refuse — fixed GUARDRAIL_REFUSAL<br/>NO model generation · NO search · persisted<br/>is_app_topic (counts/memories/albums/…) overrides → never refused"]
     route -->|search_library| lib["2 · SigLIP image↔text (search_photos, §9.2)<br/>query text vs each photo's IMAGE vector · top-k<br/>NO captions / caption_vec"]
     route -->|search_memories| mem["2 · Memory search by name/theme (memories_for_show)"]
-    route -->|none · general Q / chit-chat| gen["General answer from the model's own knowledge<br/>chat is NOT photo-limited · no off-topic gate · no search"]
-    lib --> ground["3 · Answer grounded ONLY on results<br/>id·date·caption·tags·EXIF · cite [photo:id]<br/>strict: never invent · honest-empty when none match"]
+    route -->|none & guardrails off| gen["General answer from the model's own knowledge<br/>chat is NOT photo-limited · no search"]
+    agentic["Fully-agentic loop (direct OFF)<br/>STEP 1 — about the user's OWN photos/memories? no → answer, NO tool<br/>yes → model calls REAL tools: count_photos · list_memories · count_periods · search<br/>search is the only SigLIP op, so it is last-resort: only to SHOW photos<br/>gather facts + candidate photos, bounded rounds"] --> ground
+    lib --> ground["3 · Answer grounded ONLY on results/facts<br/>id·date·caption·tags·EXIF · cite [photo:id]<br/>strict: never invent · honest-empty when none match"]
     mem --> ground
     ground --> ans["Stream SSE · temp 0 · cites render as thumbnails"]
     gen --> ans
+    refuse --> ans
 ```
 
-**No off-topic gate (plan 17).** Chat is a general assistant, so it does not refuse
-non-photo questions. The router (step 1) decides whether a message needs the user's
-own photos/memories; when it does not (`none`), the model just answers it. Only a
-library/memory question triggers a search — so unrelated questions never dump the
-library as false evidence, and general questions are answered normally instead of
-being turned away.
+**Degrade, never crash & honest-empty.** Any route/search/embed/generation failure
+falls back to a plain answer (failed route → `none`; failed `search_library` → the
+core's `candidates()` fusion, §9.2), so chat always answers and no ranking lives
+outside the core (single-pipeline invariant). The grounding rule "never invent,
+report none" means an empty search yields an honest "none", not a fabrication; the
+chat view always shows its cited source thumbnails as the evidence.
 
-The answer to a library/memory question is grounded ONLY on that tool's results'
-captions/tags/EXIF, and the grounding prompt forbids inventing a subject not written
-in a caption — so when the search returns nothing that matches, the model says it has
-none rather than fabricating one (honest-empty). Captions are model-generated and
-imperfect, so the chat view always shows its sources — the thumbnails are the
-evidence. Shown and stored sources are the ids the answer actually **cites**, never
-the raw candidate set.
-
-**Degrade, never crash.** Any route, search, embed, or generation failure falls back
-to a plain answer (a failed route defaults to `none`; a failed `search_library`
-degrades to the core's `candidates()` fusion, §9.2), so chat always answers and no
-ranking is re-implemented outside the core (plan 12 single-pipeline invariant).
-
-The view reads like a normal chat: each question and its grounded answer are kept
-on the page as a running conversation, a processing indicator shows while the
-model works, and the input stays pinned at the bottom.
-
-**History is persisted.** Each answered turn (question, full answer, cited photo
-ids) is written to `chat_messages` under the owner's current `chat_sessions` row
-(§6). On load, `/chat` renders the current session's turns server-side as static
-history, so switching away and back — or restarting the app — keeps the
-conversation. A **New session** button opens a fresh, empty session; older
-sessions stay in the database. Persistence is the visible transcript only: each
-question is still answered independently against freshly retrieved photos, not
-against prior turns — there is no multi-turn model memory.
-
-Chat and indexing share one inference service. The chat route calls the planner
-model directly, which is small and stays loaded, so a question during indexing
-does not evict the captioner.
+**History is persisted** (`chat_sessions`/`chat_messages`, §6): `/chat` renders the
+current session server-side on load, so the conversation survives navigation and
+restarts; **New session** starts a fresh one. Each question is answered independently
+against freshly retrieved photos — the transcript is not multi-turn model memory. The
+chat route calls the small, always-loaded planner directly, so a question during
+indexing does not evict the captioner.
 
 ## 11. Organize — albums by principle
 
@@ -1470,40 +1029,13 @@ model already supports this for free: `group_photos` is a many-to-many junction,
 a photo id may appear in any number of `groups(kind='memory')` — **no schema
 change**. Overlap is a feature to embrace, not a conflict to resolve.
 
-**The composition pipeline (all decisions are the agent's):**
-
-1. **Pool (cheap, no decisions).** Group the owner's **processed** photos (caption
-   + embedding present) into coarse *sessions* by time and ~50 km region purely to
-   bound context size — this is not the memory boundary, just a tractable batch the
-   agent can read at once. Only processed photos participate, so composition is run
-   **after** captioning/embedding.
-2. **Compose events (agent, per session).** For each session the agent reads
-   compact per-photo summaries (date, place, caption, tags) and **decides the
-   carve** — one memory, or several chapters, or skip — pulling extra context on
-   demand via bounded tools (similar photos, facet lookups, photos nearby in time,
-   same-subject retrieval) so it can reach *across* sessions when an event spans a
-   pool boundary. It returns each memory as `{title, description, photo_ids[]}`,
-   grounded only in the data.
-3. **Discover themes (agent + RAG).** Separately, an agent proposes recurring
-   threads — a subject that appears often (the dog), a place, an occasion, a season
-   — and for each **retrieves** candidate photos (semantic + tag + facet) then
-   curates the set. This is retrieval-augmented: the theme is the query, the agent
-   judges membership. Themes deliberately pull photos already in events → overlap.
-4. **Reconcile (agent).** A final pass dedupes near-identical memories, merges
-   fragments the pooling split, and writes final titles/covers. It merges
-   *memories*, never collapses the overlap between an event and a theme.
-5. **Persist.** Each memory → `groups(kind='memory')` + `group_photos`; a photo may
-   land in many. `params` records how it was built (kind, seed, model). The swap
-   is atomic (`albums/memory_store.py::replace_memories`) and, in the same
-   transaction, re-indexes each memory's name/description into `memory_fts` — the
-   index chat's memory-show searches (`find_memories`, §10). Rebuilding memories rebuilds that
-   index in lockstep, so a memory is findable in chat the moment it exists and a
-   dropped memory disappears from search with it.
-
-The event-composition agent's `similar` expand tool (`albums/compose.py`) now
-goes through the one retriever core — `similar_photos` is a core wrapper (§9.2)
-— so how candidates reach the agent changed, but the agent still decides every
-membership itself, unchanged.
+The composition pipeline is five agent-driven passes — **pool** (cheap, bounds
+context) → **compose events** (per session) → **discover themes** (RAG) →
+**reconcile** → **persist** (atomic swap into `groups(kind='memory')` +
+`group_photos`, re-indexing `memory_fts` so chat can find them). Every membership is
+the agent's; the pooling only bounds context, and its expand tools route through the
+one retriever core (§9.2). **Step-by-step mechanics, tools, and persistence are in
+[`docs/memories.md`](memories.md).**
 
 **Memory composition flow.** The agent decides every membership; heuristics only
 bound context. Runs only over processed photos.
@@ -1520,294 +1052,64 @@ flowchart TB
     persist --> ui["/organize?by=memories<br/>manual background rebuild · stale flag when signature moves"]
 ```
 
-**Cost is bounded, per §9.1** (this is the batch, offline exception to the
-one-call rule): per-session and per-theme agent loops are capped at a few rounds
-and tool calls; the whole build is signature-guarded and run only on demand.
-
-**Rebuilding.** Manual only ("Rebuild memories"), on a **background thread**, one
-build at a time per process, signature-guarded (owner photo count + newest
-`updated_at`, stored in each memory's `params`) so opening the tab never silently
-re-runs the agent; the tab flags **stale** when the signature moves. Because only
-processed photos participate, **rebuild after captioning/embedding completes**.
-
-> The earlier heuristic seed→curate (one time/place run → one memory, minus
-> outliers) is superseded by the above: it let a distance rule, not the model,
-> decide contents, could not produce overlapping or thematic memories, and
-> fragmented one outing across nearby spots. The coarse time/region seeder is kept
-> **only** as the step-1 pooling that bounds context — never as the decider.
-
-The `groups`/`group_photos` tables — reserved and unused in the earlier design —
-now back Memories. They remain available for a future "save this album" action on
-the live organizers.
+**Cost is bounded** (§9.1's batch, offline exception): agent loops are capped and the
+build is signature-guarded, run only on demand. **Rebuilding is manual**, on a
+background thread, one at a time; the tab flags **stale** when the library signature
+(owner photo count + newest `updated_at`) moves, and a rebuild runs only after
+captioning/embedding completes. Rebuild details, and the superseded heuristic seeder,
+are in [`docs/memories.md`](memories.md#cost-and-rebuild).
 
 ## 12. Stage 2 — the local sync tool
 
-Stage 1 learns what the photos are. Stage 2 acts on it, on the machine that
-holds them. The whole contract between the two is one JSON document.
+Stage 1 learns what the photos are. Stage 2 acts on it, on the machine that holds
+them. The whole contract between the two is **one JSON manifest** — and the local
+`ivms777-sync` CLI is the only component that ever writes to your disk (§3.2b).
+**The manifest schema, the layout contract, the CLI commands, and the full safety
+rules live in [`docs/sync-cli.md`](sync-cli.md).** The design:
 
-### 12.1 The manifest
-
-`GET /api/manifest?layout=date` returns, for every photo the owner has, its
-content hash, the path the chosen layout says it belongs at, and every local
-path it was uploaded from.
-
-```json
-{
-  "manifest_version": 1,
-  "generated_at": "2026-08-13T09:12:44Z",
-  "layout": "date",
-  "complete": true,
-  "photo_count": 4812,
-  "files": [
-    {
-      "hash": "9f2c1a…",
-      "target": "2024/2024-06 June/2024-06-14_183012_IMG_4471.jpg",
-      "sources": ["Pictures/iphone dump/IMG_4471.jpg",
-                  "Desktop/to sort/IMG_4471 copy.jpg"],
-      "bytes": 3841122
-    }
-  ]
-}
-```
-
-`complete` is false while any job row is still pending or running (section 8).
-`sources` carries every path this content arrived from; the first entry is the
-copy the plan will keep, chosen as the shallowest path and then the
-lexicographically smallest, so the result is stable across runs.
-
-The manifest is derived state. Regenerating it with a different layout produces
-a different `target` for every file and nothing else changes.
-
-### 12.2 Layouts
-
-A layout is a pure function from a photo's facts to a relative path. It sees
-EXIF facets, tags, captions, and group membership, and it may use none of them.
-
-```python
-class Layout(Protocol):
-    name: str
-    def target(self, photo: PhotoView) -> PurePosixPath: ...
-```
-
-Three ship in v1. `date` is the default.
-
-**`date`** — a year/month tree, filenames prefixed with capture time.
-Depends only on EXIF, so it is completely stable: re-running it after new
-captions or a retrained model produces byte-identical output.
-
-```
-2024/2024-06 June/2024-06-14_183012_IMG_4471.jpg
-2025/2025-01 January/2025-01-03_101533_DSC_0088.jpg
-_undated/9f2c1a3e_scan012.jpg
-```
-
-**`date-tags`** — the same tree holds every real file, plus an `_albums/`
-directory of symlinks grouped by the strongest tags. One copy of the bytes,
-many ways in. Where symlinks are unavailable the tool reports it and writes the
-date tree alone rather than duplicating files.
-
-```
-2024/2024-06 June/2024-06-14_183012_IMG_4471.jpg
-_albums/beach/2024-06-14_183012_IMG_4471.jpg -> ../../2024/2024-06 June/…
-```
-
-**`flat`** — one directory, every file named by capture time. For people who
-search rather than browse and want no tree at all.
-
-Photos with no usable capture date go to `_undated/`, named by a short hash
-prefix so the name is stable. When two photos would land on the same path, the
-later one gains an `_<hash8>` suffix; the choice is deterministic, so a re-run
-does not shuffle names.
-
-Layouts live server-side in `ivms777/organize/`. Adding one is a new module
-and a new option on `/export` — the CLI needs no change, because it only
-executes paths it is handed.
-
-### 12.3 The CLI
-
-```
-ivms777-sync plan   --url https://photos.example --root ~/Pictures \
-                      --layout date -o plan.json
-ivms777-sync apply  plan.json
-ivms777-sync undo   .ivms777-sync/journal-20260813T091244Z.jsonl
-ivms777-sync verify --url https://photos.example --root ~/Pictures
-```
-
-**`plan`** fetches the manifest, walks `--root`, hashes every file it finds, and
-matches by hash — never by path or filename, so a library reorganized since
-upload still matches perfectly. It writes `plan.json` and prints a summary:
-
-```
-  4,812 photos in manifest
-  4,796 matched on disk
-     16 in manifest but not found locally      (left alone)
-    241 files on disk not in manifest          (left alone)
-
-  3,104 to move          e.g. Pictures/iphone dump/IMG_4471.jpg
-                           -> 2024/2024-06 June/2024-06-14_183012_IMG_4471.jpg
-  1,692 already in place
-    387 redundant copies -> _duplicates/       (reclaims 4.1 GB)
-      0 conflicts
-
-  nothing has been changed. run: ivms777-sync apply plan.json
-```
-
-**`apply`** executes that plan and nothing else. It re-hashes each file
-immediately before touching it and skips any that changed since planning.
-
-**`undo`** replays the journal backwards, returning every file to where it was.
-
-**`verify`** hashes the root and reports how it differs from the manifest,
-changing nothing. It is `plan` without the output file.
-
-### 12.4 Safety
-
-The tool moves other people's photographs, so its defaults are paranoid.
-
-- **Nothing is deleted, ever.** Redundant copies move to `_duplicates/` under
-  their original relative path. Reclaiming the space is a folder the user
-  deletes when they are satisfied.
-- **Nothing outside the manifest is touched.** Files the manifest does not know
-  are counted and reported, never moved.
-- **Every operation is journaled before it runs.** `.ivms777-sync/journal-<ts>.jsonl`
-  gets one record per operation with its status updated after. A crash mid-run
-  leaves a journal that `undo` can replay.
-- **Moves prefer `os.rename`.** Within one filesystem a move is atomic. Across
-  filesystems it is copy, fsync, verify the hash, then unlink — the original
-  goes only after the copy is proven good.
-- **Conflicts stop the plan, not the apply.** If a target path is occupied by a
-  file that belongs elsewhere, `plan` orders the moves so the occupant leaves
-  first, routing through a temporary name when the moves form a cycle. A
-  conflict it cannot order is reported and that file is skipped.
-- **Plans expire.** A plan records the manifest's `generated_at` and the root it
-  was built against. `apply` refuses a plan built for a different root, and
-  warns when the manifest has since changed.
+- **The manifest** (`GET /api/manifest?layout=…`) lists, per photo, its content
+  hash, the `target` path the chosen layout assigns, and every source path it was
+  uploaded from. It is derived state: a different layout re-derives every `target`
+  and nothing else. It carries a `complete` flag (§8).
+- **Layouts are pure functions** from a photo's facts to a relative path. Three
+  ship: `date` (default, EXIF-only so byte-stable), `date-tags` (date tree + an
+  `_albums/` symlink view), and `flat`. They run server-side; the CLI only executes
+  the paths it is handed.
+- **The CLI is `plan` / `apply` / `undo` / `verify`.** It matches files by content
+  hash, never by path, so a library reorganized since upload still matches.
+- **Safety is paranoid:** nothing is ever deleted (redundant copies move to
+  `_duplicates/`), nothing outside the manifest is touched, every operation is
+  journaled before it runs and reversible by `undo`, cross-filesystem moves are
+  copy-verify-unlink, and plans expire against the root/manifest they were built for.
 
 ## 13. UI
 
-- **Persistent app shell** — the nav is a **full-width fixed header**; the content
-  region **below it is the only scroll container** (the window never scrolls), so the
-  page scrollbar starts under the menu and never crosses it. The four nav links
-  (Upload/Library/Chat/Organize) are **HTMX-boosted** and swap **only `<main>`**, so
-  the nav and its resource-bar polling stay resident across top-level navigation — the
-  menu never re-renders and the resource bar never blanks. Boost is **scoped to these
-  links only**: every grid↔leaf drill-down (photo, similar, prev/next) is a full
-  navigation, so §13.1's bfcache-based `history.back()` is unaffected.
-- **Resource bar** — live status at the **right of the nav row** on **every** page. It polls
-  `GET /api/resources` (~2 s) and shows **RAM used / total** and **CPU load %**,
-  read locally in `app` with `psutil` (profile-agnostic, `models/resources.py::snapshot`
-  — `app` itself, not the `models` service), plus **GPU load %**. GPU load
-  comes from the `models` service — the only process with GPU access (§5.1) —
-  read per profile from the tool that box already ships: `tegrastats`
-  (`GR3D_FREQ`) on jetson, `nvidia-smi` on cloud, and nothing on mac (the
-  `models` container has no GPU there, and the host `llama-server` exposes no
-  utilization number). `snapshot()` fetches `gpu_pct` best-effort through
-  `ModelsClient.resources()` (the `models` service's own `GET /resources`,
-  §5.1), so the bar keeps showing RAM/CPU when the `models` service is down,
-  and simply **omits the GPU field** where no GPU is readable. Since
-  `app`/`worker` hold no models (§8.1), there is no cross-process lease left
-  to show here — model residency (SigLIP, loaded once) is an internal concern of
-  the `models` service, observable on its own `/resources` (§8.1), not on this bar.
-- `/upload` — leads with the **folder list**: every folder in the library
-  (§3.2c) with its photo count and a confirm-guarded **Delete from library**
-  button (a folder mid-deletion shows "deleting…"). Below it, a **directory-only**
-  picker adds a new folder; watch client-side hashing, the transfer, then live
-  processing progress per stage with counts, **per-stage throughput** (`done/sec`,
-  measured from recent `jobs.updated_at` so it is derived — not stored — and the
-  last speed **survives a restart**), and failed files (Web Worker for
-  hashing/upload, HTMX polling for processing). Every stage row
-  carries its own **Reprocess** button that re-runs just that stage over the
-  already-uploaded library without re-uploading — `thumbnail`, `embed`, `taxonomy`
-  (re-tag), and a confirm-guarded `caption` (re-caption, the slow one); the worker
-  drains the reset jobs.
-- `/export` — choose a layout, preview the folder tree it would produce, and
-  download the manifest. Shows whether the collection is fully processed, and
-  the exact `ivms777-sync` command line to run next.
-- `/library` — infinite-scroll thumbnail grid. Hover shows caption and top
-  tags; an `×N` badge marks photos with exact duplicates. Left sidebar has two
-  filter groups with counts: model-derived tags per dimension, and EXIF facets
-  (camera, lens, ISO and aperture ranges, year, time of day, orientation). A
-  sort control offers capture date or any numeric facet. Filters and sort
-  **apply on change** — no Apply button — swapping only the grid via HTMX so the
-  sidebar and its scroll position stay put; a single **Clear all filters** button
-  at the top resets them. Top bar has the search box and parsed-filter chips.
-- `/photo/{id}` — a full-screen view of one photo, always shown **inside the
-  collection it was opened from** (the library with its filters/search/sort, an
-  Organize album, or a memory). `‹`/`›` buttons and the ← / → arrow keys page to
-  the previous/next photo **within that collection**, in its order (owner-scoped;
-  the arrows are absent at the ends) — never leaking into another album or the
-  wider library. The collection travels in a `ctx` URL parameter, which the route
-  resolves to the ordered id list. The panel leads with the **collection's
-  identity** — its title, description, and `N / M` position — shown on every photo
-  of it, and only then the photo's own data. Closing returns to the collection's
-  top-level grid (the album/memory/filtered library) with state and scroll intact
-  via the browser's history; every in-photo nav (paging, similar) uses replace, so
-  close always lands on the grid, never on a prior photo. The per-photo panel
-  carries everything known about it: an **AI-written title and
-  description**, the caption, tags grouped by dimension with scores and source
-  badges (the "AI data"), the full EXIF panel — including GPS **coordinates**,
-  which live here as a technical detail and nowhere else — every local path the
-  file arrived from with the wasted-space total when there is more than one, and a
-  "similar photos" strip. The photo itself and everything above render on first
-  paint; the similar strip is the one expensive part (a full-library scan), so it
-  loads **asynchronously** — the page ships a placeholder that fires
-  `GET /photo/{id}/similar` on load and swaps in the finished strip (§9.2) — so
-  opening a photo is never delayed by it. When the photo was opened within an album or memory, a
-  **collage of that whole collection** — every photo in it, the current one
-  highlighted — sits between the photo and the similar strip; each thumbnail opens
-  in place (`replace`, §13.1) so paging stays within the collection, and the
-  collage uses the **same tile size as the similar strip** so the two read as one
-  gallery. The similar strip then **excludes any photo already in that collection**,
-  so a member never appears twice. Each similar
-  thumbnail is **enlarged and labelled with
-  why it matched** — its top-3 reasons (shared tags / caption words / "looks
-  alike") with confidence percentages, one per line, sorted highest-confidence
-  first, overlaid on the image — so similarity is never a black box (§9). Opening a
-  similar photo opens in a **"Similar to <this photo>"** layer (`ctx=similar:<id>`)
-  that shows the base photo's thumbnail (clickable, to jump back to it) and pages
-  within this photo's similar set. **A photo is always exactly one level below a
-  grid** (CLAUDE.md navigation rules): every photo→photo move — prev/next, opening
-  a similar, the origin thumbnail — **replaces** history, so it stays `[grid,
-  photo]` and **close always goes up to the grid** (the library for `library`/`q`/
-  `similar:*`, the album for `album:*`), never replaying the chain of photos
-  visited. The layer panel leads with a **"Why similar — base vs this"** table:
-  every shared facet (tag, caption meaning, visual), both photos' values side by
-  side and their match %, sorted high-to-low — so a weak match is visibly weak
-  (mostly "visual" with faint generic tags) rather than a mystery. The panel also offers **per-photo reprocess** — *Re-tag* and a
-  confirm-guarded *Re-caption* — that re-run just this photo's model stages (§8);
-  thumbnails and embeddings are static and are not offered. The AI title/description and tags fill
-  in with the caption and planner phases (3–4); until then the panel shows EXIF,
-  sources, and embedding status. This is where duplicate paths are seen, since
-  there is no separate duplicates screen.
-- `/organize` — a dropdown of organization principles (date, memories, camera,
-  place) over a list of album cards, each with a cover, title, description, and a
-  strip of its photos. `date` shows a grain sub-selector (day / month / year,
-  default month). Live principles recompute on selection; `memories` reads stored rows and
-  offers a "Rebuild memories" control that queues the background build, showing a
-  live `done/total (%)` indicator (HTMX polling) while it runs and reloading to the
-  finished albums when it completes. The **last-opened organizer and grain are
-  remembered** (a per-owner cookie), so loading `/organize` from the nav returns to
-  the view you last used — memories, place, or a specific date grain — rather than
-  snapping back to the default date view ("never lose the user's place").
-- `/chat` — a normal chat view: a running **conversation history** of questions
-  and their grounded answers, a text **input** at the bottom, a **processing
-  indicator** while the model works, streamed answer tokens, and inline thumbnail
-  citations. History is **persisted** (`chat_sessions`/`chat_messages`, §6) and
-  re-rendered server-side on load, so it survives navigation and restarts; a **New
-  session** button starts a fresh conversation. Each question is grounded
-  independently — retrieval runs per question, and the persisted history is the
-  transcript, not multi-turn model memory. A cited thumbnail opens the photo as a
-  **leaf of the chat grid** (`ctx=chat`, §13.1), so closing it returns to the
-  conversation, not the library. A **"show me a memory"** answer additionally
-  renders that memory as the **same Organize memory card** below the reply; opening
-  a photo from it pages **within the memory** (`ctx=chat-memory:<key>`) and closes
-  back to the conversation (§10, §13.1).
+The app is a **persistent HTMX-boosted shell** — a fixed full-width nav with a live
+resource bar (RAM/CPU always, GPU and board temperatures where readable) over a
+single scrolling `<main>`
+that the four top-level links swap without re-rendering the nav. The routes:
 
-The nav order is **Upload → Library → Chat → Organize**: bring photos in, browse
-and search them, ask about them to understand the collection, then — last, once
-you know what you have — group and reorganize them. Organize is the final stage
-of the process (it feeds stage 2, the on-disk reorg); chat is a
-review-and-understand tool, so it sits before it.
+- **`/upload`** — the folder list (add / delete-from-library, §3.2c), then
+  client-side hashing, transfer, and live per-stage processing progress with
+  per-stage **Reprocess** buttons (§8).
+- **`/export`** — pick a layout, preview the tree, download the manifest, and see the
+  `ivms777-sync` command to run (§12).
+- **`/library`** — infinite-scroll grid with a faceted sidebar (model tags + EXIF
+  facets, apply-on-change), sort, search box, and parsed-filter chips (§9).
+- **`/photo/{id}`** — the one **leaf** view: the photo shown inside the collection it
+  was opened from (`ctx`), its AI title/description, tags, full EXIF (incl. the GPS
+  coordinates, which live only here), source paths, and an async "similar" strip with
+  why-it-matched reasons (§9). All drill-down navigation obeys §13.1.
+- **`/organize`** — a principle dropdown (date grain / camera / place / memories) over
+  album cards; memories has the background Rebuild control; the last-opened view is
+  remembered.
+- **`/chat`** — the persisted conversation with streamed answers and thumbnail
+  citations (§10).
+
+**Per-route detail — the resource-bar internals, the full `/photo` panel, throughput
+readouts — is in [`docs/ui.md`](ui.md).** The nav order **Upload → Library → Chat →
+Organize** follows the workflow: bring photos in, browse, understand, then (last)
+reorganize — Organize feeds stage 2.
 
 ### 13.1 Navigation model (STRICT — every drill-down obeys this)
 
@@ -1867,217 +1169,42 @@ must replace.
 
 ## 14. Code layout
 
-The source uses a **flat layout**: each top-level package sits at the repo root,
-so imports are `from web.app import ...`, `from ingest.receive import ...`. There
-is no wrapping package directory — the repo is `ivms777`, the code is the root.
+The source uses a **flat layout**: each top-level package (`config`, `db`,
+`storage`, `inference`, `embedding`, `ingest`, `organize`, `search`, `albums`,
+`chat`, `web`) sits at the repo root — no wrapping package directory. **The full
+annotated tree is in [`docs/code-layout.md`](code-layout.md).** Two boundaries the
+architecture leans on:
 
-```
-config.py              # pydantic settings, profile selection
-db/
-  schema.sql
-  connection.py        # connect + versioned migrate
-storage/
-  base.py              # Storage protocol
-  local.py
-  keys.py              # content-addressed storage keys
-inference/
-  client.py            # OpenAI-compatible HTTP client (llama-server and vLLM)
-  prompts.py           # caption, planner, chat templates
-  fakes.py
-embedding/
-  base.py              # Embedder protocol, EMBED_DIM
-  vectors.py           # (de)serialize + L2-normalize
-  store.py             # photo_vec read/write + KNN
-  siglip.py            # real SigLIP 2 (torch, runtime only)
-  caption_text.py      # caption-meaning text embedding (task prefixes) (§9)
-  text_embedder.py     # in-process nomic text embedder (torch, models-service only)
-  fakes.py             # deterministic hash-derived vectors for tests
-ingest/
-  receive.py           # verify hash, store original, create photo + source rows
-  exif.py              # full EXIF capture
-  facets.py            # EXIF -> queryable facets
-  geocode.py           # offline reverse geocoding: GPS -> city/country
-
-  thumbs.py
-  embed.py             # embed stage + backfill
-  taxonomy.py          # zero-shot + pixel stats           (plan 04)
-  caption.py           #                                    (plan 05)
-  worker.py            # job queue driver
-  cli.py               # worker entrypoint (python -m ingest.cli)
-organize/              # stage 2, server side                (plan 09)
-  base.py              # Layout protocol
-  date.py / date_tags.py / flat.py
-  manifest.py
-search/
-  semantic.py          # text->vector KNN, similar photos
-  facets.py            # EXIF facet filters + sidebar counts
-  tags.py              # model-tag filters + sidebar counts   (plan 04)
-  keyword.py / fusion.py                                       (plan 04)
-  planner.py                                                   (plan 06)
-albums/                # Organize tab — grouping into described albums
-  base.py              # Album, Organizer protocol
-  by_date.py           # day / month / year grains
-  by_camera.py / by_place.py
-  memories.py          # organizer: reads stored memory groups        (plan 07)
-  memories_build.py    # agentic RAG builder + owner-level worker job  (plan 07)
-  registry.py
-chat/                  #                                     (plan 06)
-  retrieve.py          # off-topic gate + fusion fallback (via core candidates)
-  context.py           # photo ids -> compact grounding block
-  history.py           # persisted chat sessions/messages + answer HTML render
-web/
-  app.py
-  deps.py              # AppContext
-  upload_api.py        # /api/upload/*
-  templates/
-  static/
-    upload.js          # picker, batching, progress
-    hash-worker.js     # Web Worker: SHA-256, one file at a time
-vocab.yaml                                                    (plan 04)
-ivms777_sync/          # stage 2 — separate package, separate entry point (plan 09)
-  cli.py               # plan | apply | undo | verify
-  client.py / scan.py / plan.py / apply.py / journal.py
-compose.yaml
-compose.mac.yaml       # profile overrides
-compose.jetson.yaml
-compose.cloud.yaml
-tests/
-docs/
-```
-
-Both `llama-server` (mac/jetson) and vLLM (cloud) expose an OpenAI-compatible API,
-so one HTTP client covers every profile. Only `base_url` and the model name differ.
-
-`ivms777_sync` imports nothing from `ivms777`. It has no database, no
-Pillow, no models — only the standard library plus `httpx` — so it installs on a
-user's machine in seconds and runs anywhere Python does. The layouts in
-`ivms777/organize/` run server-side to build the manifest; the CLI only
-executes the paths it is given.
+- **One OpenAI-compatible HTTP client** (`inference/client.py`) covers every
+  profile — `llama-server` (mac/jetson) and vLLM (cloud) differ only in `base_url`
+  and model name.
+- **`ivms777_sync` is a standalone package** that imports nothing from `ivms777` —
+  no database, no Pillow, no models, only the stdlib plus `httpx` — so it installs
+  on a user's machine in seconds and runs anywhere Python does.
 
 ## 15. Testing
 
-- Inference and embedding sit behind protocols with deterministic fakes. The
-  fake embedder returns a hash-derived unit vector, so similarity is
-  reproducible. The whole pipeline, search, grouping, and chat context assembly
-  test in milliseconds with no model weights and no network.
-- Fixture images are generated with PIL at test time, including EXIF, so the
-  repository carries no binary test data.
-- Integration tests run the full pipeline over ~20 generated images against a
-  temporary SQLite file with `sqlite-vec` loaded.
-- Repository tests assert that every user-scoped query filters on `owner_id`,
-  including a test that a second owner's photos never appear in the first
-  owner's results.
-- One optional, explicitly-marked test loads the real SigLIP model and asserts
-  that a picture of a beach ranks above a picture of a keyboard for the query
-  "beach". Skipped by default.
-- Route tests use FastAPI's `TestClient` and assert on rendered HTML fragments.
-- Upload is tested end to end through `TestClient`: probe returns only unknown
-  hashes, a body whose bytes do not match the declared hash is rejected, the
-  same file sent twice creates one `photos` row and two `photo_sources` rows.
-- Layouts are pure functions and test as such — a `PhotoView` in, a path out —
-  including collision suffixes, undated photos, and characters illegal on
-  Windows.
-- `ivms777_sync` tests build a real directory tree in `tmp_path` and run
-  `plan` and `apply` against a manifest fixture, then assert the tree matches
-  the expected layout exactly. Every such test also runs `undo` and asserts the
-  tree is byte-identical to how it started.
-- Failure injection covers the paths that can lose data: a crash between
-  journal write and rename, a target that already exists, a file modified
-  between plan and apply, and a cross-filesystem move whose copy is truncated.
+The testing strategy — deterministic fakes, PIL-generated fixtures,
+integration/route/upload tests, `owner_id` scoping tests, and `ivms777_sync`
+plan/apply/undo + failure-injection tests — lives in
+[`docs/testing.md`](testing.md).
 
 ## 16. Phases
 
-| Phase | Delivers |
-|---|---|
-| 0 | Skeleton, config and profiles, compose files, SQLite schema with `sqlite-vec` and FTS5, storage and inference interfaces, fakes, test harness |
-| 1 | Upload — client-side hashing worker, probe endpoint, receive stage, full EXIF capture and facet derivation, thumbnails, `/upload` progress, `/library` grid with EXIF facet filters and sorting, `/duplicates`, caption model bake-off script |
-| 2 | SigLIP embeddings, taxonomy scoring, semantic + facet + keyword + fusion search, similar photos, `/photo` detail |
-| 3 | Captioning stage against the inference service, captions in the UI; the caption stage also emits a per-photo **AI title + description**, and `/photo` renders the full AI panel (title, description, caption, tags) |
-| 4 | Query planner, parsed-filter chips, caption vocabulary mining with tag suggestions |
-| 5 | Memories organizer — agentic RAG builder, persisted `groups(kind='memory')`, `/organize?by=memories` with rebuild (plan 07, done) |
-| 6 | Ask-your-library chat with streaming and citations |
-| 7 | Stage 2 — layouts, `/api/manifest`, `/export` preview, and the `ivms777-sync` CLI with plan, apply, undo, and verify |
-
-Each phase leaves a working, useful application.
-
-Phase 7 is last because the manifest is richer the more the library knows —
-the `date-tags` layout needs taxonomy from phase 2 and captions from phase 3.
-But it depends on nothing after phase 3, so it can be pulled forward if
-reorganizing the disk matters more than chat does.
+The delivery phases (0–7) live in [`docs/roadmap.md`](roadmap.md). Each phase
+leaves a working, useful application; phase 7 (stage-2 sync) is last because the
+manifest is richer the more the library knows, but it depends on nothing after
+phase 3 and can be pulled forward.
 
 ## 17. Risks
 
-| Risk | Mitigation |
-|---|---|
-| SQLite single-writer contention under real multi-user load | WAL plus busy timeout is ample at v1 scale; the repository layer is the only thing that changes if Postgres becomes necessary |
-| SigLIP on CPU makes the `mac` embed pass slow | ~1.5 h one-time for 5,000 photos, and it is a background stage; `cuda` on the other profiles |
-| Jetson 8 GB cannot hold SigLIP and the captioner together | Stages drain library-wide in order, so the two are never resident at once |
-| SigLIP zero-shot scores are poorly calibrated across dimensions | Per-dimension thresholds tuned against a ~100-photo hand-labeled dev set in phase 2 |
-| Chat surfaces an irrelevant photo, or misses a real one | No fixed caption-cosine floor (nomic's baseline makes one meaningless — §4): candidates are a top-k caption-meaning KNN and the agent verifies the shortlist, dropping non-fits and answering empty when none fit. The embedder was chosen by recall/latency benchmark on real captions (§4); the weak agent is the remaining risk, bounded by schema-constrained tool-calls and a "never invent a match" prompt (§10) |
-| Overnight indexing fails silently partway | Per-photo, per-stage job rows; resume on restart; failed files surfaced in the UI |
-| HEIC and RAW files fail to open | `pillow-heif` for HEIC; RAW files are skipped in v1 and logged, not silently dropped |
-| Captions are wrong and mislead chat answers | Chat always renders source thumbnails; captions display their model name |
-| `sqlite-vec` behaves differently across arm64 and x86_64 | Integration tests run the real extension; it ships prebuilt wheels for both |
-| Uploading 5,000 photos is slow and a tab close loses the transfer | Hashes are probed before bytes are sent, so a restart resumes with only what is missing; nothing already received is re-sent |
-| Hashing thousands of files freezes the browser tab | Hashing runs in a Web Worker, one file at a time, never on the main thread |
-| Storing every original fills the disk | Free space is checked before an upload is accepted and the upload is refused with a clear message rather than failing halfway |
-| `ivms777-sync` corrupts or loses photos | Every operation is journaled before it runs and reversed by `undo`; moves are same-filesystem renames where possible and copy-verify-unlink otherwise; nothing is ever deleted, only moved to `_duplicates/` |
-| The library changed on disk since upload, so the plan is stale | `plan` matches by content hash, not path; files whose hash is unknown to the manifest are reported and left untouched |
-| Stage 2 runs against a half-processed library | The manifest carries a `complete` flag; `apply` refuses an incomplete manifest without `--allow-incomplete` |
+The risk register — single-writer contention, 8 GB residency, chat precision,
+resumable indexing, HEIC/RAW handling, `sqlite-vec` portability, and
+`ivms777-sync` data safety — lives in [`docs/risks.md`](risks.md).
 
 ## 18. Future work
 
-- Authentication, signup, and per-user quotas for public access (v02).
-- Face detection and person clustering.
-- Object storage backend behind the existing `Storage` interface.
-- Optional XMP sidecar export so other tools see the tags.
-- Offline reverse geocoding place names — the "By place" organizer names albums
-  by city and a `place_city`/`place_country` sidebar facet filters the library by
-  place (plan 08, done). Future: sub-city neighbourhoods and user-editable labels.
-- Agentic RAG + reranking for chat retrieval (plan 10, **done**). Chat routes the
-  question through the query planner, ranks candidates by caption-meaning cosine
-  (dedicated text embedder `nomic-embed-text`, §4) and takes the **top-k** — no fixed
-  floor — then runs a bounded verify-before-answer agent loop that returns the verified
-  matches or an honest "nothing found", the documented interactive exception to §9.1's
-  "one call" rule (see §10). Still future here: multi-turn conversational memory and a
-  learned reranker model.
-- Postgres and pgvector if concurrent writes become a real constraint.
-- Video support.
-- A watch mode for `ivms777-sync` that uploads new files as they appear.
-- **MCP server exposing the organized library, read-only (plan 11).** The
-  counterpart to stage 2: instead of exporting a change plan to reshape the disk,
-  expose the *organized* library over the Model Context Protocol so an external
-  agent (Claude Desktop, a local agent) reads it live — `search`, ask-your-library,
-  list memories/albums, get a photo with its metadata, get the export plan as a
-  resource. Read-only and single-owner over stdio (no auth, matching §3.2); it
-  goes through the app's read layer only (`app` serves reads, §5) and never writes
-  disk or DB, so "source folders are sacred" (§3.2c) still holds. Hosted,
-  multi-tenant MCP with per-owner tokens waits on the auth work above (v02).
-- User-defined layouts, expressed as a path template over facets and tags.
-- **Chat degradation now covers empty results, not only exceptions (done).** §10's
-  rerank keeps a candidate whose `caption_vec` is not computed yet (signal-unavailable,
-  not floored), so a partially-processed library no longer answers a false "no photos
-  matching". An honest "no sources" now means the candidate pool truly has no caption
-  match. The soft `_narrow` predicate this bullet originally shipped was superseded by
-  plan 12's `hard_filters`/`soft_tags` split (§9.2) — see §10 steps 2–3.
-- **One graceful retriever core shared by search, similar, chat, and memory
-  (done, plan 12).** Retrieval used to be duplicated and inconsistent: similar
-  degraded gracefully by scoring additively; chat's `_narrow` and rerank floor were
-  hard gates that wiped everything when one signal was absent; `/library` search and
-  memory each rolled their own fusion/retrieval calls. All four now sit on **one
-  core**, `search/retriever.py` (§9.2): `candidates()` (fast, no LLM) then `refine()`
-  (hard EXIF/date filter → additive graceful scoring, `search/scoring.py`). `/library`
-  search and `/photo` similar call it directly, no agent, no per-click latency
-  (§9.1) — `similar_photos` is now a thin wrapper over `refine(candidates())`. Chat's
-  `retrieve()` (§10) calls the core's `candidates()` + hard-filter, then ranks the
-  caption vectors itself and takes the top-k (no floor) rather than `refine()`, for the
-  reason §10 explains (the core's fused rank is unconditional content, wrong for a chat
-  seed; honest-empty is the agent's job); its outer
-  "degrade, never crash" fallback (`chat/retrieve.py`) now also routes through the core's
-  `candidates()`, so the last stray fusion is gone — fusion lives in exactly one place.
-  Memory's event-composition `similar` tool (§11) also routes through the core. `/photo` (task
-  3b, **done**) now paints instantly and loads the similar strip asynchronously via
-  `GET /photo/{id}/similar` (§9.2, §13) — first paint never waits on the full-library
-  scan. Still open: splitting that async fragment itself into **phase-1 KNN paint,
-  phase-2 `refine()` swap** (§9.2) — today the fragment runs the whole
-  `refine(candidates())` in one call; the finer two-stage split remains a follow-up.
+The future-work backlog lives in [`docs/roadmap.md`](roadmap.md): auth/quotas
+(v02), face clustering, object storage, XMP export, a read-only MCP server, video
+support, an `ivms777-sync` watch mode, and user-defined layouts — plus the
+already-shipped retrieval-core and chat-degradation items kept there for history.

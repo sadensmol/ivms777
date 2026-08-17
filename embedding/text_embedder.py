@@ -2,19 +2,18 @@
 
 Since plan 16 dropped Ollama, the dedicated text embedder (`nomic-embed-text-v1.5`
 by default) no longer has a server — llama-server holds only the one gemma GGUF.
-So it loads IN-PROCESS in the `models` service (the single model process, §5.1),
-next to SigLIP, and `TextBackend.text_embed` uses it instead of an HTTP backend.
+So the `models` service hosts it itself, in a `TorchWorker` CHILD process (plan 20,
+§8.1) that the registry starts and kills; `TextBackend.text_embed` reaches it over
+that worker's pipe.
 
-Only the `models` service imports this module (via `TextBackend`); `torch` /
-`transformers` are imported LAZILY inside `_load`, so importing
-`embedding.text_embedder` — or `modelsvc.backends` — stays torch-free for
-`app`/`worker` and the test suite. The required `search_query:` /
+Only that child imports this module's torch: `torch`/`transformers` are imported
+LAZILY inside `_load`, so importing `embedding.text_embedder` — or
+`modelsvc.backends` — stays torch-free for `app`/`worker`, the models parent
+process, and the test suite. The required `search_query:` /
 `search_document:` task prefixes are applied by the caller
 (`embedding/caption_text.py`), so this module just encodes + mean-pools +
 L2-normalises.
 """
-
-from functools import lru_cache
 
 
 class TextEmbedder:
@@ -36,9 +35,20 @@ class TextEmbedder:
 
         # nomic's encoder ships custom modeling code (needs `einops`); trust it.
         self._tokenizer = AutoTokenizer.from_pretrained(self._model_name)
+        # `.to()`, NOT `device_map` — unlike SigLIP (§8.1). nomic ships CUSTOM
+        # modeling code (`trust_remote_code`), and accelerate's device_map leaves part
+        # of it behind: measured, `embed_texts` then dies with "index is on cuda:0,
+        # different from other tensors on cpu". `.to()` costs a host copy that is
+        # never freed, but this child measures ~1.3 GB total — a fraction of the
+        # 2.2 GB the same trap costs SigLIP, and correctness wins.
         self._model = AutoModel.from_pretrained(
             self._model_name, trust_remote_code=True
         ).to(self._device).eval()
+
+    def warm(self) -> None:
+        """Load now, so a worker's `start()` means the model is really resident —
+        the governor's budget assumes it — instead of loading on first use."""
+        self._load()
 
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
         import torch
@@ -56,10 +66,3 @@ class TextEmbedder:
         counts = mask.sum(dim=1).clamp(min=1e-9)
         pooled = torch.nn.functional.normalize(summed / counts, p=2, dim=1)
         return pooled.cpu().tolist()
-
-
-@lru_cache
-def get_text_embedder(model_name: str, device: str) -> TextEmbedder:
-    """Cached so the encoder loads once per (model, device) and is reused across
-    requests — mirrors `embedding.siglip.get_siglip_embedder`."""
-    return TextEmbedder(model_name, device)

@@ -13,12 +13,8 @@ CAPTION_SCHEMA = {
         "caption": {"type": "string"},
         "title": {"type": "string"},
         "description": {"type": "string"},
-        "tags": {
-            "type": "object",
-            "additionalProperties": {"type": "array", "items": {"type": "string"}},
-        },
     },
-    "required": ["caption", "title", "description", "tags"],
+    "required": ["caption", "title", "description"],
 }
 
 _DEFAULT_SYSTEM = (
@@ -31,29 +27,24 @@ _DEFAULT_SYSTEM = (
 _SYSTEM_BY_MODEL: dict[str, str] = {}
 
 
-def _user_text(dimensions: list[str]) -> str:
-    dims = ", ".join(dimensions)
+def _user_text() -> str:
     return (
         "Return a JSON object describing this photo with these keys:\n"
         '- "caption": one plain sentence describing the photo.\n'
         '- "title": a short title, 3-6 words.\n'
         '- "description": one or two sentences of extra detail.\n'
-        f'- "tags": an object mapping any of these dimensions to a list of labels '
-        f"that clearly apply: {dims}. Omit a dimension if none apply.\n"
         "Reply with ONLY the JSON object."
     )
 
 
-def caption_messages(
-    model: str, image_data_uri: str, dimensions: list[str]
-) -> list[ChatMessage]:
+def caption_messages(model: str, image_data_uri: str) -> list[ChatMessage]:
     system = _SYSTEM_BY_MODEL.get(model, _DEFAULT_SYSTEM)
     return [
         {"role": "system", "content": system},
         {
             "role": "user",
             "content": [
-                {"type": "text", "text": _user_text(dimensions)},
+                {"type": "text", "text": _user_text()},
                 {"type": "image_url", "image_url": {"url": image_data_uri}},
             ],
         },
@@ -128,4 +119,51 @@ def general_chat_messages(question: str) -> list[ChatMessage]:
     return [
         {"role": "system", "content": _GENERAL_SYSTEM},
         {"role": "user", "content": question},
+    ]
+
+
+# Guardrails ON (§10): a fixed, model-free refusal for a question the router
+# classified as NOT about the user's photos/memories. Streamed verbatim — no lease,
+# no generation, no search.
+GUARDRAIL_REFUSAL = (
+    "I can only answer questions about your photos and this app — finding photos, "
+    "memories, counts, or how the library works. Ask me about those."
+)
+
+
+# Direct answers OFF (§10): the fully-agentic loop already gathered REAL facts
+# (count/memories/periods lines) and candidate photos; this final call turns them
+# into the streamed answer. Unlike `_CHAT_SYSTEM` it must state a count even when no
+# photo is cited (a "how many" answer has a number, not a thumbnail).
+_AGENTIC_ANSWER_SYSTEM = (
+    "You answer a question about a personal photo library using ONLY the gathered "
+    "data below. It has TWO kinds of lines and you MUST treat them differently.\n"
+    "FACT lines — 'count: N ...', 'memories: ...', 'month(s)/year(s) with photos: N' "
+    "— are REAL values already computed for you. State the number or the list in a "
+    "natural sentence. A count is a QUANTITY, never a photo id: 'count: 1' means one "
+    "photo EXISTS, it is NOT photo number 1.\n"
+    "PHOTO blocks — each starts with its OWN '[photo:ID]' tag, then that photo's "
+    "date/caption/tags — are the ONLY things you may cite. Copy a block's exact "
+    "'[photo:ID]' tag, and only for a photo whose caption/tags answer the question.\n"
+    "HARD RULE: a [photo:...] citation may come ONLY from a PHOTO block above. If the "
+    "gathered data has NO photo blocks, your answer MUST NOT contain '[photo:' at "
+    "all — a bare count line is not a photo.\n"
+    "Never invent a subject, id, number, or date not written below. If nothing "
+    "answers the question, say so plainly.\n"
+    "Examples:\n"
+    "Gathered: 'count: 1 photo(s) matching \"dog\"' → 'You have 1 photo of a dog.' "
+    "(NO citation — there is no photo block)\n"
+    "Gathered: 'count: 206 photo(s) in the library' → 'You have 206 photos.' (no "
+    "citation)\n"
+    "Gathered: '[photo:178] caption: A dog on a rooftop' → 'Here is your dog photo: "
+    "[photo:178].'"
+)
+
+
+def agentic_answer_messages(question: str, gathered_block: str) -> list[ChatMessage]:
+    """Final grounded answer for the fully-agentic direct-OFF path (§10): answer from
+    the gathered fact lines + photo context, cite photos as [photo:ID]."""
+    return [
+        {"role": "system", "content": _AGENTIC_ANSWER_SYSTEM},
+        {"role": "user", "content": f"Gathered:\n{gathered_block}\n\nQuestion: {question}"},
     ]

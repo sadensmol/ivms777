@@ -13,7 +13,7 @@ so a wrong phrasing degrades to the agent, never to a confidently-wrong answer.
 import pytest
 
 from albums.memory_store import Memory, replace_memories
-from chat.agent import direct_answer
+from chat.agent import _count_subject, direct_answer
 from tests.factories import add_photo
 
 
@@ -36,6 +36,8 @@ DIRECT = [
     "how many photos do I have?",
     "how many images in my libray?",              # typo
     "total number of pics",
+    "what total photos do I have?",               # "total <photoword>", no "how many"
+    "total photos",
     "how many photos do I have in total?",
     "how many photos altogether",
     # subject count
@@ -68,6 +70,23 @@ AGENT = [
     "how many photos are in my Borjomi memory?",  # photos-in-a-memory != memory count
     "do I have any photos of cats?",
 ]
+
+
+# The narrowing subject must be the real FTS term, whichever preposition (or the
+# count-intent "number of") introduces it — a stray leading "with"/"of" leaked from
+# "number of photos with X" makes the keyword count 0 (the "with dog" -> 0 bug).
+COUNT_SUBJECT = [
+    ("how many photos with dogs", "dogs"),
+    ("number of beach photos", "beach"),
+    ("how many photos of my car", "car"),
+    ("what number of photos with dog?", "dog"),     # "number of" + trailing "with"
+    ("count of photos with my cat", "cat"),
+]
+
+
+@pytest.mark.parametrize(("question", "subject"), COUNT_SUBJECT)
+def test_count_subject_is_the_bare_term(question, subject):
+    assert _count_subject(question) == subject
 
 
 @pytest.mark.parametrize("question", DIRECT)

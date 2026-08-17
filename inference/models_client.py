@@ -33,10 +33,8 @@ class ModelsClient:
         response.raise_for_status()
         return response.json()
 
-    def caption(
-        self, image: bytes, dimensions: list[str], *, timeout: float = 120.0
-    ) -> dict:
-        payload = {"image": base64.b64encode(image).decode(), "dimensions": dimensions}
+    def caption(self, image: bytes, *, timeout: float = 120.0) -> dict:
+        payload = {"image": base64.b64encode(image).decode()}
         response = self._client.post("/caption", json=payload, timeout=timeout)
         response.raise_for_status()
         return response.json()
@@ -48,10 +46,16 @@ class ModelsClient:
         *,
         json_schema: dict | None = None,
         timeout: float = 120.0,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> str:
         payload: dict = {"model": model, "messages": messages}
         if json_schema is not None:
             payload["json_schema"] = json_schema
+        if temperature is not None:
+            payload["temperature"] = temperature
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
         response = self._client.post("/text/complete", json=payload, timeout=timeout)
         response.raise_for_status()
         return response.json()["text"]
@@ -97,3 +101,16 @@ class ModelsClient:
         response = self._client.get("/resources", timeout=timeout)
         response.raise_for_status()
         return response.json()
+
+    def models_state(self, *, timeout: float = 10.0) -> dict:
+        response = self._client.get("/models", timeout=timeout)
+        response.raise_for_status()
+        return response.json()
+
+    def model_ensure(self, name: str, *, timeout: float = 120.0) -> None:
+        response = self._client.post(f"/models/{name}/ensure", timeout=timeout)
+        response.raise_for_status()
+
+    def model_unload(self, name: str, *, timeout: float = 30.0) -> None:
+        response = self._client.post(f"/models/{name}/unload", timeout=timeout)
+        response.raise_for_status()
