@@ -25,8 +25,42 @@ by design: one photo may sit in one event and several themes, which `group_photo
    memory, or several chapters, or skip — pulling extra context on demand via bounded
    tools (similar photos, facet lookups, photos nearby in time, same-subject
    retrieval) so it can reach *across* sessions when an event spans a pool boundary.
-   It returns each memory as `{title, description, photo_ids[]}`, grounded only in the
-   data.
+   It returns each memory as `{title, description, photo_ids[]}`.
+
+   **The place in a summary is a NAME, never coordinates** — `Borjomi, Georgia`, read
+   from the `place_city`/`place_country` facets (§6.2); a photo whose place cannot be
+   named reads "place unknown". Raw lat/long used to be passed straight through, and a
+   small model can neither recognise nor hide it, so it produced titles like
+   "Activities in a location on December 1, 2023" and descriptions ending "at
+   coordinates 42.17, 42.93" (design §11: a place is a name a person recognises;
+   coordinates live on `/photo` alone).
+
+   **The summary also carries the day's spine, from EXIF** — a single `Facts —
+   When: 2023-11-25, Saturday, morning · Where: Tbilisi, Georgia · Camera: …` line per
+   cluster, from the facets stage (§6.2). The captions say what is in a frame; this
+   says what the day *was*, and it is what turns "photos of a street" into "a Saturday
+   morning in Tbilisi". **Technical tag dimensions are withheld** (`composition`,
+   `palette`, `quality`): fed "sharp, top-down, pastel" the model wrote them into the
+   prose ("a moment filled with sharp, joyful holiday cheer") and they crowded out the
+   tags that carry meaning.
+
+   **Voice — this is written for the person whose life it is.** The title is short and
+   warm and names the place ("A winter day in Borjomi"); the description is 2-4
+   sentences about the day as one whole — never a per-photo list ("another view
+   shows…", "There were scenes of…").
+
+   **Warmth never buys invention.** A 2B model told to be warm fills in the humans it
+   expects: two photos of a birthday cake became "Friends gathered around the sweet
+   treats". So the rule is hard — **only people a caption mentions may appear, described
+   as the caption describes them; if no caption mentions a person, the memory has no
+   people in it** (no friends, family, guests, "everyone", "we", "you"). Warmth comes
+   from the real place, light, season, and occasion. Tags are hints, not words to
+   quote: a `summer` tag on a November day loses to the date. The one thing the model
+   may add from its own knowledge is a **short, well-known touch about a place the
+   summaries already name** (its mountains, its old town) — the thing a bigger model
+   did for free and a 2B one must be told to do. Examples in the prompt are shapes to
+   follow, never words to copy: the example title "Christmas at home in Tbilisi" was
+   pasted verbatim onto outdoor photos, so no example carries a setting any more.
 3. **Discover themes (agent + RAG).** Separately, an agent proposes recurring threads
    — a subject that appears often (the dog), a place, an occasion, a season — and for
    each **retrieves** candidate photos (semantic + tag + facet) then curates the set.

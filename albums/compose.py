@@ -18,10 +18,40 @@ _SYSTEM_PROMPT = (
     "When ready, answer with "
     '{\"action\":\"answer\",\"keep\":<bool>,\"title\":\"...\",\"description\":\"...\",'
     '\"drop_photo_ids\":[...]}. '
-    "The title and description must use ONLY facts in the summaries — real dates, "
-    "the place, what the captions show. Never invent people, names, or events. If "
-    "the photos are unrelated (they merely happened close in time), set keep=false. "
-    "Drop any photo that does not belong via drop_photo_ids."
+    "You are writing for the person whose life this is — they should read it and "
+    "want to open it. "
+    'TITLE: short and warm, and it NAMES THE PLACE when there is one — "A winter '
+    'day in Borjomi" is the SHAPE to follow, not words to copy. Never "Activities", '
+    'never "a location" or "an indoor setting", never coordinates. Put nothing in '
+    "the title that the summaries do not show — if they never say the photos are at "
+    'home, in a cafe, or in a museum, the title does not say it either. '
+    "DESCRIPTION: 2-4 sentences of warm, plain storytelling about WHAT IS IN THESE "
+    "PHOTOS — the place, the day, the things that are actually there. Write about "
+    "the DAY as one whole, never frame by frame: no \"another photo shows\", no "
+    '"a third view", no "these photos capture", no "There were scenes of…". Say it '
+    "as it happened — a girl by the window in the morning, later blankets and a "
+    "seascape — never the same sentence shape twice. "
+    "PEOPLE — the hard rule. Mention only people the captions mention, described the "
+    'way the captions describe them ("a young girl", "two people"). If no caption '
+    "mentions a person, THERE ARE NO PEOPLE IN THIS MEMORY: write about the cake, "
+    "the street, the light — and never about friends, family, guests, everyone, we, "
+    "or you. Two photos of a cake are two photos of a cake, however warm the day. "
+    "Warmth comes from the real place, light, season and occasion — never from "
+    "people, feelings or doings you added yourself. "
+    "Tags are hints, not words to quote: when a tag contradicts the date or the "
+    'captions (a "summer" tag on a November day), trust the date and the captions. '
+    "Invent no names and no relationships. When a real town or country is named you "
+    "MAY add one short, well-known touch about it (its mountains, its old town, what "
+    "it is known for) — that is the only thing you may bring from your own "
+    "knowledge. "
+    "keep=true whenever the photos hang together — then write the title and the "
+    "description. Photos from the same day in the same town are one memory unless "
+    "they are truly unrelated; WHEN IN DOUBT, KEEP. To skip, reply exactly "
+    '{"action":"answer","keep":false} and nothing else — never an empty value like '
+    '"title":, which is not valid JSON. '
+    "drop_photo_ids is USUALLY EMPTY: it lists only the odd photo that does not "
+    "belong. The memory keeps every photo you do not drop, so NEVER list them all — "
+    "listing every id throws the whole memory away."
 )
 
 # The prompt must fit the SMALLEST context we run: jetson's `llm_ctx: 2048` (§3.1,
@@ -33,6 +63,12 @@ _SYSTEM_PROMPT = (
 # cap only bites on pathological ones.
 MAX_SUMMARY_PHOTOS = 24
 MAX_CAPTION_CHARS = 160
+
+# Tag dimensions that describe the PICTURE, not the day. Fed "sharp, top-down,
+# pastel" the model wrote them into the story ("a moment filled with sharp, joyful
+# holiday cheer"), and they crowd out the four tag slots that carry meaning. The
+# agent gets subject/setting/occasion/season/emotion/vibe/light only.
+SKIPPED_TAG_DIMENSIONS = ("composition", "palette", "quality")
 
 
 def compose_memory(
@@ -51,9 +87,10 @@ def compose_memory(
     Returns a Memory when the agent keeps the candidate, or None when it skips
     it, drops it below two photos, or emits output we cannot use.
     """
+    facts = _cluster_facts(conn, owner_id, candidate.photo_ids)
     messages: list[ChatMessage] = [
         {"role": "system", "content": _SYSTEM_PROMPT},
-        {"role": "user", "content": _summarise(conn, owner_id, candidate.photo_ids)},
+        {"role": "user", "content": facts + _summarise(conn, owner_id, candidate.photo_ids)},
     ]
     for round_no in range(max_rounds + 1):
         force_answer = round_no == max_rounds
@@ -94,23 +131,22 @@ def _summarise(
     """
     lines: list[str] = []
     omitted = max(0, len(photo_ids) - limit)
-    for photo_id in photo_ids[:limit]:
+    shown = photo_ids[:limit]
+    places = _place_names(conn, shown)
+    for photo_id in shown:
         photo = conn.execute(
-            "SELECT shot_at, gps_lat, gps_lon, caption FROM photos WHERE id = ? AND owner_id = ?",
+            "SELECT shot_at, caption FROM photos WHERE id = ? AND owner_id = ?",
             (photo_id, owner_id),
         ).fetchone()
         if photo is None:
             continue
-        place = (
-            f"{photo['gps_lat']:.2f},{photo['gps_lon']:.2f}"
-            if photo["gps_lat"] is not None and photo["gps_lon"] is not None
-            else "no location"
-        )
+        place = places.get(photo_id, "place unknown")
         tags = ", ".join(
             r["label"] for r in conn.execute(
                 "SELECT t.label FROM photo_tags pt JOIN tags t ON t.id = pt.tag_id"
-                " WHERE pt.photo_id = ? ORDER BY pt.score DESC LIMIT 4",
-                (photo_id,),
+                f" WHERE pt.photo_id = ? AND t.dimension NOT IN ({_marks(list(SKIPPED_TAG_DIMENSIONS))})"
+                " ORDER BY pt.score DESC LIMIT 4",
+                (photo_id, *SKIPPED_TAG_DIMENSIONS),
             )
         )
         caption = (photo["caption"] or "")[:MAX_CAPTION_CHARS]
@@ -124,6 +160,96 @@ def _summarise(
         # is only this big" and judge coherence on a partial view.
         summary += f"\n(+{omitted} more photos in this cluster, not listed)"
     return summary
+
+
+def _cluster_facts(conn: sqlite3.Connection, owner_id: int, photo_ids: list[int]) -> str:
+    """The 'When / Where / Camera' spine of the whole cluster, from EXIF (§6.2).
+
+    The per-photo lines say what is IN each frame; this says what the day WAS —
+    the date(s), the weekday and the part of day, the town, the camera. It is read
+    from the EXIF facets the ingest stage already derives, which the agent
+    otherwise never sees, and it is what turns "photos of a street" into "a Sunday
+    afternoon in Tbilisi". One line per cluster, so it costs ~30 tokens.
+    """
+    dates = sorted(
+        {
+            row["shot_at"][:10]
+            for row in conn.execute(
+                f"SELECT shot_at FROM photos WHERE owner_id = ?"
+                f" AND id IN ({_marks(photo_ids)}) AND shot_at IS NOT NULL",
+                (owner_id, *photo_ids),
+            )
+        }
+    )
+    facets = _facet_values(conn, photo_ids, ("weekday", "time_of_day", "camera_model"))
+    parts = []
+    if dates:
+        when = dates[0] if len(dates) == 1 else f"{dates[0]} to {dates[-1]}"
+        if len(dates) == 1:
+            # A single day earns its weekday and its part of the day; a multi-day
+            # cluster does not — "Friday, afternoon" would be a lie about the rest.
+            when += "".join(
+                f", {facets[key][0]}" for key in ("weekday", "time_of_day") if facets.get(key)
+            )
+        parts.append(f"When: {when}")
+    places = sorted(set(_place_names(conn, photo_ids).values()))
+    if places:
+        parts.append(f"Where: {'; '.join(places[:3])}")
+    if facets.get("camera_model"):
+        parts.append(f"Camera: {'; '.join(facets['camera_model'][:2])}")
+    return ("Facts — " + " · ".join(parts) + "\n") if parts else ""
+
+
+def _marks(values: list[int]) -> str:
+    return ",".join("?" * len(values))
+
+
+def _facet_values(
+    conn: sqlite3.Connection, photo_ids: list[int], keys: tuple[str, ...]
+) -> dict[str, list[str]]:
+    """key -> its distinct values across the cluster, most common first."""
+    if not photo_ids:
+        return {}
+    rows = conn.execute(
+        f"SELECT key, value_text, count(*) AS n FROM photo_facets"
+        f" WHERE photo_id IN ({_marks(photo_ids)})"
+        f" AND key IN ({','.join('?' * len(keys))}) AND value_text IS NOT NULL"
+        " AND value_text != '' GROUP BY key, value_text ORDER BY n DESC",
+        (*photo_ids, *keys),
+    )
+    values: dict[str, list[str]] = {}
+    for row in rows:
+        values.setdefault(row["key"], []).append(row["value_text"])
+    return values
+
+
+def _place_names(conn: sqlite3.Connection, photo_ids: list[int]) -> dict[int, str]:
+    """photo_id -> "Borjomi, Georgia" from the reverse-geocoded facets (§6.2, §11).
+
+    **The agent is never given raw coordinates.** The facets stage already resolves
+    every GPS point to a real place offline, and a small model cannot: fed
+    `41.68,44.86` it wrote titles like "Activities in a location on December 1" and
+    descriptions ending "at coordinates 42.17, 42.93". Design §11 is explicit that a
+    place is a name a person recognises and bare lat/long belongs on `/photo` only,
+    so a photo whose place cannot be named is simply "place unknown" here.
+    """
+    if not photo_ids:
+        return {}
+    marks = ",".join("?" * len(photo_ids))
+    rows = conn.execute(
+        "SELECT photo_id, key, value_text FROM photo_facets"
+        f" WHERE photo_id IN ({marks}) AND key IN ('place_city', 'place_country')",
+        tuple(photo_ids),
+    )
+    parts: dict[int, dict[str, str]] = {}
+    for row in rows:
+        if row["value_text"]:
+            parts.setdefault(row["photo_id"], {})[row["key"]] = row["value_text"]
+    names: dict[int, str] = {}
+    for photo_id, place in parts.items():
+        ordered = [place[key] for key in ("place_city", "place_country") if key in place]
+        names[photo_id] = ", ".join(ordered)
+    return names
 
 
 def _run_tool(

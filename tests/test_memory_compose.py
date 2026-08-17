@@ -127,6 +127,85 @@ def test_an_overlong_caption_is_clipped(conn):
     assert "x" * (MAX_CAPTION_CHARS + 1) not in client.calls[0][1][1]["content"]
 
 
+def _facet(conn, photo_id, key, value):
+    conn.execute(
+        "INSERT INTO photo_facets(photo_id, key, value_text) VALUES (?, ?, ?)",
+        (photo_id, key, value),
+    )
+
+
+def test_the_summary_names_the_place_instead_of_coordinates(conn):
+    # Fed "41.84,43.39" the model wrote "Activities in a location" and put raw
+    # coordinates in the description. The facets stage already knows the name.
+    for pid in (1, 2, 3):
+        _photo(conn, pid, shot_at="2023-12-01T12:00:00", gps_lat=41.84, gps_lon=43.39)
+        _facet(conn, pid, "place_city", "Borjomi")
+        _facet(conn, pid, "place_country", "Georgia")
+    client = FakeInferenceClient([_ANSWER])
+    compose_memory(conn, client, "planner", 1, Candidate([1, 2, 3]), signature="s")
+
+    prompt = client.calls[0][1][1]["content"]
+    assert "Borjomi, Georgia" in prompt
+    assert "41.84" not in prompt and "43.39" not in prompt
+
+
+def test_a_photo_without_a_place_name_never_leaks_its_coordinates(conn):
+    # GPS but no resolved facet (ingested before the place backfill): the agent gets
+    # nothing rather than a number it would copy into the story.
+    for pid in (1, 2):
+        _photo(conn, pid, shot_at="2023-12-01T12:00:00", gps_lat=41.84, gps_lon=43.39)
+    client = FakeInferenceClient([_ANSWER])
+    compose_memory(conn, client, "planner", 1, Candidate([1, 2]), signature="s")
+
+    prompt = client.calls[0][1][1]["content"]
+    assert "place unknown" in prompt
+    assert "41.84" not in prompt
+
+
+def _tag(conn, photo_id, dimension, label, score=0.9):
+    conn.execute("INSERT OR IGNORE INTO tags(dimension, label) VALUES (?, ?)", (dimension, label))
+    tag_id = conn.execute(
+        "SELECT id FROM tags WHERE dimension = ? AND label = ?", (dimension, label)
+    ).fetchone()["id"]
+    conn.execute(
+        "INSERT INTO photo_tags(photo_id, tag_id, score, source) VALUES (?, ?, ?, 'model')",
+        (photo_id, tag_id, score),
+    )
+
+
+def test_the_summary_carries_the_when_where_and_camera_of_the_cluster(conn):
+    # The captions say what is in the frame; EXIF says what the day was.
+    for pid in (1, 2):
+        _photo(conn, pid, shot_at="2023-11-05T15:21:57")
+        _facet(conn, pid, "place_city", "Tbilisi")
+        _facet(conn, pid, "weekday", "Sunday")
+        _facet(conn, pid, "time_of_day", "afternoon")
+        _facet(conn, pid, "camera_model", "iPhone SE (2nd generation)")
+    client = FakeInferenceClient([_ANSWER])
+    compose_memory(conn, client, "planner", 1, Candidate([1, 2]), signature="s")
+
+    prompt = client.calls[0][1][1]["content"]
+    assert "When: 2023-11-05, Sunday, afternoon" in prompt
+    assert "Where: Tbilisi" in prompt
+    assert "Camera: iPhone SE (2nd generation)" in prompt
+
+
+def test_technical_tags_never_reach_the_story(conn):
+    # "sharp"/"pastel" describe the picture, not the day — the model wrote them into
+    # the prose ("a moment filled with sharp, joyful holiday cheer").
+    for pid in (1, 2):
+        _photo(conn, pid, shot_at="2023-12-25T10:00:00")
+        _tag(conn, pid, "quality", "sharp", 0.99)
+        _tag(conn, pid, "palette", "pastel", 0.98)
+        _tag(conn, pid, "occasion", "christmas", 0.5)
+    client = FakeInferenceClient([_ANSWER])
+    compose_memory(conn, client, "planner", 1, Candidate([1, 2]), signature="s")
+
+    prompt = client.calls[0][1][1]["content"]
+    assert "christmas" in prompt
+    assert "sharp" not in prompt and "pastel" not in prompt
+
+
 def test_a_failing_model_call_skips_the_candidate_instead_of_raising(conn):
     # The catch used to list only the parse errors, so an httpx.HTTPStatusError (a
     # 500 from /text/complete) escaped compose_memory, propagated through
