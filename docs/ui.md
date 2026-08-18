@@ -48,6 +48,34 @@ model; this file is the per-route detail. Section references point into
   it alone knows. When it is unreachable those degrade to "no model info" and every
   other field is unaffected.
 
+## Settings popup (⚙) — model slots
+
+A **⚙ button sits in the nav, immediately after the resource bar**, on every page.
+It opens a modal `<dialog>` whose body is fetched from `GET /settings/models` — an
+overlay, not a route: no URL change, no history entry, so design §13.1 is untouched
+and Esc/backdrop/× just closes it.
+
+- **One section per slot** (design §4.1) — Image embeddings, Caption text
+  embeddings, Captions, Planner & chat — each naming what the slot does in one line
+  and listing its catalog entries as radios, with the **currently active one
+  checked**. A slot the profile pins (all four on `cloud`) renders read-only with
+  the reason.
+- **Each entry shows** display name, download size, resident RAM cost — suffixed
+  **"estimated"** when `cost_measured` is false — and its state: **on disk**, a
+  **live progress bar** (`bytes / total`, polled ~1 s while any download is in
+  flight, otherwise not polled at all), or **Download** for one not yet fetched. A
+  failed download shows the error and offers a retry; nothing else in the dialog is
+  blocked by it.
+- **Selecting a different entry does not switch anything.** It reveals the
+  consequence line — "Switching re-runs *embed, taxonomy* for **4,812 photos**"
+  (the count comes from `jobs`), plus "search results will be incomplete until it
+  finishes" for the two embedder slots — and enables a single **Switch** button.
+  `planner` has no consequence line: it stores nothing.
+- **Switch** is disabled while the model is not on disk. Pressing it POSTs, and the
+  dialog re-renders with the new selection active; the requeued work then shows up
+  in the ordinary per-stage progress rows on `/upload` (§8) and in the resource bar,
+  not in the dialog — the dialog is not a job monitor.
+
 ## Routes
 
 - `/upload` — leads with the **folder list**: every folder in the library (§3.2c)

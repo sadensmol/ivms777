@@ -1,18 +1,74 @@
-# Models — roles, backends, and the caption-embedding decision
+# Models — slots, the catalog, backends, and the caption-embedding decision
 
-The exact model roster, per-profile backends, download mechanics, and the
-settled caption-embedding decision. Design §4 carries the selection *narrative*
-and *why*; this file is the exact wiring. All of these run inside the one
-`models` service (design §5.1), loaded once — never in `app`/`worker`.
+The exact model slots, the selectable catalog, per-profile backends, download
+mechanics, and the settled caption-embedding decision. Design §4/§4.1 carries the
+selection *narrative* and *why*; this file is the exact wiring. All of these run
+inside the one `models` service (design §5.1), loaded once — never in
+`app`/`worker`.
 
-## Roles → models → backend
+## Slots → default model → backend
 
-| Role | Model | Backend (inside the `models` service) |
-|---|---|---|
-| Image and text embeddings, zero-shot tags | SigLIP 2 `so400m-patch14-384` | in-process `transformers` — CPU (mac) / CUDA (jetson) |
-| Captions (caption sentence only — no tags) | `gemma4-E2B` GGUF (mac/jetson) · `qwen2.5vl:7b` (cloud) | OpenAI `/v1` call to `llama-server` (mac/jetson) / vLLM (cloud) |
-| Query planning, chat answers | `gemma4-E2B` GGUF (mac/jetson) · `qwen2.5:3b` (cloud) | OpenAI `/v1` call to `llama-server` (mac/jetson) / vLLM (cloud) |
-| Caption text embeddings (§9 similar) | `nomic-embed-text-v1.5` (dedicated text embedder) | **in-process** `transformers` — CPU (mac) / CUDA (jetson) |
+| Slot | Default model | Backend (inside the `models` service) | Residency unit |
+|---|---|---|---|
+| `image_embed` — image and text embeddings, zero-shot tags | SigLIP 2 `so400m-patch14-384` | `TorchWorker` child, `transformers` — CPU (mac) / CUDA (jetson) | `image_embed` |
+| `caption` — captions (caption sentence only — no tags) | `gemma4-E2B` GGUF (mac/jetson) · `qwen2.5vl:7b` (cloud) | OpenAI `/v1` call to `llama-server` (mac/jetson) / vLLM (cloud) | `llm_vision` |
+| `planner` — query planning, chat answers | `gemma4-E2B` GGUF (mac/jetson) · `qwen2.5:3b` (cloud) | OpenAI `/v1` call to `llama-server` (mac/jetson) / vLLM (cloud) | `llm` |
+| `text_embed` — caption text embeddings (§9 similar) | `nomic-embed-text-v1.5` (dedicated text embedder) | `TorchWorker` child, `transformers` — CPU (mac) / CUDA (jetson) | `text_embed` |
+
+Each slot is switchable at runtime from the settings popup (design §4.1, §13);
+the table gives the defaults. `caption` and `planner` share one `llama-server`
+child, so their two residency units are mutually exclusive.
+
+## The catalog
+
+`models/catalog.py` — plain data, no torch import, the single source of every
+selectable model. Fields per entry: `slot`, `key`, `display`, `source`
+(HF repo id, or GGUF repo + file + mmproj file), `size_mb` (download),
+`cost_mb` + `cost_measured` (resident cost for the governor; `False` means an
+estimate, shown as unverified in the UI), `dim` (embedders), `preprocess`
+(`input_px`, `resample`, `mode: squash|native`, image embedder only),
+`prompt_template` (LLM slots), and `profiles` (which profiles may offer it).
+
+What ships:
+
+| Slot | Entries |
+|---|---|
+| `image_embed` | `siglip2-so400m-384` (default) · `siglip2-so400m-512` |
+| `text_embed` | `nomic-1.5` (default) · `embeddinggemma-300m` · `qwen3-embed-0.6b` |
+| `caption` | `gemma4-E2B` (default) · `qwen3-vl-4b` · `qwen3-vl-8b` (mac) |
+| `planner` | `gemma4-E2B` (default) · `qwen3-4b-2507` · `qwen3-vl-8b` (mac) |
+
+Everything beyond the defaults carries an **estimated** `cost_mb` until it is
+measured on the board the way §8.1 requires (the drop in
+`psutil.virtual_memory().available` across a load). Until then the settings popup
+labels it unverified, and `test_every_model_fits_its_profile_budget` still refuses
+to offer any entry whose `cost_mb + headroom` exceeds the profile budget.
+
+A free-form "type any HF id" field is deliberately **not** offered: `cost_mb`,
+`dim` and `preprocess` cannot be discovered at runtime, and each breaks something
+different when wrong (OOM / unloadable slot, an unusable vector table, silently
+degraded embeddings).
+
+## Switching a slot
+
+`app` owns the choice (`app_settings`, one row per slot) and resolves
+**stored → env override → profile default**. On confirm, in one transaction:
+write the choice → rebuild `photo_vec` if the new `image_embed` `dim` differs →
+`jobs.reprocess()` over the slot's invalidated range — `image_embed`:
+`embed`→`taxonomy`, `text_embed`: `caption_embed`, `caption`:
+`caption`→`caption_embed`, `planner`: nothing. Then `PUT /models/slots` to the
+service, which evicts the outgoing resident and re-registers the slot; the next op
+loads the new model.
+
+The `models` service has no DB. It boots on profile defaults and reports a
+`generation` with its slots; `app` re-pushes when the resource-bar poll shows a
+generation it did not set, so a `models` restart converges without a shared store.
+
+**Preprocessing follows the model.** `GET /embed/spec` returns calibration *and*
+the selected image embedder's `preprocess`; `RemoteEmbedder` caches it and resizes
+by it (`squash` = stretch to `input_px`², today's behaviour; `native` = fit inside
+`input_px`, aspect kept, for NaFlex/native-resolution encoders). No caller holds a
+resolution constant.
 
 Since plan 16, captioning and text generation are the **same** `gemma4-E2B` GGUF on
 `llama-server` (mac/jetson) — one model, text + vision, on the GPU. Captioning goes
@@ -87,11 +143,21 @@ consumed as **top-k KNN** (never a fixed cosine floor).
 
 ## Model download
 
-On `mac`/`jetson`, the gemma GGUF (+ mmproj) is fetched once into a volume/dir — by
-the `inference` container's entrypoint on jetson, by `make llama-mac` on mac (design
-§3.1). SigLIP and the nomic text embedder are fetched from Hugging Face into a
-mounted cache the first time they are used. On `cloud`, vLLM fetches its model from
-Hugging Face. All these caches survive restarts.
+On `mac`/`jetson`, the default gemma GGUF (+ mmproj) is fetched once into a
+volume/dir — by the `inference` container's entrypoint on jetson, by `make
+llama-mac` on mac (design §3.1). SigLIP and the nomic text embedder are fetched
+from Hugging Face into a mounted cache the first time they are used. On `cloud`,
+vLLM fetches its model from Hugging Face. All these caches survive restarts.
+
+**Any other catalog entry is fetched on demand by the `models` service**
+(`modelsvc/downloads.py`): `POST /models/download` starts a background thread —
+`huggingface_hub.snapshot_download` for a transformers model, a streaming GET for a
+GGUF (+ its mmproj) into the same `/data/models` dir `llama-server` is pointed at.
+Progress (`bytes`/`total`, plus a terminal `error`) is kept in a thread-safe dict
+and read back through `GET /models/catalog`, which is what the settings popup polls.
+"Already downloaded" is a probe of the cache path, not a flag — a manually placed
+GGUF counts. Downloads never run inside a request, and a download in flight never
+blocks inference: it holds no scheduler slot and loads nothing.
 
 ## Bake-off gate
 

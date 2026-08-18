@@ -75,97 +75,111 @@ pipeline:
 
 | A photo has… | Similar is computed from… |
 |---|---|
-| no embedding yet | nothing — it can't be compared |
-| embedding only | image-vector KNN (cosine ≥ `similar_min_cosine`, default 0.8) |
-| + taxonomy | ⊕ shared **tags across every dimension**, each weighted by that dimension's importance |
+| EXIF only, not embedded yet | **moment** — same time, same place (needs no model at all) |
+| + embedding | ⊕ image-vector cosine above its gate |
+| + taxonomy | ⊕ shared **tags**, by tier |
 | + captions | ⊕ **caption meaning** (caption text-embedding cosine) |
 
-Every matching facet is a scored **contribution**:
+### The signals
 
-1. **Shared tags — all dimensions, per-dimension weighted.** Each shared tag
-   contributes `dimension_weight × agreement × idf`, where the **per-dimension
-   weight** lives in `vocab.yaml` (`similar_dimension_weights`). `agreement` is the
-   weaker of the two confidences and `idf` (0–1) damps common tags. This stops a rare
-   `palette=earthy` from outweighing the actual subject.
+Every signal is described by exactly two numbers — a **gate** (below it the signal is
+*absent*, never a small number) and a **weight** (the most it may claim on its own, on
+one shared 0–1 scale). All of them live in `search/signals.py`; the three gates a
+deployment may retune are in `config.py`, and the four tier weights are in `vocab.yaml`.
 
-   The weights order the dimensions **what → where → when → how it looks**, then
-   discount each by how reliable SigLIP actually is on it: `subject` 3.0, `setting`
-   2.0, `occasion` 1.2, `light` 0.5, `season_weather` 0.4, `palette`/`vibe` 0.3,
-   `composition`/`emotion` 0.2, `quality` **0 — ignored**. The low ones are measured,
-   not guessed: SigLIP's per-dimension softmax always crowns a winner, so **every
-   photo carries every dimension** whether or not it applies — `vibe: chaotic` lands on
-   50% of the library, and `emotion` reaches 0.5 confidence on just **15%** of its tags
-   (`surprised` on half the photos, objects included). `subject`, by contrast, clears
-   0.5 on **79%**. `setting` gets *more* weight than its confidence suggests for the
-   opposite reason: 23 well-spread labels but only 22% above 0.5, so without the weight
-   a real match never surfaces. Since `idf` already damps a label carried by most
-   photos, these weights mostly govern each dimension's **rare** labels — which is
-   exactly where an unreliable dimension does its damage.
+| # | Signal | Gate | Weight | Content? | Why this gate |
+|---|---|---|---|---|---|
+| 1 | **image** — SigLIP image↔image cosine | **0.80** | **0.95** | ✔ | top 4 % of all pairs; a random pair scores 0.558 |
+| 2 | **subject** — shared `subject` tag | **0.80** | **0.75** | ✔ | median top-`subject` is 0.83; 93 % clear 0.5, so 0.5 gates nothing |
+| 3 | **caption** — caption-embedding cosine | **0.75** | **0.65** | ✔ | top 5 %; a random pair scores 0.621 |
+| 4 | **where** — `setting`, `occasion` | 0.50 | **0.40** | ✘ rerank | 38 % / 51 % of photos clear 0.5 |
+| 5 | **moment** — time × place | **0.20** | **0.35** | ✔ | ≈ top 4 % of pairs (below) |
+| 6 | **look** — `light`, `season_weather`, `palette`, `vibe`, `composition`, `emotion` | 0.50 | **0.12** | ✘ rerank | least reliable: `emotion` clears 0.5 on 28 % |
+| 7 | **quality** — `sharp`, `blurry`, … | 0.50 | **0.03** | ✘ rerank | pure tiebreak; `sharp` is on 201/206 photos |
 
-   These numbers are what they are *after* the §7 prompt work; before it, `subject`
-   was right 37% of the time and `composition: top-down` alone landed on 82% of the
-   library. Weights cannot rescue a mislabelled tag — fix the labels first.
-2. **Caption meaning.** SigLIP tagging is single-label and picks the *dominant*
-   subject, so a dog riding in a car is tagged `vehicle` and never shares
-   `subject=dog` with a dog on a rooftop. So each caption is embedded with a text
-   model (§4) when written, and similarity is the **cosine between caption
-   embeddings** — "a dog on a rooftop" ≈ "a dog in a car", while "a small teddy bear"
-   ≠ "a small domino tile". Contributes above `similar_caption_min` (default 0.6),
-   at `caption_weight (2.0) × strength`.
+A text query has no seed image vector, so its **fused rank** stands in for signal 1 at
+weight **0.60** — deliberately lighter, because a fused rank says "this matched the
+query somehow", not "these two photos are alike".
 
-   **`strength` is the cosine rescaled against its noise floor**, not the raw cosine:
-   `(cosine − similar_caption_min) / (1 − similar_caption_min)`, so the bar is 0 and
-   an identical caption is 1. Text-embedding cosines do not start at 0 — measured
-   over 4k random pairs of the real library, two **unrelated** captions score a
-   median **0.62** (p10 0.56, p90 0.72), i.e. 64% of all random pairs clear the 0.6
-   bar. Fed in raw, that floor alone earned more than any idf-damped tag could, so
-   the caption led the ranking on essentially every photo (it was the top reason on
-   **51%** of results, against 18% for all tags combined) — the "captions give bad
-   similar photos" symptom. Tags are damped by idf; this is the caption's equivalent.
-   After rescaling the same sample gives caption 12%, `subject` 21%, visual 36%, and
-   a caption that genuinely means the same (cosine 0.90 → strength 0.75) still leads.
-   The **displayed match %** is this strength too, so the panel never shows an
-   unrelated pair as an 80% caption match.
-3. **Image-vector cosine.** A mild look-alike signal (cosine ≥ `similar_min_cosine`,
-   default **0.8**) — how alike two photos *look*, not what they are — and the sole
-   signal before taxonomy exists. The floor is high because SigLIP image cosines have
-   a high baseline: any two photos sit ~0.5–0.65, so a lower floor admits noise (a
-   teddy bear "looks alike" a selfie at 0.63), while genuinely-alike photos are
-   0.85–0.98.
+### The formula
 
-**Content gate.** A candidate is "similar" ONLY if it shares a **content** signal that
-is also **confident**: a `subject` tag at **≥ `_CONTENT_TAG_MIN` (0.5) agreement**, a
-caption at **≥ `_CAPTION_CONTENT_MIN` (0.6) strength**, or a genuine visual near-dup.
-SigLIP is single-label over a large vocabulary, so its runner-up subjects sit at
-0.2–0.4 and are often simply wrong (blue curtains tagged `subject: screenshot` at
-0.39); two photos agreeing on a guess neither of them is share no content. A weak
-subject tag still reranks, it just cannot qualify a pair — the same rule as a weak
-caption. On the reference library the bar removes ~15% of results and leaves ~9% of
-photos with an honest empty strip. Style/scene facets (composition, vibe, palette, light, season,
-occasion, setting, emotion, quality) **only rerank** content matches — they never make
-two photos similar on their own, and neither does a *weak* caption match: "a dog stands
-on a ledge overlooking a cityscape" and "a person stands in front of a dark framed
-object" share a 42% caption and nothing else, and used to be called similar.
+```
+cosine-like (image, caption, moment):
+    raw < gate   →  absent
+    raw ≥ gate   →  evidence = w × (0.5 + 0.5 × (raw − gate) / (1 − gate))
 
-**Score floor.** A result below `similar_score_min` (default **0.8**) is not shown.
-Without it the strip always returned its full `k`, so a photo with nothing genuinely
-like it got 12 fillers. The floor is absolute, not relative, and tag contributions
-carry `idf` — so in a *tiny* library (a tag on most of the few photos it has) scores
-are legitimately small and the strip is legitimately near-empty.
+tags:
+    agreement < gate  →  absent
+    agreement ≥ gate  →  evidence = w × agreement × (0.4 + 0.6 × idf)
 
-A candidate's score is its contributions **sorted high-to-low and summed with a
-decay** (each further facet counts less), so **one strong match — a shared
-`subject` — beats a pile of weak ones**. This replaced an earlier flat sum that let
-quantity of weak facets win, and a `caption × 3` hack that papered over it. Each
-result carries the **reasons** it was chosen, each with a match percentage (the
-*weaker* of the two photos' confidences — a 0.71 close-up matching a 1.00 close-up
-agree at 71%, never the candidate's raw score). The UI shows the **top 3** reasons —
-picked by relevance (contribution = importance × rarity × match), then **displayed
-highest match % first**, so the biggest number is always on top — overlaid on each
-enlarged thumbnail (§13). The `/photo` "why similar" table sorts the same way, by
-match %, with contribution only breaking ties. Pure image-vector KNN as the *primary*
-signal was rejected (a dog on a rooftop returned other rooftops); an LLM reranker was
-rejected for this interactive path (it reintroduces per-click latency §9.1 forbids).
+score = 1 − Π (1 − evidence)          # noisy-OR, a true 0–1
+qualify if ≥1 CONTENT signal present AND score ≥ similar_score_min (0.25)
+```
+
+**Why cosines get a 0.5 entry ramp and tags do not.** A cosine's gate must sit well
+above the noise, so a pair *just above* it would score ~0 if the strength were rescaled
+from the gate — admitting it would buy nothing, and a genuine near-dup at 0.85 would
+lose to a tag. The ramp makes crossing a gate immediately worth half the weight. Tag
+confidences are already softmax probabilities spanning 0–1, and `idf` is their
+equivalent noise floor; the `0.4 + 0.6 × idf` damp keeps a common-but-confident label
+at 40 % of its weight instead of zeroing it.
+
+**The rule for setting any gate: never below the library's random-pair median.** This is
+the bug the model replaced. `similar_caption_min` was 0.60 — *under* the 0.621 median —
+so 64 % of all pairs cleared it and the caption signal scored pure chance. Combined with
+a `subject` bar of 0.5 that gated nothing, a girl by a Christmas tree (mis-tagged
+`subject: toy` at 0.58, runner-up `person` at 0.31) was scored as similar to a teddy
+bear, with `light: low light 69 %` as the headline reason. All four of its signals now
+fall below their gates and it is dropped.
+
+**Why tiers instead of ten per-dimension weights.** Ten hand-tuned numbers could not be
+reasoned about, and `idf` already handles the part that genuinely varies — how rare a
+specific label is. A shared `museum` outranks a shared `indoor` without either needing
+a weight of its own. Four tiers, four numbers, in `vocab.yaml`.
+
+These numbers are what they are *after* the §7 prompt work; before it, `subject` was
+right 37 % of the time. **No weight can rescue a mislabelled tag** — a carnival ride
+confidently tagged `subject: toy` at 0.98 will still match a teddy bear. Fix labels in
+`vocab.yaml`, not weights.
+
+### `moment` — same time, same place
+
+`exp(−Δt / 12h) × exp(−Δd / 1km)`, from EXIF `shot_at` and GPS. Same hour + same block
+→ 0.75; same afternoon + 500 m → 0.47; six hours + 1 km → 0.22, just admitted; next day
+or 5 km → absent. If either photo has no GPS the place is **unknown, not zero**, so it
+falls back to time alone × 0.5.
+
+It earns a content-signal weight because closeness in *both* time and place is rare:
+measured over the 184 reference photos carrying time and GPS (25 distinct ~1 km places),
+the median pair is **886 hours and 119 km apart**, and only **3.75 %** of pairs fall
+within 1 h / 200 m — about as selective as an image cosine of 0.80. `similar_score_min`
+is sized so a lone `moment` at same-hour/same-block (0.30) survives on its own, while
+same-afternoon/500 m (0.23) needs a second signal to agree.
+
+### Content gate, floor, and reasons
+
+**Content gate.** A candidate is "similar" ONLY if it shares a content signal — image,
+`subject`, caption, or moment. Clearing the gate *is* the content bar: there is no
+second threshold. `where`, `look` and `quality` **only rerank** — they never qualify a
+pair, however many of them agree.
+
+**Score floor.** A result below `similar_score_min` (default **0.25** on the 0–1 score)
+is not shown. Without it the strip always returned its full `k`, so a photo with nothing
+genuinely like it got 12 fillers. On the reference library this leaves 2 % of photos
+with an honest empty strip and a median of 9 results.
+
+**Reasons.** Each result carries its **top 3 contributions by evidence, in that order** —
+what actually drove the match leads. The match % shown beside each is the *agreement*
+(for a tag, the weaker of the two photos' confidences; for a cosine, its strength above
+the gate), which answers a different question and is deliberately not the sort key.
+Ordering reasons by percentage instead put `quality: sharp 100 %` at the top of **403**
+result cards — it agrees perfectly on almost every pair and drives ~0.01. A big number
+is not a big reason. The `/photo` "why similar" table sorts the same way, and shows **no
+row at all** for a facet below its gate, since it contributed nothing.
+
+Pure image-vector KNN as the *primary* signal was rejected (a dog on a rooftop returned
+other rooftops); an LLM reranker was rejected for this interactive path (it reintroduces
+per-click latency §9.1 forbids).
 
 ## Async paint (`/photo`)
 

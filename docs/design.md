@@ -52,6 +52,11 @@ below). Ingest is identical everywhere — photos always arrive by upload
 | `jetson` | `llama-server` in a container (sm_87 CUDA) | `gemma4-E2B` | `gemma4-E2B` | `cuda` |
 | `cloud` | vLLM in a container, `--gpus all` | `qwen2.5vl:7b` | `qwen2.5:3b` | `cuda` |
 
+The model columns are the profile **defaults**, not a fixed roster: since plan 21
+each of the four model **slots** (§4.1) is switchable at runtime from the settings
+popup (§13), and the stored choice wins over these defaults. `cloud` is the
+exception — its slots are config-only.
+
 Since plan 16, `mac` and `jetson` run **one gemma4-E2B GGUF on llama.cpp
 `llama-server`**, which serves **both** the caption (vision) and planner/chat
 (text) roles over the OpenAI `/v1` API — so both model-name columns are the same
@@ -291,10 +296,11 @@ restarts and never blocks the UI. This is the Outbox pattern.
 
 ## 4. Models
 
-The app runs a small, fixed roster, all inside the one `models` service (§5.1),
-loaded once — never in `app`/`worker`. **The exact role→model→backend table,
-per-profile wiring, download mechanics, and the settled caption-embedding
-decision live in [`docs/models.md`](models.md).** The selection:
+The app runs **four model slots** (§4.1), all inside the one `models` service
+(§5.1), loaded once — never in `app`/`worker`. **The exact slot→model→backend
+table, the catalog, per-profile wiring, download mechanics, and the settled
+caption-embedding decision live in [`docs/models.md`](models.md).** The shipping
+defaults:
 
 - **SigLIP 2** does image + text embeddings and zero-shot tags, in a `TorchWorker`
   child of the models service (CPU on mac, CUDA on jetson) — neither `llama-server`
@@ -312,6 +318,71 @@ decision live in [`docs/models.md`](models.md).** The selection:
 Gemma 4 is used over the dominated Gemma 3. The default caption model is chosen by
 a **bake-off** on real photos, not published benchmarks — the winner is a config
 default, not code.
+
+### 4.1 Model slots — the catalog, and switching a model while the app runs
+
+The four models above are not hardcoded: they are the **defaults of four slots**,
+and the user picks a different model per slot from the settings popup (§13) while
+the app is running. A slot is the unit everything else names — the registry, the
+governor's budget, the scheduler's "needs" list, and the ingest stages a switch
+invalidates.
+
+| Slot | Default | Role | Switching invalidates |
+|---|---|---|---|
+| `image_embed` | SigLIP 2 `so400m-patch14-384` | image + text vectors, zero-shot tags | `embed` → `taxonomy` |
+| `text_embed` | `nomic-embed-text-v1.5` | caption-meaning vectors (§9) | `caption_embed` |
+| `caption` | `gemma4-E2B` GGUF (vision) | the caption sentence | `caption` → `caption_embed` |
+| `planner` | `gemma4-E2B` GGUF (text) | query planner + chat | nothing (no stored output) |
+
+`caption` and `planner` are **separately selectable but share one `llama-server`
+child** — one process, one port. If they resolve to different GGUFs the child
+restarts when the role changes, which is exactly the cost shape the existing
+text↔vision restart already has (§3.1); pointing both at one GGUF (the default)
+keeps that restart to the projector alone.
+
+**The catalog is data, in the repo** (`models/catalog.py`, no torch import). One
+entry per selectable model, carrying everything every consumer needs so nothing
+downstream has to know model names:
+
+- `source` — the Hugging Face repo id, or the GGUF repo + file (+ mmproj file).
+- `cost_mb` — the resident cost the governor budgets against (§8.1), and whether
+  that figure is **measured on this board or an estimate**. An estimate is shown
+  as unverified in the UI, because an over-estimate can make a model unloadable
+  and an under-estimate OOMs the box (§8.1).
+- `dim` — the embedding width (embedder slots only). It decides whether a switch
+  must rebuild `photo_vec` (§6).
+- `preprocess` — `{input_px, resample, mode}` for image embedders. `mode: squash`
+  is today's aspect-ignoring stretch to a fixed square; `mode: native` (NaFlex,
+  and any native-resolution encoder) means fit-inside `input_px` with the aspect
+  ratio kept. **The client resizes by this spec, never by a constant** — see §5.1's
+  `/embed/spec`.
+- `prompt_template` — the key into `inference/prompts.py` (LLM slots only), so
+  adding a model stays "add a template", not pipeline surgery.
+
+Only catalog entries are selectable. A free-form model id is deliberately not
+offered: `cost_mb`, `dim`, and `preprocess` cannot be guessed at runtime, and each
+of the three breaks something different when wrong.
+
+**A switch is a re-index, and says so before it runs.** The selection lives in
+`app_settings` (§6), owned by `app`; resolution is **stored choice → env override →
+profile default**. Confirming a switch, in one transaction:
+
+1. writes the new slot choice,
+2. rebuilds `photo_vec` when `image_embed`'s `dim` differs from the live table
+   (vectors from two encoders are not comparable — the old ones are dropped, not
+   migrated),
+3. calls `jobs.reprocess()` over the slot's invalidated stage range (table above),
+
+then pushes the new slots to the `models` service. The `worker` drains the requeued
+stages exactly like any other reprocess, with the same per-stage progress rows (§8);
+search and "similar" run against a thinning index until it finishes, which is why the
+popup states the photo count before it asks for confirmation.
+
+The `models` service holds no database, so it cannot read the choice itself: it
+starts on the profile defaults and exposes a **`generation`** counter with its
+current slots. `app` compares that generation on the resource-bar poll it already
+makes (§13) and re-pushes when they diverge — so a `models` restart converges back
+to the user's selection without a coordinating store.
 
 ## 5. Architecture
 
@@ -333,7 +404,7 @@ flowchart TB
     subgraph gpu["The GPU box · docker compose"]
         app["app · FastAPI + Jinja + HTMX<br/>UI · read queries · upload receipt · /api/manifest<br/>NO models, NO torch — a thin client of the models service"]
         worker["worker · ingest pipeline (primary writer)<br/>facets · thumbs · taxonomy · caption · memories · deletions<br/>NO models, NO torch — a thin client of the models service"]
-        models["models · THE ONE INFERENCE GATEWAY (§5.1)<br/>the only process that imports torch/transformers AND the only client of the inference server<br/>hosts SigLIP + nomic in KILLABLE TorchWorker children (parent imports no torch) · memory governor swaps SigLIP↔gemma under budget (§8.1)<br/>HTTP: /embed/image · /embed/text · /tag · /caption · /plan · /chat · /resources"]
+        models["models · THE ONE INFERENCE GATEWAY (§5.1)<br/>the only process that imports torch/transformers AND the only client of the inference server<br/>hosts the image/text embedder in KILLABLE TorchWorker children (parent imports no torch) · memory governor swaps embedder↔LLM under budget (§8.1)<br/>owns the model slots + downloads (§4.1)<br/>HTTP: /embed/image · /embed/text · /embed/spec · /tag · /caption · /plan · /chat · /resources · /models/*"]
         infer["inference · llama.cpp llama-server (mac/jetson) | vLLM (cloud)<br/>ONE gemma4-E2B GGUF — text (planner/chat) AND vision (caption), on the GPU<br/>reached ONLY by the models service · (host on mac, container on jetson/cloud)"]
         db[("SQLite WAL<br/>sqlite-vec + FTS5 · named volume")]
         store[("Storage<br/>originals + thumbnails")]
@@ -351,11 +422,13 @@ flowchart TB
     worker -->|"write originals / thumbnails"| store
 
     app -->|"ALL inference: query embed · planner · chat (HTTP)"| models
+    app -->|"slot switch + downloads: PUT /models/slots · POST /models/download (§4.1)"| models
     worker -->|"ALL inference: embed · zero-shot tags · caption (HTTP)"| models
     models -->|"gemma4-E2B: planner/chat + caption/vision (OpenAI /v1)"| infer
+    models -->|"fetch weights on demand (HF / GGUF) → model cache volume"| hf[("Hugging Face<br/>weights, fetched once per model")]
 
     classDef store fill:#eef2ff,stroke:#8899cc,color:#111;
-    class db,store,disk store;
+    class db,store,disk,hf store;
 ```
 
 `app` serves the UI, read queries, upload receipt, and the manifest endpoint.
@@ -423,10 +496,13 @@ HTTP.
 - `POST /embed/text` — SigLIP **text** embeddings for search/chat query vectors
   (same joint space as the image vectors).
 - `POST /tag` — SigLIP zero-shot scoring against `vocab.yaml` (ingest `taxonomy`).
-- `GET /embed/calibration` — SigLIP's zero-shot calibration (`logit_scale`,
-  `logit_bias`); `RemoteEmbedder` fetches and caches this once so taxonomy
-  scoring (§9) can stay client-side (ingest keeps computing tag probabilities
-  itself, over `embed_text` + this calibration — nothing server-side changes).
+- `GET /embed/spec` — the image embedder's **calibration and its preprocessing
+  contract**: `logit_scale`, `logit_bias`, and the slot's `preprocess`
+  (`input_px`, `resample`, `mode`) plus the slots `generation` (§4.1).
+  `RemoteEmbedder` fetches and caches it, so taxonomy scoring (§9) stays
+  client-side *and* the caller's pre-resize follows the model instead of a
+  hardcoded 384. It re-fetches when the generation moves. (It replaces the
+  calibration-only `GET /embed/calibration`.)
 - `POST /caption` — a caption sentence (title/description) for one image (OpenAI
   `/v1` call to `llama-server` with the image as an `image_url`, §4). It returns
   **no tags** — tags are SigLIP-only (§7).
@@ -435,6 +511,14 @@ HTTP.
   text embedder `nomic-embed-text-v1.5`**, in its own worker child (`TextBackend`,
   `embedding/text_embedder.py`) — NOT `/embed/text` (that is SigLIP, image↔text
   only). Consumed as top-k KNN (§10).
+- `GET /models/catalog`, `PUT /models/slots`, `POST /models/download` — the slot
+  control surface (§4.1). The catalog response is the repo catalog joined with
+  live per-model state: the current selection, whether the weights are already on
+  disk, and a download's bytes-so-far. `PUT` swaps a slot: it evicts the outgoing
+  model (killing its child, §8.1) and re-registers the slot from the new catalog
+  entry — the next op loads it, nothing loads eagerly. `POST /models/download`
+  fetches weights in a background thread (HF snapshot / GGUF stream into the same
+  cache the entrypoint and `make llama-mac` use), never inside the request.
 - `GET /resources` — **only what the service alone knows**: which models are
   resident, and the current in-flight op. It reports **no machine metrics**.
   RAM/CPU/GPU-load/temperature are host-wide numbers that any process can read
@@ -488,6 +572,12 @@ The library is one SQLite file. **The full DDL — every table and index, the
   diluted by a model *guess* (§6.2). **`photo_tags`** holds the model-derived tags,
   each with a `score` (0..1) and a `source`, so the UI can show why a tag is present.
 - **`jobs`** — one row per (photo, stage): the resumable ingest queue (§8).
+- **`app_settings`** — one key/value row per owner-level setting the UI can
+  change. It holds the four model-slot choices (§4.1); an absent key means "use
+  the env override, else the profile default", so a fresh library and an untouched
+  install behave identically. `photo_vec`'s declared width follows the selected
+  `image_embed` model's `dim` — a switch to a different width **drops and recreates
+  the vec0 table** rather than migrating it (§4.1).
 - **`groups` / `group_photos`** — a many-to-many junction backing Memories, so a
   photo may belong to any number of memories (§11).
 - **`uploads`**, **`chat_sessions` / `chat_messages`** — the folder list (§3.2c) and
@@ -637,10 +727,14 @@ footprint, because the eviction guard is `free >= cost + headroom` — an
 under-estimate loads a model on top of one that should have been evicted and OOMs
 the box (the gemma "connection refused" bug).
 
-gemma is registered **twice** — `gemma` (text: chat/planner) and `gemma-vision`
-(text + the ~531 MB projector: captioning only). They are one `llama-server` child on
-one port, so they are **mutually exclusive**: making either resident frees the other
-(§3.1). A text chat never loads the vision half.
+**Residents are named by slot, not by model** (§4.1), so switching a model never
+renames anything the governor, the scheduler or a "needs" list mentions. The four
+residency units are `image_embed`, `text_embed`, `llm` and `llm_vision`; the last
+two are the `planner` and `caption` slots' two spawn modes of one `llama-server`
+child on one port, so they are **mutually exclusive**: making either resident frees
+the other (§3.1). A text chat never loads the vision half. `cost_mb` comes from the
+selected catalog entry, not from a fixed per-name table, so a heavier model brings
+its own budget figure with it.
 
 **Residency is a claim about the world, not a note to self.** gemma lives in a
 separate process that can die without asking us — `llama-server` aborts (SIGABRT) the
@@ -713,7 +807,12 @@ against a 5000 jetson budget and a 512 MB headroom, so `5000 + 512 > 5000` raise
 with 5.6 GB free. Every entry in `model_cost_mb` must satisfy that inequality for
 its profile; `tests/test_config.py::test_every_model_fits_its_profile_budget`
 enforces it, and the costs are **measured** (as the drop in
-`psutil.virtual_memory().available`, which is what the guard reads), never guessed. gemma always loads **fully on the GPU** (`-ngl
+`psutil.virtual_memory().available`, which is what the guard reads), never guessed.
+That test now runs over the whole **catalog** (§4.1): a selectable model whose
+`cost_mb + headroom` exceeds a profile's budget is not offered on that profile at
+all, because offering it would mean offering a slot that can never load. A catalog
+entry whose cost is an estimate rather than a board measurement is labelled as such
+in the settings popup — it is the one number the user is trusting. gemma always loads **fully on the GPU** (`-ngl
 99`, vision projector included) — **the platform never degrades to the CPU** (§3.1).
 If the all-GPU load still cannot fit (the non-evictable baseline leaves < gemma's GPU
 footprint), `llama-server` aborts at load and `app` streams a plain error turn to the
@@ -1195,6 +1294,14 @@ that the four top-level links swap without re-rendering the nav. The routes:
   remembered.
 - **`/chat`** — the persisted conversation with streamed answers and thumbnail
   citations (§10).
+- **Settings (⚙, in the nav beside the resource bar)** — a modal `<dialog>` served
+  by `/settings/models`: one section per model slot (§4.1), the selectable catalog
+  entries as radios with the current one checked, each showing its download size,
+  RAM cost (flagged when estimated), and either "on disk" or a live download bar.
+  Choosing a different model states what the switch re-runs and for how many
+  photos, and only then offers **Switch**. It is an **overlay, not a layer** — it
+  pushes no history entry and changes no URL, so §13.1's `[grid, leaf]` invariant is
+  untouched, and Esc/close simply closes it.
 
 **Per-route detail — the resource-bar internals, the full `/photo` panel, throughput
 readouts — is in [`docs/ui.md`](ui.md).** The nav order **Upload → Library → Chat →

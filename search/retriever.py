@@ -126,19 +126,20 @@ def refine(
     min_cosine: float = IMAGE_GATE,
     caption_min: float = CAPTION_GATE,
 ) -> list[dict]:
-    """Phase 2 — hard pre-filter, then graceful additive scoring (§9.2).
+    """Phase 2 — hard pre-filter, then graceful gated scoring (§9.2).
 
     (1) `hard_filters` cut `ids` EXACTLY — a non-matching photo is removed before
     any scoring happens; tags are never a hard filter (see `_soft_tag_contributions`).
     (2) Build each surviving id's contributions — shared tags / caption meaning /
-    image look-alike vs the seed, or caption meaning / fused rank / soft-tag hints
-    for a text query — via `search/scoring.py` so both paths score identically.
-    A missing per-photo signal (no caption_vec, no tag, no vector) just drops that
-    ONE contribution, never the candidate (mirrors `search/rerank.py`).
-    (3) Score via `scoring.score_candidates` (decayed sum, content gate, top-3
-    reasons). (4) `query.floor`, if set, cuts by the final score; None ranks
-    everyone — a floor never removes a candidate on a signal it never had a chance
-    to score on, because that candidate's score already reflects only what it has.
+    image look-alike / shared moment vs the seed, or caption meaning / fused rank /
+    soft-tag hints for a text query — via `search/scoring.py` so both paths score
+    identically. A missing per-photo signal (no caption_vec, no tag, no vector, no
+    GPS) just drops that ONE contribution, never the candidate.
+    (3) Score via `scoring.score_candidates` (noisy-OR over gated evidence, content
+    gate, top-3 reasons). (4) `query.floor`, if set, cuts by the final score; None
+    ranks everyone — a floor never removes a candidate on a signal it never had a
+    chance to score on, because that candidate's score already reflects only what
+    it has.
     """
     ids = _hard_filter(conn, owner_id, query.hard_filters, ids)
     if not ids:

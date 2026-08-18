@@ -57,7 +57,11 @@ photo_facets (
 CREATE INDEX photo_facets_lookup ON photo_facets(key, value_text);
 CREATE INDEX photo_facets_range  ON photo_facets(key, value_num);
 
--- sqlite-vec virtual table; rowid joins to photos.id
+-- sqlite-vec virtual table; rowid joins to photos.id. The width is the SELECTED
+-- image_embed model's `dim` (design §4.1) — 1152 for the default SigLIP 2
+-- so400m. Switching to a model of a different width DROPS and recreates this
+-- table (vectors from two encoders are not comparable) and requeues the embed
+-- stage; it is never migrated in place.
 CREATE VIRTUAL TABLE photo_vec USING vec0(
   embedding float[1152]
 );
@@ -134,6 +138,19 @@ chat_messages (
   answer     TEXT NOT NULL,
   sources    TEXT,                     -- JSON array of cited photo ids
   created_at TEXT NOT NULL
+);
+
+-- Owner-level settings the UI can change (design §4.1). Today: the four model
+-- slots, keys `model_slot.image_embed` / `.text_embed` / `.caption` / `.planner`,
+-- each value a catalog key. A MISSING row means "env override, else profile
+-- default" — never a written-out default, so an untouched install and a fresh
+-- library resolve identically.
+app_settings (
+  owner_id   INTEGER NOT NULL,
+  key        TEXT NOT NULL,
+  value      TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (owner_id, key)
 );
 ```
 
