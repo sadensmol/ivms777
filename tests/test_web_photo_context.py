@@ -94,6 +94,10 @@ def test_memory_shown_in_chat_excludes_members_from_similar(settings):
     from embedding.fakes import FakeEmbedder
     from embedding.store import write_vector
     settings.data_dir.mkdir(parents=True, exist_ok=True)
+    # This 4-photo fixture is about member EXCLUSION, not ranking: a tag carried by
+    # 3 of 4 photos has almost no idf, so every score sits under the real
+    # `similar_score_min`. Drop the floor so the exclusion is what is measured.
+    settings.similar_score_min = 0.0
     app = create_app(settings)
     conn = app.state.context.conn
     for pid in (1, 2, 3, 4):
@@ -132,6 +136,7 @@ def test_similar_strip_excludes_photos_already_in_the_memory(settings):
     # A photo that is both "similar" and a memory member must not repeat in the
     # similar strip — the collage already shows it (§13).
     settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.similar_score_min = 0.0  # see above: exclusion fixture, not a ranking one
     app = create_app(settings)
     conn = app.state.context.conn
     for pid in (1, 2, 3, 4):

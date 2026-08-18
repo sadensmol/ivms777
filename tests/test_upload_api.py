@@ -170,6 +170,7 @@ def test_inline_drain_off_leaves_the_work_to_the_worker(settings):
         "SELECT stage, status FROM jobs ORDER BY stage"
     )] == [
         ("caption", "pending"),
+        ("caption_embed", "pending"),
         ("embed", "pending"),
         ("taxonomy", "pending"),
         ("thumbnail", "pending"),

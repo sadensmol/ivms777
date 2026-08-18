@@ -25,10 +25,17 @@
   </div>
   <div id="chat-log" class="chat-log">
     {% for m in messages %}
-      <div class="msg user"><div class="bubble">{{ m.question }}</div></div>
+      <div class="msg user">
+        <div class="bubble">{{ m.question }}</div>
+        {% if m.at %}<div class="msg-meta">{{ m.at }}</div>{% endif %}
+      </div>
       <div class="msg assistant">
+        {# The wait goes ABOVE the answer — it happened before it. The message's own
+           timestamp stays BELOW, like every other message's. #}
+        {% if m.took %}<div class="msg-meta msg-think">thought for {{ m.took }}</div>{% endif %}
         <div class="bubble">{{ m.answer_html|safe }}</div>
         {% if m.memory_html %}<div class="msg-memory">{{ m.memory_html|safe }}</div>{% endif %}
+        {% if m.at %}<div class="msg-meta">{{ m.at }}</div>{% endif %}
       </div>
     {% endfor %}
   </div>

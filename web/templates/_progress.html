@@ -2,7 +2,7 @@
      hx-trigger="every 2s, refresh" hx-swap="outerHTML">
   {% for stage, counts, speed in stages %}
     <div class="progress-row">
-      <span>{{ stage }}</span>
+      <span>{{ stage.replace('_', ' ') }}</span>
       <span class="progress-counts">
         {{ counts['done'] }} done · {{ counts['pending'] }} pending
         {% if speed %}<span class="progress-speed" title="recent throughput — last speed persists across restarts">· {{ speed }}</span>{% endif %}

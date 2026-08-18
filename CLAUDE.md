@@ -98,10 +98,13 @@ before touching any navigation. The non-negotiable core:
    origin thumbnail — uses `location.replace`, NEVER a push. If you ever `push` on
    a leaf→leaf move you break this and close starts replaying visited photos.
 
-5. **Close/Esc goes UP to the grid, once** — `history.back()` (restores the grid's
-   scroll + state via bfcache), with the computed grid URL as the `href` deep-link
-   fallback. It must never walk back through visited photos (rule 4 guarantees
-   none are in history).
+5. **Close/Esc goes UP exactly ONE level** — for a normal leaf that is the grid:
+   `history.back()` (restores the grid's scroll + state via bfcache), with the
+   computed grid URL as the `href` deep-link fallback. It must never walk back
+   through visited photos (rule 4 guarantees none are in history).
+   A `ctx=similar:<id>` leaf has ONE extra level above it — the origin photo — so
+   close goes there first (`location.replace`, no push), and the next close does the
+   normal `history.back()` to the grid: similar → origin → grid.
 
 6. **Prev/next move only *within* the current layer's order**, carrying `ctx`
    forward — never leaking into a sibling memory/album or the wider library.

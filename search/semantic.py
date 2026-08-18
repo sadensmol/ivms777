@@ -4,41 +4,79 @@ import sqlite3
 from embedding.base import Embedder
 from embedding.store import all_caption_vectors, knn, read_caption_vector, read_vector, read_vectors
 from embedding.vectors import l2_normalize
+from search.moment import gap, read_moment
+from search.scoring import (
+    caption_contribution,
+    image_contribution,
+    moment_contribution,
+    tag_contribution,
+)
+from search.signals import (
+    CAPTION_GATE,
+    IMAGE_GATE,
+    SIGNAL_OFF,
+    moment_strength,
+)
+from search.signals import dimension_weights as tier_dimension_weights
 
-# "similar" spans the photo's WHOLE character — subject, vibe, emotion, setting,
-# light, palette… weighted per dimension (below), plus the caption's full meaning
-# via its text embedding, plus a mild image-look-alike signal.
+# "similar" spans the photo's WHOLE character — what it is, where and when it was
+# taken, and how it looks. Seven signals, each with one gate and one weight, composed
+# by noisy-OR. `search/signals.py` owns the numbers and the reasoning behind them.
 
 
 def search_photos(
     conn: sqlite3.Connection, embedder: Embedder, owner_id: int, query: str, k: int
 ) -> list[int]:
-    """Photo ids best matching a natural-language query, best first."""
+    """Photo ids best matching a natural-language query, best first.
+
+    The query is **lower-cased** before it reaches SigLIP. Its text tower is trained
+    on lower-case web captions and is case-sensitive in a way that actively misleads
+    here: an upper-case word reads as text PRINTED IN the image, so "DOG" retrieved
+    documents and ID cards while "dog" returned the actual dog photo at rank 1.
+    Measured on the board — "show me all photos with DOG on it!" found nothing, the
+    same sentence lower-cased found it first. Users type in whatever case they like,
+    so normalising here fixes every caller at once (chat search, library search).
+    """
+    return [pid for pid, _ in search_photos_scored(conn, embedder, owner_id, query, k)]
+
+
+def search_photos_scored(
+    conn: sqlite3.Connection, embedder: Embedder, owner_id: int, query: str, k: int
+) -> list[tuple[int, float]]:
+    """`search_photos` plus each hit's RELATIVE strength, 0–1, best first.
+
+    Strength is the hit's cosine divided by the best hit's, so 1.0 is "the closest
+    match in this result set" and 0.5 is "half as close". It is deliberately NOT an
+    absolute score. Measured on the real library, SigLIP's calibrated probability
+    for a CORRECT top hit ranges 0.76 %–9.8 %, and raw top-1 cosines for subjects
+    that ARE present (0.0889–0.1313) overlap those for subjects that are NOT
+    (0.0137–0.0921) — "a birthday cake" (present, 0.0889) scores below "sushi on a
+    plate" (absent, 0.0921). No global threshold separates them, because the
+    magnitude tracks the PHRASING as much as the library. Within one query the
+    ordering is still meaningful, so that is the only thing exposed.
+    """
     if not query.strip():
         return []
-    vector = l2_normalize(embedder.embed_texts([query])[0])
-    return [photo_id for photo_id, _ in knn(conn, owner_id, vector, k)]
+    vector = l2_normalize(embedder.embed_texts([query.lower()])[0])
+    hits = knn(conn, owner_id, vector, k)
+    if not hits:
+        return []
+    # vec0 is L2 over unit vectors, so cos = 1 - d²/2.
+    scored = [(pid, 1.0 - (distance * distance) / 2.0) for pid, distance in hits]
+    best = max(cos for _, cos in scored)
+    if best <= 0:
+        return [(pid, 0.0) for pid, _ in scored]
+    return [(pid, max(0.0, cos) / best) for pid, cos in scored]
 
 
-# Per-dimension importance for "similar" (§9); overridden from vocab.yaml. subject
-# dominates, quality is ignored. Kept here so search/ has a sane default in tests.
-DEFAULT_SIMILAR_DIMENSION_WEIGHTS = {
-    "subject": 3.0, "setting": 1.5, "occasion": 1.5, "vibe": 1.0, "emotion": 1.0,
-    "light": 0.8, "season_weather": 0.8, "composition": 0.8, "palette": 0.5, "quality": 0.0,
-}
-_CAPTION_WEIGHT = 3.0   # a shared rare caption word ranks like a strong subject match
-# An unreachable caption cosine — the ablation switch (§9.3). Passed as `caption_min`
-# it makes every caption comparison fall below the bar, which is exactly "no caption
-# signal" for both the recall union and the scoring contribution.
-CAPTION_SIGNAL_OFF = 2.0
-_VECTOR_WEIGHT = 1.0    # holistic look, a mild tiebreak
-_DECAY = 0.6            # each extra reason counts less, so one strong match beats many weak
-# "Content" = what the photo IS. A candidate must share at least one content signal
-# (a subject tag, a caption that means the same, or a genuine visual near-dup) to
-# be "similar" at all. Style/scene dimensions (composition, vibe, palette, light,
-# season, occasion, setting, emotion, quality) only RERANK content matches — two
-# photos both shot top-down in cool overcast light are not "the same thing".
-_CONTENT_TAG_DIMENSIONS = ("subject",)
+# Per-dimension importance for "similar" (§9), expanded from the four tier weights in
+# `search/signals.py` and overridable from vocab.yaml. Kept here so search/ has a sane
+# default in tests and so callers keep passing a plain {dimension: weight} map.
+DEFAULT_SIMILAR_DIMENSION_WEIGHTS = tier_dimension_weights()
+# A cosine no real pair can reach — the ablation switch (§9.3). Passed as a gate it
+# makes every comparison fall below the bar, which is exactly "no signal" for both the
+# recall union and the scoring contribution.
+CAPTION_SIGNAL_OFF = SIGNAL_OFF
 
 
 def _tag_similarity(
@@ -46,13 +84,11 @@ def _tag_similarity(
 ) -> dict[int, list[dict]]:
     """Per-shared-tag similarity contributions to every other photo (§9).
 
-    Each shared tag contributes ``dimension_weight × agreement × idf`` where
-    agreement is the WEAKER of the two photos' confidences (0.71 close-up matching
-    1.00 close-up agree at 0.71, not 1.00) and idf (normalised 0–1) damps common
-    tags. The per-dimension weight is what makes `subject` outrank `palette` and
-    silences `quality` (weight 0) — the caller then decays extra contributions so
-    one strong match beats a pile of weak ones. Returns
-    {pid: [{"text", "pct", "contrib", "tag": (dim, label)}]}.
+    Each shared tag is scored by `scoring.tag_contribution` — the tier's weight times
+    the agreement (the WEAKER of the two photos' confidences: a 0.71 close-up matching
+    a 1.00 close-up agree at 0.71, not 1.00) times an idf damp for common labels — and
+    is dropped entirely below its tier's gate. Returns
+    {pid: [{"text", "pct", "evidence", "content", "tag": (dim, label)}]}.
     """
     # MAX(score) GROUP BY tag_id folds a tag carried by two sources (siglip + vlm)
     # into one, so it is never counted — or shown as a reason — twice.
@@ -88,13 +124,11 @@ def _tag_similarity(
             " GROUP BY pt.photo_id",
             (tag_id, photo_id, owner_id),
         ):
-            agreement = min(src_score, cand_score)
-            hits.setdefault(pid, []).append({
-                "text": f"{info['dimension']}: {info['label']}",
-                "pct": round(agreement * 100),
-                "contrib": dim_weight * agreement * idf,
-                "tag": (info["dimension"], info["label"]),
-            })
+            contrib = tag_contribution(
+                info["dimension"], info["label"], min(src_score, cand_score), idf, dim_weight
+            )
+            if contrib is not None:
+                hits.setdefault(pid, []).append(contrib)
     return hits
 
 
@@ -128,8 +162,9 @@ def similar_photos(
     owner_id: int,
     photo_id: int,
     k: int,
-    min_cosine: float = 0.5,
-    caption_min: float = 0.6,
+    min_cosine: float = IMAGE_GATE,
+    caption_min: float = CAPTION_GATE,
+    score_min: float | None = None,
     dimension_weights: dict[str, float] | None = None,
     use_captions: bool = True,
 ) -> list[dict]:
@@ -138,23 +173,22 @@ def similar_photos(
     A thin wrapper over the retriever core (§9.2, plan 12 task 3):
     ``refine(candidates(Query(seed_photo_id=photo_id)))``. Progressive, by what
     the pipeline has produced (graceful degradation):
-      * no embedding yet -> nothing (the photo can't be compared);
-      * embedding only    -> visual neighbours (image-vector KNN, cosine floor);
-      * + taxonomy        -> add shared tags, per-dimension weighted;
+      * no embedding yet -> nothing visual, but EXIF alone can still find a `moment`;
+      * embedding only    -> visual neighbours (image-vector cosine above its gate);
+      * + taxonomy        -> add shared tags, per-tier weighted;
       * + captions        -> add caption-meaning similarity (text-embedding cosine).
 
     `use_captions=False` (settings `similar_use_captions`, §9.3) removes the caption
     signal from BOTH halves — the candidate union and the scoring contribution — so
-    the result is exactly "tags + image look-alike". It is the ablation switch for
-    measuring what the caption embedding is worth; it is not a tuning knob.
+    the result is exactly "tags + image look-alike + moment". It is the ablation
+    switch for measuring what the caption embedding is worth; not a tuning knob.
 
-    Each facet is a scored **contribution** — a tag (`dimension_weight × agreement
-    × idf`), the caption's semantic closeness (`_CAPTION_WEIGHT × caption cosine`),
-    or the image look-alike (`_VECTOR_WEIGHT × image cosine`). A candidate's score
-    is its contributions sorted high-to-low and summed with a `_DECAY` falloff, so
-    ONE strong match (same subject, or a caption that means the same thing) beats a
-    PILE of weak ones (five faint scene tags). Each result's `reasons` are its top-3
-    contributions, shown sorted by match %, highest first.
+    Each facet is a scored **contribution** carrying `evidence` in the shared unit of
+    `search/signals.py`; a candidate's score is `combine()` over them — a noisy-OR, so
+    ONE strong match beats a PILE of weak ones and the result is a true 0–1. A
+    candidate with no CONTENT signal (image, subject, caption, moment) is dropped
+    however many style facets it shares. Each result's `reasons` are its top-3
+    contributions by evidence, shown sorted by match %, highest first.
 
     The seed path is image-vector KNN dispatch ONLY — no planner, no SigLIP text
     encoder, no `client.embed` — so `embedder`/`client` are never constructed here;
@@ -174,7 +208,10 @@ def similar_photos(
     # signal in `_caption_similarity` (recall) AND `caption_contribution` (scoring)
     # without either of them growing a flag of its own.
     caption_min = caption_min if use_captions else CAPTION_SIGNAL_OFF
-    query = Query(seed_photo_id=photo_id, k=k, weights=weights, floor=None)
+    # `score_min` is what stops a photo with nothing genuinely like it from filling
+    # the strip with 12 fillers: below it, a candidate is not "similar", it is just
+    # the best of a bad set (settings `similar_score_min`, §9).
+    query = Query(seed_photo_id=photo_id, k=k, weights=weights, floor=score_min)
     ids = candidates(conn, None, owner_id, query, caption_min=caption_min)
     results = refine(
         conn, None, None, owner_id, query, ids, min_cosine=min_cosine, caption_min=caption_min
@@ -206,13 +243,18 @@ def similarity_breakdown(
     origin_id: int,
     current_id: int,
     dimension_weights: dict[str, float] | None = None,
+    min_cosine: float = IMAGE_GATE,
+    caption_min: float = CAPTION_GATE,
     use_captions: bool = True,
 ) -> list[dict]:
     """Full facet-by-facet explanation of why `current` is similar to `origin`
-    (§9, §13). One row per shared facet — tag, caption word, or visual — showing
-    both photos' values and their match, sorted by how much each **drove** the
-    similarity (its contribution), strongest first. This is what the tech panel
-    renders so a weak match is self-evidently weak.
+    (§9, §13). One row per facet that ACTUALLY SCORED — a shared tag, the caption
+    meaning, the visual look-alike, the shared moment — showing both photos' values
+    and their match, sorted strongest first. This is what the tech panel renders, so
+    a weak match is self-evidently weak.
+
+    A facet below its gate contributed nothing to the score, so it gets NO row: the
+    panel and the ranking must never disagree about what drove a match.
 
     Returns [{"param", "origin", "current", "match", "contrib"}].
     """
@@ -246,10 +288,13 @@ def similarity_breakdown(
         if idf <= 0.0:
             continue
         agreement = min(os_score, cur_score)
+        contrib = tag_contribution(dim, label, agreement, idf, weight)
+        if contrib is None:
+            continue  # below this dimension's gate — it drove nothing, so show nothing
         rows.append({
             "param": f"{dim}: {label}", "origin": f"{round(os_score * 100)}%",
             "current": f"{round(cur_score * 100)}%", "match": round(agreement * 100),
-            "contrib": weight * agreement * idf,
+            "contrib": contrib["evidence"],
         })
 
     # Mirrors `similar_photos`: with the signal off the panel must not claim a row
@@ -258,17 +303,64 @@ def similarity_breakdown(
     c_capvec = read_caption_vector(conn, current_id) if use_captions else None
     if o_capvec is not None and c_capvec is not None:
         cap_cos = max(0.0, sum(a * b for a, b in zip(l2_normalize(o_capvec), l2_normalize(c_capvec))))
-        rows.append({"param": "caption (meaning)", "origin": "—", "current": "—",
-                     "match": round(cap_cos * 100), "contrib": _CAPTION_WEIGHT * cap_cos})
+        # Below the bar the caption contributes nothing to the score, so the panel
+        # must not show a row for it. Above it, the row reports the SAME rescaled
+        # strength the score used — never the raw cosine, whose 0.6-ish noise floor
+        # would read as a strong match between two unrelated photos.
+        contrib = caption_contribution(cap_cos, caption_min)
+        if contrib is not None:
+            rows.append({"param": "caption (meaning)", "origin": "—", "current": "—",
+                         "match": contrib["pct"], "contrib": contrib["evidence"]})
 
     o_vec, c_vec = read_vector(conn, origin_id), read_vector(conn, current_id)
     if o_vec is not None and c_vec is not None:
         cos = max(0.0, sum(a * b for a, b in zip(l2_normalize(o_vec), l2_normalize(c_vec))))
-        rows.append({"param": "visual (image)", "origin": "—", "current": "—",
-                     "match": round(cos * 100), "contrib": _VECTOR_WEIGHT * cos})
+        # Same rule as the caption row: below its gate the look-alike signal did not
+        # score, so the panel must not show it. SigLIP image cosines sit ~0.5–0.65 for
+        # ANY two photos, so an ungated row read as "57% visual match" between two
+        # unrelated photos — a number that drove nothing.
+        contrib = image_contribution(cos, min_cosine)
+        if contrib is not None:
+            rows.append({"param": "visual (image)", "origin": "—", "current": "—",
+                         "match": contrib["pct"], "contrib": contrib["evidence"]})
 
-    # Sorted by contribution (relevance = importance × rarity × match), most
-    # relevant first — so a generic style facet (composition/palette/light) sinks
-    # below the subject/caption match even when its raw match % is higher.
-    rows.sort(key=lambda r: -r["contrib"])
+    # The one signal that ignores the picture entirely (§9): same stretch of time,
+    # same place. Shown with the actual gap so "same time & place" is checkable.
+    origin_moment, current_moment = read_moment(conn, origin_id), read_moment(conn, current_id)
+    if origin_moment is not None and current_moment is not None:
+        hours, metres = gap(origin_moment, current_moment)
+        contrib = moment_contribution(moment_strength(hours, metres))
+        if contrib is not None:
+            rows.append({
+                "param": "same time & place", "match": contrib["pct"],
+                "origin": _format_gap_time(hours),
+                "current": _format_gap_place(metres),
+                "contrib": contrib["evidence"],
+            })
+
+    # Sorted by what DROVE the match, strongest first (docs/ui.md). Not by match %:
+    # `quality: sharp` agrees at 100% on almost every pair and drives ~0.01, so a
+    # %-sorted panel led with it — the same complaint that started this rework, where
+    # `light: low light 69%` headlined two photos that had nothing to do with
+    # each other. Match % breaks ties.
+    rows.sort(key=lambda r: (-r["contrib"], -r["match"]))
     return rows
+
+
+def _format_gap_time(hours: float) -> str:
+    """The time gap, said the way a person would read it."""
+    minutes = hours * 60
+    if minutes < 90:
+        return f"{round(minutes)} min apart"
+    if hours < 36:
+        return f"{round(hours)} h apart"
+    return f"{round(hours / 24)} days apart"
+
+
+def _format_gap_place(metres: float | None) -> str:
+    """The distance gap, or an honest "no GPS" when either photo lacks coordinates."""
+    if metres is None:
+        return "no GPS"
+    if metres < 1000:
+        return f"{round(metres)} m apart"
+    return f"{metres / 1000:.1f} km apart"

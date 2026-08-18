@@ -12,7 +12,7 @@ from search.keyword import keyword_search
 from search.planner import plan, spec_to_params
 from search.rerank import rerank
 from search.retriever import Query, _hard_filter, candidates
-from search.semantic import search_photos, similar_photos
+from search.semantic import search_photos, search_photos_scored, similar_photos
 
 # The agent only handles the SEMANTIC tail — open-ended photo search. Counts,
 # memories, and periods are answered deterministically by `direct_answer` BEFORE
@@ -323,6 +323,35 @@ def _plain_total(question: str) -> bool:
     rest = _TOTAL_FILLER.sub(" ", _PHOTO_WORD.sub(" ", _COUNT_INTENT.sub(" ", question)))
     leftovers = (token.strip("?.!,'\"“”") for token in rest.split())
     return all(not token or token.lower().startswith("libr") for token in leftovers)
+
+
+# "find/show me photos of X" — a request to SEE photos, matched deterministically.
+_SHOW_INTENT = re.compile(
+    r"\b(show|find|see|display|give|get|list|search)\b", re.IGNORECASE
+)
+
+
+def is_photo_show(question: str) -> bool:
+    """True for "find/show me photos of X" — the user wants to SEE photos (§10).
+
+    Two jobs. It establishes, with NO model call, that the question is about the
+    library, which is what licenses waking SigLIP up front (the rule is never to
+    load it on a guess — see `agentic_gather`). And it is the phrasing the weak
+    router gets wrong: asked "find me all photos with dog", gemma4-E2B called
+    `count_photos` instead of `search`, so the loop gathered only
+    `count: 1 photo(s) matching "dog"` — no photo blocks — and then invented both a
+    photo id and a caption to answer with. Retrieving first means the answer has
+    real photos to cite.
+
+    A count ("how many photos with dogs") and a memory request are NOT this: they
+    have their own deterministic matchers and must keep them.
+    """
+    return (
+        bool(_SHOW_INTENT.search(question))
+        and bool(_PHOTO_WORD.search(question))
+        and not is_aggregate_question(question)
+        and not is_memory_show(question)
+    )
 
 
 def is_aggregate_question(question: str) -> bool:
@@ -673,11 +702,27 @@ def agentic_gather(
     question: str,
     *,
     max_rounds: int = 4,
+    prime: bool = False,
+    prime_as_evidence: bool = False,
 ) -> tuple[str, bool]:
     """Fully-agentic direct-OFF path (§10): the model calls REAL count/search tools,
     then we build a grounded block for the final answer. Returns (block, grounded);
     `grounded` False means nothing was gathered, so the caller answers from general
-    knowledge. Any failure degrades to whatever was gathered so far — never raises."""
+    knowledge. Any failure degrades to whatever was gathered so far — never raises.
+
+    `prime` retrieves the photo pool BEFORE the model runs, making the turn
+    `siglip → gemma` — ONE model swap instead of `gemma → siglip → gemma`, which on
+    the jetson costs an extra ~9 s `llama-server` reload (§8.1).
+
+    **It is opt-in, and the caller passes it only under guardrails.** Priming is a
+    bet that this question needs photos. Under guardrails that bet always wins —
+    off-topic messages are refused, so anything answered is about the library. With
+    guardrails OFF it frequently loses: "how many planets are in the solar system"
+    needs no photos, and priming would evict an already-resident gemma to load
+    SigLIP, then reload gemma to answer — two swaps bought for a search that never
+    happens. So by default the loop's own STEP 1 decides first, and SigLIP is woken
+    only if the model actually calls `search`.
+    """
     messages = [
         {"role": "system", "content": _AGENTIC_SYSTEM},
         {"role": "user", "content": question},
@@ -685,19 +730,61 @@ def agentic_gather(
     facts: list[str] = []
     photo_ids: list[int] = []
     seen: set[int] = set()
+    # How well the IMAGE model matched each photo, so the answer prompt can weigh
+    # visual evidence the caption never mentions (design §10).
+    strengths: dict[int, float] = {}
+    # Kept OUT of `photo_ids`: these are candidates the `search` tool will serve
+    # from, NOT evidence. Folding them straight in would make `grounded` true for
+    # every message, so a general question would be answered as if photos mattered.
+    primed: list[int] | None = None
+    if prime:
+        try:
+            scored = search_photos_scored(conn, embedder, owner_id, question, k=10)
+        except Exception:  # noqa: BLE001 — priming is an optimisation, never a requirement
+            scored = []
+        primed = [pid for pid, _ in scored]
+        strengths.update(dict(scored))
+        if prime_as_evidence and primed:
+            # The question SAID "show me photos of X", so the retrieved photos are
+            # the answer — they must not wait for the model to ask for them. Asked
+            # "find me all photos with dog", gemma4-E2B called `count_photos` and
+            # never called `search`, so the pool sat unused, the gathered block was
+            # just `count: 1 photo(s)`, and the model invented a photo id and a
+            # caption to fill the gap. Grounding on what retrieval actually returned
+            # removes the gap. Safe because the caller only sets this for an
+            # explicit show request (`is_photo_show`), never for a general question.
+            for pid in primed:
+                if pid not in seen:
+                    seen.add(pid)
+                    photo_ids.append(pid)
+            primed = None
     try:
         for round_no in range(max_rounds):
             turn = _agentic_turn(client, model, messages, force=round_no == max_rounds - 1)
             if turn is None or turn.get("action") == "answer":
                 break
-            result = _run_agentic_tool(conn, embedder, owner_id, turn, photo_ids, seen, facts)
+            if turn.get("action") == "search" and primed is not None:
+                # Serve the FIRST search from the pool retrieved before the model
+                # woke — even when it is empty. Re-embedding here would evict gemma
+                # and pay a ~9 s reload to bring it back (§8.1), and the question was
+                # already embedded (lower-cased) so a second pass rarely finds more.
+                ids, primed = primed, None
+                for pid in ids:
+                    if pid not in seen:
+                        seen.add(pid)
+                        photo_ids.append(pid)
+                result = _summarise(conn, owner_id, ids)
+            else:
+                result = _run_agentic_tool(
+                    conn, embedder, owner_id, turn, photo_ids, seen, facts
+                )
             messages.append({"role": "assistant", "content": json.dumps(turn)})
             messages.append({"role": "user", "content": result})
     except Exception:  # noqa: BLE001, S110 — degrade to what we gathered; never crash chat
         pass
     parts = list(facts)
     if photo_ids:
-        parts.append(build_context(conn, photo_ids))
+        parts.append(build_context(conn, photo_ids, strengths=strengths))
     grounded = bool(facts or photo_ids)
     return ("\n".join(parts) if grounded else ""), grounded
 
@@ -713,7 +800,13 @@ def _run_agentic_tool(
 ) -> str:
     """Run one agentic tool; append its result to `facts`/`photo_ids` and return a
     short line for the model's next turn. Search widens the candidate pool; the three
-    count tools produce REAL numbers as fact lines the final answer states verbatim."""
+    count tools produce REAL numbers as fact lines the final answer states verbatim.
+
+    The turn's FIRST search never reaches here — `agentic_gather` serves it from the
+    pool it retrieved before the model woke, which is what keeps SigLIP on one side
+    of the turn (§8.1). A later search, with a genuinely different query, lands here
+    and pays the swap.
+    """
     action = turn.get("action")
     if action == "search":
         query = turn.get("query")

@@ -160,6 +160,7 @@ def receive(
     enqueue(conn, photo_id, "embed")
     enqueue(conn, photo_id, "taxonomy")
     enqueue(conn, photo_id, "caption")
+    enqueue(conn, photo_id, "caption_embed")
     return ReceiveResult(
         photo_id=photo_id, content_hash=digest, created=True, source_added=added
     )

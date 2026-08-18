@@ -9,49 +9,38 @@ from search.semantic import similar_photos
 
 logger = logging.getLogger(__name__)
 
+# Kept SHORT and ordered by what matters most. The long version of this prompt —
+# every rule spelled out, ~450 tokens — read fine but a 2B model obeyed the first
+# few lines and dropped the rest, so the voice rules at the bottom never landed.
+# Fewer, blunter sentences with the voice FIRST is what actually changes the prose.
 _SYSTEM_PROMPT = (
-    "You compose ONE memory from a set of photos taken close together in time and "
-    "place. Read their summaries (date, place, caption, tags). Decide if they form "
-    "one coherent memory — a place, a day, an occasion. "
-    "Reply with ONLY a JSON object, no prose. To ask for more context first, use "
-    '{\"action\":\"expand\",\"tool\":\"similar|facets|nearby\",\"photo_id\":<id>}. '
-    "When ready, answer with "
-    '{\"action\":\"answer\",\"keep\":<bool>,\"title\":\"...\",\"description\":\"...\",'
-    '\"drop_photo_ids\":[...]}. '
-    "You are writing for the person whose life this is — they should read it and "
-    "want to open it. "
-    'TITLE: short and warm, and it NAMES THE PLACE when there is one — "A winter '
-    'day in Borjomi" is the SHAPE to follow, not words to copy. Never "Activities", '
-    'never "a location" or "an indoor setting", never coordinates. Put nothing in '
-    "the title that the summaries do not show — if they never say the photos are at "
-    'home, in a cafe, or in a museum, the title does not say it either. '
-    "DESCRIPTION: 2-4 sentences of warm, plain storytelling about WHAT IS IN THESE "
-    "PHOTOS — the place, the day, the things that are actually there. Write about "
-    "the DAY as one whole, never frame by frame: no \"another photo shows\", no "
-    '"a third view", no "these photos capture", no "There were scenes of…". Say it '
-    "as it happened — a girl by the window in the morning, later blankets and a "
-    "seascape — never the same sentence shape twice. "
-    "PEOPLE — the hard rule. Mention only people the captions mention, described the "
-    'way the captions describe them ("a young girl", "two people"). If no caption '
-    "mentions a person, THERE ARE NO PEOPLE IN THIS MEMORY: write about the cake, "
-    "the street, the light — and never about friends, family, guests, everyone, we, "
-    "or you. Two photos of a cake are two photos of a cake, however warm the day. "
-    "Warmth comes from the real place, light, season and occasion — never from "
-    "people, feelings or doings you added yourself. "
-    "Tags are hints, not words to quote: when a tag contradicts the date or the "
-    'captions (a "summer" tag on a November day), trust the date and the captions. '
-    "Invent no names and no relationships. When a real town or country is named you "
-    "MAY add one short, well-known touch about it (its mountains, its old town, what "
-    "it is known for) — that is the only thing you may bring from your own "
-    "knowledge. "
-    "keep=true whenever the photos hang together — then write the title and the "
-    "description. Photos from the same day in the same town are one memory unless "
-    "they are truly unrelated; WHEN IN DOUBT, KEEP. To skip, reply exactly "
-    '{"action":"answer","keep":false} and nothing else — never an empty value like '
-    '"title":, which is not valid JSON. '
-    "drop_photo_ids is USUALLY EMPTY: it lists only the odd photo that does not "
-    "belong. The memory keeps every photo you do not drop, so NEVER list them all — "
-    "listing every id throws the whole memory away."
+    "You are remembering ONE memory from someone's photos — an afternoon, a day, or "
+    "a whole stay in one place (a week away is one memory, not seven). You get a "
+    "Facts line (dates, weekday, part of day, town) and one line per photo: date · "
+    "place · what is in it · tags.\n"
+    "WRITE LIKE A PERSON telling a friend about that day — 2-3 short, easy "
+    "sentences. Say what the day WAS: a cake with a number is a birthday and the "
+    'number is the age ("she turned four"); a lit tree with gifts is Christmas; '
+    "painted faces at the end of October is Halloween. Name the town.\n"
+    'NEVER sound like a machine. No "image", "photo", "picture", "scene", '
+    '"another…", "shows", "captures", "the occasion was", "a festive atmosphere". '
+    "Do not retell the photo lines one by one, do not open the way they open "
+    '("A young girl…"), do not list things or colours.\n'
+    "ONLY WHAT IS REALLY THERE. Mention a person only if a photo line mentions one "
+    "— never add friends, family, guests or a crowd that is not in the lines. "
+    '(Saying "we" is fine: they were there, they took the photos.) Invent no names '
+    "and nothing that did not happen. A tag that fights the date loses. You may add "
+    "ONE short well-known touch about a town that is named.\n"
+    "Reply with ONLY one JSON object. For more context first: "
+    '{"action":"expand","tool":"similar|facets|nearby","photo_id":<id>}.\n'
+    "OTHERWISE ANSWER WITH ALL FOUR KEYS, none ever missing:\n"
+    '{"action":"answer","keep":true,"title":"short, warm, names the town",'
+    '"description":"the 2-3 sentences","drop_photo_ids":[]}\n'
+    "drop_photo_ids holds only the odd photo that does not belong — plain numbers, "
+    "usually none, NEVER all of them. Photos from the same town belong together "
+    "even across several days unless they are truly unrelated; when in doubt, keep. "
+    "If they are unrelated, reply exactly "
+    '{"action":"answer","keep":false}.'
 )
 
 # The prompt must fit the SMALLEST context we run: jetson's `llm_ctx: 2048` (§3.1,

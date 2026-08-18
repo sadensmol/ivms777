@@ -193,6 +193,18 @@ h1 { margin: 0 0 1rem; }
 .collection-origin img { display: block; width: 48px; height: 48px; object-fit: cover;
   border-radius: 6px; }
 
+/* Base then This — the two photos' own words, in the same order as the similarity
+   table's columns, so the header reads straight into it. Stacked, not columned:
+   the panel is ~30% of the viewport, too narrow for two readable text columns. */
+.compare-pair { margin-top: 10px; display: flex; flex-direction: column; gap: 10px; }
+.compare-side { min-width: 0; padding-left: 8px; border-left: 2px solid #333; }
+.compare-side + .compare-side { border-left-color: #b5651d; }
+.compare-label { font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
+  color: #9aa0a6; margin-bottom: 3px; }
+.compare-title { font-size: 14px; font-weight: 600; color: #eee; }
+.compare-desc { font-size: 13px; color: #bbb; margin: 3px 0 0; }
+.compare-caption { font-size: 13px; color: #8d8d8d; margin: 3px 0 0; }
+
 button.danger { background: #7a3b0e; border-color: #b5651d; color: #fff; }
 button.danger:hover { background: #925017; }
 
@@ -232,6 +244,15 @@ button.danger:hover { background: #925017; }
   border-bottom-right-radius: 5px; }
 .msg.assistant .bubble { background: #1e1e1e; color: #e6e6e6; border: 1px solid #2a2a2a;
   border-bottom-left-radius: 5px; }
+/* Per-message timestamp, under the message. Deliberately quiet: it is reference
+   information, never something that competes with the answer. Empty until the turn
+   completes, so it must not reserve space when blank. */
+.msg-meta { font-size: 0.72rem; color: #7a7a7a; margin-top: 3px; padding: 0 4px;
+  font-variant-numeric: tabular-nums; }
+.msg-meta:empty { display: none; }
+/* …and on an answer, one more line ABOVE it: the wait that came before it
+   ("thought for 12.4 s"), so the gap belongs underneath instead. */
+.msg-think { margin: 0 0 3px; }
 .msg .sources { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 6px; }
 img.cite { height: 40px; width: 40px; object-fit: cover; border-radius: 4px;
   vertical-align: middle; margin: 0 2px; }

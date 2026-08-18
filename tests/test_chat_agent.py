@@ -324,3 +324,153 @@ def test_is_app_topic_false_for_genuinely_off_topic():
         "how do I bake bread?",
     ]:
         assert is_app_topic(q) is False, q
+
+
+def test_uppercase_queries_still_find_the_photo(conn):
+    # SigLIP's text tower is trained on lower-case web captions and is case
+    # SENSITIVE in a way that misleads: "DOG" reads as text PRINTED IN the image, so
+    # it returned documents and ID cards while "dog" returned the dog at rank 1.
+    # Measured on the board: "show me all photos with DOG on it!" found nothing.
+    from embedding.fakes import FakeEmbedder
+    from search.semantic import search_photos
+    from tests.factories import add_photo
+
+    class CaseSpy(FakeEmbedder):
+        def __init__(self):
+            super().__init__()
+            self.seen = []
+
+        def embed_texts(self, texts):
+            self.seen.extend(texts)
+            return super().embed_texts(texts)
+
+    add_photo(conn, photo_id=1, content_hash="h1", thumb_key="1.jpg")
+    spy = CaseSpy()
+    search_photos(conn, spy, 1, "show me all photos with DOG on it!", 5)
+    assert spy.seen == ["show me all photos with dog on it!"]
+
+
+def test_priming_is_off_by_default_so_a_general_question_never_wakes_siglip(conn):
+    # Default (guardrails off): gemma decides first. A question that never calls
+    # `search` must not touch SigLIP at all — otherwise an already-resident gemma is
+    # evicted and reloaded for nothing (§8.1).
+    from chat.agent import agentic_gather
+    from embedding.fakes import FakeEmbedder
+    from inference.fakes import FakeInferenceClient
+    from tests.factories import add_photo
+
+    calls = []
+
+    class CountingEmbedder(FakeEmbedder):
+        def embed_texts(self, texts):
+            calls.append(texts[0])
+            return super().embed_texts(texts)
+
+    add_photo(conn, photo_id=1, content_hash="h1", thumb_key="1.jpg", caption="a dog")
+    client = FakeInferenceClient(
+        responses=[json.dumps({"action": "answer", "query": None, "grain": None})]
+    )
+    agentic_gather(conn, CountingEmbedder(), client, "m", 1, "how many planets are there")
+    assert calls == []
+
+
+def test_priming_on_retrieves_before_the_model_and_only_once(conn):
+    # Guardrails on: the question is about the library by policy, so retrieve up
+    # front and let the first `search` serve from that pool — one SigLIP call.
+    from chat.agent import agentic_gather
+    from embedding.fakes import FakeEmbedder
+    from inference.fakes import FakeInferenceClient
+    from tests.factories import add_photo
+
+    calls = []
+
+    class CountingEmbedder(FakeEmbedder):
+        def embed_texts(self, texts):
+            calls.append(texts[0])
+            return super().embed_texts(texts)
+
+    for pid in (1, 2):
+        add_photo(conn, photo_id=pid, content_hash=f"h{pid}", thumb_key=f"{pid}.jpg",
+                  caption="a dog")
+    client = FakeInferenceClient(responses=[
+        json.dumps({"action": "search", "query": "dog", "grain": None}),
+        json.dumps({"action": "answer", "query": None, "grain": None}),
+    ])
+    agentic_gather(conn, CountingEmbedder(), client, "m", 1, "show me photos of a dog",
+                   prime=True)
+    assert len(calls) == 1
+    assert calls[0] == "show me photos of a dog"
+
+
+def test_a_general_question_is_not_grounded_by_the_primed_pool(conn):
+    # Priming must not make every message look photo-related: the pool is
+    # candidates, not evidence, so `grounded` stays False when the model answers
+    # without calling a tool.
+    from chat.agent import agentic_gather
+    from embedding.fakes import FakeEmbedder
+    from inference.fakes import FakeInferenceClient
+    from tests.factories import add_photo
+
+    add_photo(conn, photo_id=1, content_hash="h1", thumb_key="1.jpg", caption="a dog")
+    client = FakeInferenceClient(
+        responses=[json.dumps({"action": "answer", "query": None, "grain": None})]
+    )
+    block, grounded = agentic_gather(
+        conn, FakeEmbedder(), client, "m", 1, "what is the capital of France"
+    )
+    assert grounded is False and block == ""
+
+
+def test_photo_show_intent_is_recognised_without_a_model():
+    from chat.agent import is_photo_show
+
+    for q in ("find me all photos with dog", "show me photos of a dog",
+              "find all photos with man in black", "show my beach pictures",
+              "list photos with cars"):
+        assert is_photo_show(q), q
+    # A count is not a show request, nor is a memory request, nor a general question.
+    for q in ("how many photos do I have", "how many photos with dogs",
+              "show me my Tbilisi memory", "what is the capital of France",
+              "how do I bake bread"):
+        assert not is_photo_show(q), q
+
+
+def test_relative_strength_is_used_not_an_absolute_score(conn):
+    # Measured on the real library: SigLIP's calibrated probability for a CORRECT
+    # top hit is 0.76%-9.8%, and top-1 cosines for subjects that ARE present
+    # (0.0889-0.1313) overlap those for subjects that are NOT (0.0137-0.0921) —
+    # "a birthday cake" (present, 0.0889) scores below "sushi on a plate" (absent,
+    # 0.0921). So no absolute threshold works, and printing ~1% would read as "no
+    # match". Only the ordering within one query is meaningful.
+    from embedding.fakes import FakeEmbedder
+    from search.semantic import search_photos_scored
+    from tests.factories import add_photo
+
+    fe = FakeEmbedder()
+    for pid, word in ((1, "beach"), (2, "keyboard"), (3, "mountain")):
+        add_photo(conn, photo_id=pid, content_hash=f"h{pid}", thumb_key=f"{pid}.jpg")
+        write_vector(conn, pid, fe.embed_texts([word])[0])
+
+    scored = search_photos_scored(conn, fe, 1, "beach", 3)
+    assert scored, "expected hits"
+    assert scored[0][1] == 1.0                      # best hit is the reference point
+    assert all(0.0 <= strength <= 1.0 for _, strength in scored)
+    assert [s for _, s in scored] == sorted((s for _, s in scored), reverse=True)
+
+
+def test_the_context_tells_the_model_what_the_image_model_saw(conn):
+    # The caption cannot mention every attribute (clothing colour, small objects),
+    # so the block must carry the visual rank — otherwise the model rejects rank 1
+    # purely because the caption is worded differently, which is the "man in black"
+    # bug: SigLIP ranked it #1 and gemma answered "no photos".
+    from chat.context import build_context
+    from tests.factories import add_photo
+
+    add_photo(conn, photo_id=1, content_hash="h1", thumb_key="1.jpg",
+              caption="A man with facial hair looks directly at the camera")
+    block = build_context(conn, [1], strengths={1: 1.0})
+    assert "visual match: rank 1" in block
+    assert "100% as close as the best match" in block
+    # Without strengths the block is unchanged — other callers must not grow a
+    # meaningless rank line.
+    assert "visual match" not in build_context(conn, [1])

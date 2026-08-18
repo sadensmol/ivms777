@@ -9,28 +9,184 @@
 # probability is within `select_ratio` of the top's, up to `max_per_dim` labels.
 max_per_dim: 3
 select_ratio: 0.5
-# "Similar photos" (§9): how much each dimension matters when comparing two
-# photos. subject (what it IS) dominates; quality is irrelevant to similarity
-# (0 = ignored entirely). Tune freely — higher means that facet pulls harder.
-similar_dimension_weights:
-  subject: 3.0
-  setting: 1.5
-  occasion: 1.5
-  vibe: 1.0
-  emotion: 1.0
-  light: 0.8
-  season_weather: 0.8
-  composition: 0.8
-  palette: 0.5
-  quality: 0.0
+# "Similar photos" (§9): how hard each GROUP of dimensions pulls when comparing two
+# photos. A weight is the most that signal may ever claim on its own, on the same
+# 0–1 scale as the image, caption and moment signals in `search/signals.py`.
+#
+#   subject 0.75  what the photo IS — the ONLY tag tier that can make two photos
+#                 similar by itself, and the most reliable dimension by far
+#                 (median top-score 0.83; 93% of photos clear 0.5).
+#   where   0.40  setting + occasion. WHERE it was, WHICH event. Reorders a match,
+#                 never creates one.
+#   look    0.12  light, season_weather, palette, vibe, composition, emotion —
+#                 how it LOOKS. Measured worst: `emotion` clears 0.5 on 28% of
+#                 photos and `surprised` lands on half the library, objects
+#                 included. Two photos shot top-down in cool light are not
+#                 "the same thing".
+#   quality 0.03  sharpness — a pure tiebreak. `sharp` is on 201/206 photos, so idf
+#                 cuts it to ~0.01 in practice. It can never qualify anything.
+#
+# These replaced ten hand-tuned per-dimension numbers that could not be reasoned
+# about. `idf` already handles the part that genuinely varies — how RARE a specific
+# label is — so a shared `museum` still outranks a shared `indoor` without either
+# needing a weight of its own. Tune freely; the gates live in `search/signals.py`.
+similar_tier_weights:
+  subject: 0.75
+  where: 0.40
+  look: 0.12
+  quality: 0.03
 dimensions:
-  subject: [portrait, group of people, selfie, candid, pet, dog, cat, bird, wildlife, food, drink, dessert, architecture, interior, nature, landscape, plant, flower, vehicle, car, boat, aircraft, document, text, screenshot, artwork, toy, sports, crowd]
+  # `subject` is the ONE content dimension (§9), so its labels must be mutually
+  # exclusive — softmax picks exactly one, and two photos of the same thing must
+  # land on the SAME label or they share nothing. `portrait`/`selfie`/`candid`/
+  # `group of people` all mean "a photo of people" and split that mass five ways:
+  # eleven family photos of one trip landed on nature ×4, group of people ×3,
+  # selfie ×3, crowd ×1 — no two matched. They are collapsed to person/people/crowd
+  # (how MANY, which is the part that differs), and how-it-was-taken moved to
+  # `composition: selfie`. `clothing`/`product` fill the gaps that were forcing
+  # wrong labels (torn jeans -> "selfie", a bottle of motor oil -> "screenshot").
+  subject: [person, people, crowd, pet, dog, cat, bird, wildlife, food, drink, dessert, building, interior, nature, landscape, plant, flower, vehicle, car, boat, aircraft, document, text, screenshot, artwork, toy, clothing, product, sports]
   setting: [indoor, outdoor, beach, ocean, lake, river, mountain, hill, forest, park, garden, desert, field, city street, urban, suburban, rural, restaurant, cafe, bar, home, bedroom, kitchen, office, shop, museum, church, stadium, airport, station, water, snow]
   vibe: [cozy, energetic, serene, calm, moody, festive, nostalgic, dramatic, minimal, chaotic, romantic, playful, elegant, gritty, dreamy, epic]
   emotion: [joyful, happy, sad, tense, angry, surprised, affectionate, playful, contemplative, proud, bored, neutral]
   light: [golden hour, blue hour, sunrise, sunset, night, harsh midday, overcast, shade, backlit, side light, neon, candlelit, studio light, low light]
-  season_weather: [summer, autumn, winter, spring, rain, snow, fog, mist, storm, cloudy, clear sky, sunny, windy]
-  composition: [close-up, macro, portrait orientation, wide shot, panorama, aerial, top-down, shallow depth of field, deep focus, symmetry, rule of thirds, silhouette, leading lines, framing, patterns, negative space]
+  season_weather: [summer, autumn, winter, spring, rain, snow, fog, storm, cloudy, clear sky, sunny, windy]
+  composition: [close-up, macro, selfie, portrait orientation, wide shot, panorama, aerial, top-down, shallow depth of field, deep focus, symmetry, rule of thirds, silhouette, leading lines, patterns, negative space]
   palette: [warm, cool, pastel, vivid, saturated, muted, monochrome, black and white, sepia, dark, bright, high contrast, low contrast, earthy, neon]
   occasion: [birthday, wedding, party, graduation, travel, vacation, hike, camping, road trip, concert, festival, sports event, holiday, christmas, halloween, everyday, work, meeting]
   quality: [sharp, blurry, motion blur, noisy, grainy, overexposed, underexposed, well exposed, low resolution, high detail]
+
+# What each label SAYS to SigLIP's text tower (§7), keyed by dimension then label.
+# A label with no entry falls back to its dimension's template in ingest/taxonomy.py.
+#
+# This exists because the templates alone produce prompts SigLIP was never trained
+# on — "a photo of portrait", "a photo of top-down", "a photo of work". Measured
+# against a hand-labelled sample, the template-only `subject` was right 37% of the
+# time; saying each label the way a caption would, and averaging over a couple of
+# phrasings, took the same model to 80% (top-3: 68% -> 100%). No re-embedding of
+# images is involved — only the label side changes, so a re-tag is cheap.
+#
+# Rules of thumb when editing: describe what would be VISIBLE, disambiguate labels
+# that compete for the same photos, and give a label two phrasings when one alone
+# reads oddly. Re-run "Reprocess all photos" (taxonomy) on /upload after editing.
+prompts:
+  subject:
+    person: ["a photo of one person", "a portrait of a person"]
+    people: ["a photo of two or more people together", "a photo of a family together"]
+    crowd: ["a photo of a large crowd of people in a public place"]
+    pet: ["a photo of a pet animal"]
+    wildlife: ["a photo of a wild animal"]
+    food: ["a photo of food", "a photo of a meal on a plate"]
+    drink: ["a photo of a drink in a glass or cup"]
+    dessert: ["a photo of a cake or dessert"]
+    building: ["a photo of a building", "a photo of a house or block of flats"]
+    interior: ["a photo of the inside of a room"]
+    nature: ["a photo of trees and plants outdoors with no people"]
+    landscape: ["a scenic view of the countryside or mountains"]
+    plant: ["a close-up photo of a plant"]
+    flower: ["a close-up photo of a flower"]
+    aircraft: ["a photo of an aeroplane"]
+    document: ["a photo of a printed document or paper"]
+    text: ["a photo of a sign with writing on it"]
+    screenshot: ["a screenshot of a phone or computer user interface"]
+    artwork: ["a photo of a drawing, painting or handmade craft object"]
+    clothing: ["a photo of clothing or shoes"]
+    product: ["a photo of a product package, bottle or box"]
+    sports: ["a photo of people playing sport"]
+  setting:
+    indoor: ["a photo taken indoors"]
+    beach: ["a photo taken on a sandy beach"]
+    ocean: ["a photo taken at the sea"]
+    lake: ["a photo taken at a lake"]
+    river: ["a photo taken beside a river"]
+    mountain: ["a photo taken in the mountains"]
+    hill: ["a photo taken on a hillside"]
+    forest: ["a photo taken in a forest"]
+    park: ["a photo taken in a public park"]
+    garden: ["a photo taken in a garden"]
+    desert: ["a photo taken in a desert"]
+    field: ["a photo taken in an open field"]
+    restaurant: ["a photo taken inside a restaurant"]
+    cafe: ["a photo taken inside a cafe"]
+    bar: ["a photo taken inside a bar"]
+    bedroom: ["a photo taken in a bedroom"]
+    kitchen: ["a photo taken in a kitchen"]
+    office: ["a photo taken in an office"]
+    shop: ["a photo taken inside a shop"]
+    museum: ["a photo taken inside a museum"]
+    church: ["a photo taken at a church"]
+    stadium: ["a photo taken in a stadium"]
+    airport: ["a photo taken at an airport"]
+    station: ["a photo taken at a railway station"]
+    outdoor: ["a photo taken outdoors"]
+    city street: ["a photo taken on a city street"]
+    urban: ["a photo taken in a city"]
+    suburban: ["a photo taken in a residential suburb"]
+    rural: ["a photo taken in the countryside"]
+    home: ["a photo taken at home"]
+    water: ["a photo taken beside water"]
+    snow: ["a photo taken in the snow"]
+  occasion:
+    birthday: ["a photo taken at a birthday party"]
+    wedding: ["a photo taken at a wedding"]
+    party: ["a photo taken at a party"]
+    graduation: ["a photo taken at a graduation ceremony"]
+    camping: ["a photo taken while camping"]
+    concert: ["a photo taken at a concert"]
+    festival: ["a photo taken at a festival"]
+    christmas: ["a photo taken at christmas"]
+    halloween: ["a photo taken at halloween"]
+    travel: ["a photo taken while travelling abroad"]
+    vacation: ["a photo taken on holiday"]
+    hike: ["a photo taken while hiking on a trail"]
+    road trip: ["a photo taken on a road trip"]
+    everyday: ["an ordinary everyday photo"]
+    work: ["a photo taken at work in an office"]
+    meeting: ["a photo taken during a meeting"]
+    holiday: ["a photo taken at a holiday celebration with decorations"]
+    sports event: ["a photo taken at a sports match"]
+  composition:
+    close-up: ["a close-up photo"]
+    macro: ["an extreme macro photo"]
+    selfie: ["a selfie taken at arm's length"]
+    portrait orientation: ["a tall vertical photo"]
+    wide shot: ["a wide shot showing the whole scene"]
+    panorama: ["a very wide panoramic photo"]
+    aerial: ["a photo taken from the air"]
+    top-down: ["a photo taken looking straight down from above"]
+    shallow depth of field: ["a photo with a blurred background"]
+    deep focus: ["a photo sharp from front to back"]
+    symmetry: ["a symmetrical photo"]
+    rule of thirds: ["a photo with the subject off to one side"]
+    silhouette: ["a silhouette against a bright background"]
+    leading lines: ["a photo with strong lines leading into the distance"]
+    patterns: ["a photo of a repeating pattern"]
+    negative space: ["a photo with a lot of empty space around the subject"]
+  light:
+    night: ["a photo taken at night"]
+    shade: ["a photo taken in the shade"]
+    backlit: ["a photo taken against the light"]
+    side light: ["a photo lit from one side"]
+    studio light: ["a photo taken with studio lighting"]
+    low light: ["a photo taken in very dim light"]
+    harsh midday: ["a photo taken in harsh midday sun"]
+    overcast: ["a photo taken under an overcast sky"]
+  palette:
+    monochrome: ["a monochrome photo in a single colour"]
+    black and white: ["a black and white photo"]
+    sepia: ["a sepia toned photo"]
+    high contrast: ["a high contrast photo"]
+    low contrast: ["a flat low contrast photo"]
+  season_weather:
+    summer: ["a photo taken in summer"]
+    autumn: ["a photo taken in autumn with fallen leaves"]
+    winter: ["a photo taken in winter"]
+    spring: ["a photo taken in spring with blossom"]
+    rain: ["a photo taken in the rain"]
+    snow: ["a photo taken while it is snowing"]
+    fog: ["a photo taken in thick fog"]
+    storm: ["a photo taken during a storm"]
+    cloudy: ["a photo taken under a cloudy sky"]
+    sunny: ["a photo taken on a sunny day"]
+    clear sky: ["a photo taken under a clear blue sky"]
+    windy: ["a photo taken on a windy day"]

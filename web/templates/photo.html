@@ -18,13 +18,17 @@
        onclick="location.replace(this.href);return false;">›</a>{% endif %}
   </div>
   <aside class="photo-panel">
+    {# In a "similar" layer the photo's own words live in the Base|This pair at the
+       top, so the standalone block below the table would just repeat them. #}
+    {% set comparing = collection and collection.origin_id and collection.origin_id != photo['id'] %}
     {% if collection and collection.title %}
       <div class="photo-collection">
         <div class="photo-collection-head">
           {% if collection.origin_id %}
-            {# The photo this "similar" layer branched from — clickable to jump
-               back to it. REPLACE so history stays [grid, photo] (§13). #}
-            <a class="collection-origin" href="/photo/{{ collection.origin_id }}"
+            {# The photo this "similar" layer branched from — the level close goes
+               up to, so the thumbnail is the same move: same URL, REPLACE, so
+               history stays [grid, photo] (§13.1). #}
+            <a class="collection-origin" href="{{ origin_url }}"
                title="Back to this photo" onclick="location.replace(this.href);return false;">
               <img src="/thumb/{{ collection.origin_id }}" alt="">
             </a>
@@ -36,6 +40,24 @@
         </div>
         {% if collection.description %}
           <p class="photo-collection-desc">{{ collection.description }}</p>
+        {% endif %}
+        {% if comparing %}
+          {# What is being compared, in the photos' OWN words, right above the
+             table that scores them — same Base | This order as its columns. #}
+          <div class="compare-pair">
+            <div class="compare-side">
+              <div class="compare-label">Base</div>
+              {% if collection.origin_title %}<div class="compare-title">{{ collection.origin_title }}</div>{% endif %}
+              {% if collection.origin_description %}<p class="compare-desc">{{ collection.origin_description }}</p>{% endif %}
+              {% if collection.origin_caption %}<p class="compare-caption">{{ collection.origin_caption }}</p>{% endif %}
+            </div>
+            <div class="compare-side">
+              <div class="compare-label">This</div>
+              {% if photo['ai_title'] %}<div class="compare-title">{{ photo['ai_title'] }}</div>{% endif %}
+              {% if photo['ai_description'] %}<p class="compare-desc">{{ photo['ai_description'] }}</p>{% endif %}
+              {% if photo['caption'] %}<p class="compare-caption">{{ photo['caption'] }}</p>{% endif %}
+            </div>
+          </div>
         {% endif %}
       </div>
     {% endif %}
@@ -49,12 +71,14 @@
         {% endfor %}
       </table>
     {% endif %}
-    {% if photo['ai_title'] %}<h2 class="photo-title">{{ photo['ai_title'] }}</h2>{% endif %}
-    {% if photo['ai_description'] %}<p class="photo-desc">{{ photo['ai_description'] }}</p>{% endif %}
-    {% if photo['caption'] %}
-      <p class="photo-caption">{{ photo['caption'] }}
-        {% if photo['caption_model'] %}<span class="muted">— {{ photo['caption_model'] }}</span>{% endif %}
-      </p>
+    {% if not comparing %}
+      {% if photo['ai_title'] %}<h2 class="photo-title">{{ photo['ai_title'] }}</h2>{% endif %}
+      {% if photo['ai_description'] %}<p class="photo-desc">{{ photo['ai_description'] }}</p>{% endif %}
+      {% if photo['caption'] %}
+        <p class="photo-caption">{{ photo['caption'] }}
+          {% if photo['caption_model'] %}<span class="muted">— {{ photo['caption_model'] }}</span>{% endif %}
+        </p>
+      {% endif %}
     {% endif %}
 
     <h3>AI</h3>
@@ -127,14 +151,20 @@
   <p class="hint">Finding similar photos…</p>
 </div>
 <script>
-  // Close the leaf: go UP to the grid. Prefer history.back() so the grid restores
-  // its scroll + filters via bfcache (§13.1); if there's nothing to go back to
-  // (deep link, opened in a new tab), fall back to the computed grid URL so close
-  // and Esc NEVER silently do nothing — the "Esc stopped working" bug.
+  // Close the leaf: go UP exactly ONE level (§13.1 rule 4). Normally that is the
+  // grid, so prefer history.back() — it restores the grid's scroll + filters via
+  // bfcache; if there's nothing to go back to (deep link, opened in a new tab),
+  // fall back to the computed URL so close and Esc NEVER silently do nothing —
+  // the "Esc stopped working" bug.
   var ivmsOrigin = {{ origin_url|tojson }};
+  // A "similar" leaf has one extra level above it: the origin photo. Close goes
+  // THERE first, by replacing this history entry (never pushing), so depth stays
+  // two and the next close still back()s to the grid: similar -> origin -> grid.
+  var ivmsCloseReplaces = {{ (comparing or false)|tojson }};
   function ivmsClose(e) {
     if (e) e.preventDefault();
-    if (history.length > 1) history.back();
+    if (ivmsCloseReplaces) location.replace(ivmsOrigin);
+    else if (history.length > 1) history.back();
     else window.location.href = ivmsOrigin;
     return false;
   }

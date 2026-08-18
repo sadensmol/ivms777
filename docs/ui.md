@@ -59,7 +59,8 @@ model; this file is the per-route detail. Section references point into
   restart**), and failed files (Web Worker for hashing/upload, HTMX polling for
   processing). Every stage row carries its own **Reprocess** button that re-runs just
   that stage over the already-uploaded library without re-uploading — `thumbnail`,
-  `embed`, `taxonomy` (re-tag), and a confirm-guarded `caption` (re-caption, the slow
+  `embed`, `taxonomy` (re-tag), `caption embed` (the §9 caption vector, shown with a
+  space), and a confirm-guarded `caption` (re-caption, the slow
   one); the worker drains the reset jobs.
 - `/export` — choose a layout, preview the folder tree it would produce, and download
   the manifest. Shows whether the collection is fully processed, and the exact
@@ -99,19 +100,27 @@ model; this file is the per-route detail. Section references point into
   the **same tile size as the similar strip** so the two read as one gallery. The
   similar strip then **excludes any photo already in that collection**, so a member
   never appears twice. Each similar thumbnail is **enlarged and labelled with why it
-  matched** — its top-3 reasons (shared tags / caption words / "looks alike") with
-  confidence percentages, one per line, sorted highest-confidence first, overlaid on
-  the image — so similarity is never a black box (§9). Opening a similar photo opens in
+  matched** — its top-3 reasons (shared tags / caption meaning / "looks alike" / "same
+  time & place") with confidence percentages, one per line, **sorted by what actually
+  drove the match**, not by the biggest percentage, overlaid on the image — so
+  similarity is never a black box (§9). Opening a similar photo opens in
   a **"Similar to <this photo>"** layer (`ctx=similar:<id>`) that shows the base
   photo's thumbnail (clickable, to jump back to it) and pages within this photo's
   similar set. **A photo is always exactly one level below a grid** (§13.1): every
   photo→photo move — prev/next, opening a similar, the origin thumbnail — **replaces**
   history, so it stays `[grid, photo]` and **close always goes up to the grid** (the
   library for `library`/`q`/`similar:*`, the album for `album:*`), never replaying the
-  chain of photos visited. The layer panel leads with a **"Why similar — base vs
-  this"** table: every shared facet (tag, caption meaning, visual), both photos' values
-  side by side and their match %, sorted high-to-low — so a weak match is visibly weak
-  (mostly "visual" with faint generic tags) rather than a mystery. The panel also
+  chain of photos visited. The layer panel leads with the two photos' **own words —
+  `Base` then `This`**, each with that photo's AI title, description, and caption, in
+  the same order as the comparison table's columns, so *what* is being compared is read
+  before *how* it scored (in this layer the leaf's own title/description/caption block
+  is not repeated below the table). Then the **"Why similar — base vs this"** table:
+  every facet that ACTUALLY SCORED (tag, caption meaning, visual, moment), both photos'
+  values side by side and their match %, **sorted by how much each drove the match** —
+  so a weak match is visibly weak rather than a mystery. Facets below their gate get no
+  row at all: they contributed nothing, so the panel must not claim them. Sorting by
+  match % instead is what used to headline two unrelated photos with `light: low light
+  69%` — a big percentage is not a big reason. The panel also
   offers **per-photo reprocess** — *Re-tag* and a confirm-guarded *Re-caption* — that
   re-run just this photo's model stages (§8); thumbnails and embeddings are static and
   are not offered. The AI title/description and tags fill in with the caption and
@@ -130,6 +139,15 @@ model; this file is the per-route detail. Section references point into
 - `/chat` — a normal chat view: a running **conversation history** of questions and
   their grounded answers, a text **input** at the bottom, a **processing indicator**
   while the model works, streamed answer tokens, and inline thumbnail citations.
+  A `thought for … · HH:MM` line sits **above** each answer, in the order it
+  happened: it is the **wait before the answer** — request in to first token out,
+  covering routing, retrieval and any model swap — and deliberately **excludes
+  streaming time**, since once tokens are arriving the user is reading, not waiting,
+  and a long answer is not a slow one. The server announces it on its own `thinking`
+  SSE event as the first token goes out, so it prints as the answer starts rather
+  than after it ends, and it is persisted with the turn so a reload shows the same
+  number. The log **follows the stream to the bottom** and scrolls once more when
+  the turn finishes.
   History is **persisted** (`chat_sessions`/`chat_messages`, §6) and re-rendered
   server-side on load, so it survives navigation and restarts; a **New session** button
   starts a fresh conversation. Each question is grounded independently — retrieval runs

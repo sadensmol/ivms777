@@ -135,7 +135,11 @@ CREATE TABLE IF NOT EXISTS chat_messages (
   question   TEXT NOT NULL,
   answer     TEXT NOT NULL,
   sources    TEXT,                     -- JSON array of cited photo ids
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  -- Wall-clock the whole turn took, end to end (§10). Shown in the UI as
+  -- "thought for N s" — on the Jetson a turn can include a model swap, so how
+  -- long it took is information the user wants, not a detail.
+  elapsed_ms INTEGER
 );
 CREATE INDEX IF NOT EXISTS chat_messages_session ON chat_messages(session_id, id);
 

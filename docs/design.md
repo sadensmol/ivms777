@@ -567,6 +567,19 @@ The scoring design:
   probabilities are tiny and flat, so tags are chosen by a **softmax over each
   dimension's own labels** (top label + runners-up within `select_ratio`, capped at
   `max_per_dim`), storing a real within-dimension 0..1 confidence.
+- **Every label says itself in its own words.** A label is not fed to the text tower
+  as its own name in a template; `vocab.yaml`'s `prompts:` block gives it one or more
+  natural sentences, embedded and **averaged** (prompt ensembling), with the
+  dimension's template only as a fallback. SigLIP's text tower is trained on real
+  captions, so "a photo of portrait" / "a photo of top-down" / "a photo of work" cost
+  real accuracy: measured against a hand-labelled sample, `subject` was right **37%**
+  of the time and is now **80%** (top-3 68% → 100%), with median confidence 0.39 →
+  0.76. Only the label side changes, so re-tagging a whole library is seconds.
+- **The `subject` labels must be mutually exclusive**, because softmax picks exactly
+  one and §9's content gate is built on it. `portrait`/`selfie`/`candid`/`group of
+  people` all meant "people" and split that mass four ways — eleven family photos of
+  one trip landed on four different labels and shared nothing. They are now
+  `person`/`people`/`crowd` (how many), with framing moved to `composition: selfie`.
 - **Captions write NO tags** (decision) — a flat-`1.0` free-text VLM guess used to
   override SigLIP's honest scores and mislabel photos. Tags come only from SigLIP +
   pixel stats (`palette`/`quality`) + EXIF.
@@ -583,7 +596,8 @@ in [`docs/taxonomy.md`](taxonomy.md#vocabulary-mining).
 ## 8. Ingest pipeline
 
 Every photo flows through a **resumable, per-stage job queue** (`jobs`, §6):
-`receive` → `facets` → `thumbnail` → `embed` → `taxonomy` → `caption`. `receive`
+`receive` → `facets` → `thumbnail` → `embed` → `taxonomy` → `caption` →
+`caption_embed`. `receive`
 runs synchronously in `app`; everything after is drained by the `worker`, and
 killing/restarting the container resumes exactly where it stopped. **The exact
 per-stage mechanics, reprocess endpoints, and failure handling are in
@@ -595,8 +609,10 @@ The design decisions that matter:
   and tagged before any is captioned. On the 8 GB Jetson this is what keeps SigLIP
   and the captioner from being needed at once, and it means search + "similar" work
   across the whole collection minutes after upload, while captions fill in over
-  hours. The caption's text embedding (`caption_vec`, §9) is a separate batch step,
-  never interleaved per photo.
+  hours. The caption's text embedding (`caption_vec`, §9) is the last stage,
+  `caption_embed` — queued and counted per photo like every other stage, so it shows
+  its own progress row, but **drained in one batch** (the text embedder loads once
+  and embeds up to 50 captions per call), never interleaved per photo.
 - **Degrade, never crash.** A drain pass runs the GPU-free stages (thumbnail, place
   facets, deletions) first, then the inference stages; if the `models` service is
   down the inference group is skipped and retried next pass, so photos still appear
@@ -713,20 +729,23 @@ the `/resources` fields — is in
 
 Retrieval is **one core, two stages** (`search/retriever.py`, plan 12 — see
 §9.2 for the full interface). **`candidates()`** is fast and has no LLM: for a
-seed photo it is the image-vector KNN unioned with shared-tag and
-caption-meaning matches (the same union `similar_photos` has always used); for
-text it is SigLIP semantic KNN fused with FTS5 keyword search. **`refine()`**
-then applies the rule that governs the whole core:
+seed photo it is the image-vector KNN unioned with shared-tag, caption-meaning
+and **same-moment** matches; for text it is SigLIP semantic KNN fused with FTS5
+keyword search. **`refine()`** then applies the rule that governs the whole core:
 
 **The ADR — hard filters gate, everything else scores.** EXIF facets and
 explicit user/planner *facet*/*date* predicates (section 6.2) are **hard**: an
 exact cut applied before ranking, and a photo that fails one is **out**, no
-matter how well it would otherwise score. Every model-derived signal — shared
-tags, caption-meaning cosine, image-vector cosine, the semantic/keyword fusion
-rank — is **soft**: an additive **contribution**. A missing signal (no caption
-vector yet, no tag) is *unavailable*, not zero, so it is skipped for that one
-photo, never a kill switch. This is the rule `similar` always followed; §10
-explains why chat needed it made structural too.
+matter how well it would otherwise score. Every other signal — shared tags,
+caption-meaning cosine, image-vector cosine, the shared moment, the
+semantic/keyword fusion rank — is **soft**: a scored **contribution**. A missing
+signal (no caption vector yet, no tag, no GPS) is *unavailable*, not zero, so it
+is skipped for that one photo, never a kill switch. This is the rule `similar`
+always followed; §10 explains why chat needed it made structural too.
+
+EXIF time and place are the exception that proves the rule: as a *predicate* they
+are a hard filter (§6.2), and as a *similarity signal* — the `moment` below — they
+are soft like everything else. Same data, two roles, never confused.
 
 What used to be described as four separate mechanisms are now candidate
 generation and contributions of the one core:
@@ -743,6 +762,10 @@ generation and contributions of the one core:
 - **Tag facets** — model-derived tag filters are no longer a pre-ranking SQL
   narrow; a sidebar/planner tag hint is a **soft** contribution
   (`_soft_tag_contributions`, §9.2) scored by `refine()`, never a gate.
+- **Moment** — for a seed photo only, EXIF time and GPS also generate candidates
+  (`search/moment.py`): photos from the same stretch of time in the same place,
+  which no model-derived signal can reach. It is the only source needing neither
+  an embedding nor a caption.
 
 `/library` search calls `candidates()` directly for the fused ranking, then
 narrows that list by the sidebar's EXIF/tag filters — the same
@@ -758,12 +781,12 @@ flowchart TB
 
     subgraph gen["1 · candidates() — fast, no LLM"]
         t["text → SigLIP text→image KNN ⊕ FTS keyword, RRF-fused"]
-        s["seed → image-vector KNN ∪ shared-tag ∪ caption-meaning matches"]
+        s["seed → image-vector KNN ∪ shared-tag ∪ caption-meaning ∪ same-moment<br/>(moment needs no embedding — it alone survives tier 0)"]
     end
 
     gen --> hard["2 · HARD pre-filter (_hard_filter)<br/>EXIF facets + explicit date (§6.2) — exact cut"]
-    hard --> score["3 · refine(): additive scoring (search/scoring.py)<br/>shared tags ⊕ caption-meaning cosine ⊕ image cosine ⊕ fused rank<br/>per-photo graceful skip · decayed sum · content gate"]
-    score --> floorstep["4 · Optional floor (caller-set)<br/>search/similar: none (rank, don't cut) · chat ranks separately (§10: top-k + agent)"]
+    hard --> score["3 · refine(): gated evidence (search/signals.py + search/scoring.py)<br/>tags ⊕ caption cosine ⊕ image cosine ⊕ moment ⊕ fused rank<br/>each gated then weighted · per-photo graceful skip · content gate<br/>composed by noisy-OR → a true 0–1 score"]
+    score --> floorstep["4 · Optional floor (caller-set)<br/>similar: similar_score_min · search: none (rank, don't cut)<br/>chat ranks separately (§10: top-k + agent)"]
     floorstep --> out["ranked [{id, score, reasons}]"]
 ```
 
@@ -773,48 +796,90 @@ hands the core a `Query`. It is not part of the core itself: keeping it outside
 is what keeps the core LLM-free and single-pass, honouring §9.1's
 interactive-latency rule.
 
-**Similar photos** — a photo's whole character, from three signals fused, and it
-**degrades gracefully with the pipeline** so it is useful the moment a photo is
-embedded and richer once it is tagged and captioned. This scorer now *is* the
-core's `refine()` (§9.2) — `similar_photos` is a thin wrapper over
-`refine(candidates(Query(seed_photo_id=...)))` — so what follows describes the
-core's seed-query scoring, not a separate mechanism:
+**Similar photos** — a photo's whole character, from **seven signals** composed into
+one 0–1 score, and it **degrades gracefully with the pipeline** so it is useful the
+moment a photo is uploaded and richer once it is embedded, tagged and captioned. This
+scorer now *is* the core's `refine()` (§9.2) — `similar_photos` is a thin wrapper over
+`refine(candidates(Query(seed_photo_id=...)))` — so what follows describes the core's
+seed-query scoring, not a separate mechanism.
 
-Three signals fuse and degrade with the pipeline: image-vector **look-alike**
-(before anything else), shared **tags across all dimensions** (per-dimension
-weighted — `subject` heaviest, `quality` ignored), and **caption meaning** (cosine
-between caption embeddings, which catches a dog-in-a-car that SigLIP tagged
-`vehicle`). **The exact weights, thresholds, and scoring formula are in
-[`docs/retrieval.md`](retrieval.md#similar-photo-scoring).**
+**Every signal has exactly two numbers: a gate and a weight.** The gate is the
+admission bar — below it the signal is **absent**, never a small number. The weight is
+the cap — the most that signal may ever claim on its own, on one shared 0–1 scale. In
+weight order: **image** (SigLIP image↔image cosine) · **subject** (the shared subject
+tag) · **caption** (caption-embedding cosine) · **where** (`setting`, `occasion`) ·
+**moment** (same time, same place) · **look** (`light`, `season_weather`, `palette`,
+`vibe`, `composition`, `emotion`) · **quality** (a pure tiebreak). **The exact gates,
+weights, and the measured distribution behind each one are in
+[`docs/retrieval.md`](retrieval.md#similar-photo-scoring); `search/signals.py` is the
+single place they live in code.**
+
+**`moment` — same time, same place.** The one signal that never looks at the picture.
+Two photos can share no subject, no palette and no visual resemblance and still belong
+together because they were taken minutes apart in the same spot: the cake and the faces
+around it, the trailhead sign and the summit. `exp(-Δt/12h) × exp(-Δd/1km)` from EXIF
+time and GPS, so both must be close; **without GPS it falls back to time alone and is
+capped**, because "same hour" without "same place" is a much weaker claim. It needs no
+embedding at all, so a just-uploaded photo already has similar photos — graceful
+degradation taken to its limit.
+
+**Choosing a gate — the one rule: NEVER below the library's random-pair median.**
+Cosines do not start at 0. Two RANDOM photos of the reference library score 0.558
+(image) and 0.621 (caption). The bug this model replaced broke exactly that rule —
+the caption bar was 0.60, *under* its own noise median, so 64 % of all pairs cleared it
+and the caption was scoring pure chance. And because a cosine's gate sits high, a pair
+sitting just above it must not score ~0 or admitting it buys nothing: **crossing a gate
+is immediately worth half the signal's weight**, rising to full at 1.0. Tags need no
+such ramp — they are already softmax probabilities — and are damped by `idf` instead,
+which is the tag world's equivalent noise floor.
 
 **Content gate.** A candidate is "similar" ONLY if it shares a **content** signal: a
-`subject` tag, a caption that means the same, or a genuine visual near-dup.
-Style/scene facets (composition, vibe, palette, light, …) **only rerank** content
-matches — they never make two photos similar on their own. Two photos both shot
-top-down in cool overcast light are not "the same thing".
+visual near-dup, a confident shared `subject`, a caption that means the same, or the
+same `moment`. Style and scene facets **only rerank** — they never make two photos
+similar on their own, however many of them agree. Two photos both shot top-down in cool
+overcast light are not "the same thing". **The gate IS the content bar**: a signal that
+cleared its gate is real enough to qualify, and one that did not is absent.
 
-Contributions are **sorted high-to-low and summed with a decay**, so **one strong
-match — a shared `subject` — beats a pile of weak ones**. Each result carries its
-**top-3 reasons** with a match % (§13). Pure image-vector KNN as the *primary*
-signal was rejected (a dog on a rooftop returned other rooftops); so was an LLM
-reranker for this interactive path — it reintroduces per-click latency §9.1 forbids.
+**Composition — a noisy-OR, not a sum.** `score = 1 − Π(1 − evidence)`. Each signal
+takes a share of what is still unclaimed, which buys three things a decayed sum did
+not: the score is a true **0–1** the UI can print as a percentage instead of an
+unbounded number chased by a magic floor; one strong signal dominates for free, with no
+decay constant to tune; and weak signals **mathematically cannot stack** into a false
+positive.
+
+**Score floor.** Below `similar_score_min` a candidate is not shown at all, so a photo
+with nothing genuinely like it in the library returns **fewer results, or none** —
+never a full strip of the best of a bad set.
+
+Each result carries its **top-3 reasons** with a match % (§13), ordered by **what
+actually drove the match** — not by the biggest percentage. `quality: sharp` agrees at
+100 % on almost every pair and drives ~0.01; sorting by percentage put it at the top of
+403 result cards, and headlined two unrelated photos with `light: low light 69 %`. A
+big number is not a big reason.
+
+Pure image-vector KNN as the *primary* signal was rejected (a dog on a rooftop returned
+other rooftops); so was an LLM reranker for this interactive path — it reintroduces
+per-click latency §9.1 forbids.
 
 **Similar-photo flow.** Degrades with the pipeline; the content gate is mandatory.
 
 ```mermaid
 flowchart TB
     p["A photo"] --> sig{"What signals exist?"}
-    sig -->|"no embedding"| none["not comparable"]
-    sig -->|"embedding"| v["image-vector KNN<br/>cosine ≥ similar_min_cosine (0.8)"]
-    sig -->|"+ taxonomy"| t["shared tags · ALL dimensions<br/>dimension_weight × agreement × idf"]
-    sig -->|"+ caption"| c["caption meaning<br/>caption-vec cosine ≥ similar_caption_min (0.6)"]
+    sig -->|"EXIF only"| m["moment · same time &amp; place<br/>exp(-Δt/12h) × exp(-Δd/1km) ≥ gate<br/>(no GPS → time alone, capped)"]
+    sig -->|"+ embedding"| v["image cosine ≥ gate<br/>(gate ≫ the 0.558 random-pair median)"]
+    sig -->|"+ taxonomy"| t["shared tags · 4 tiers<br/>subject · where · look · quality<br/>tier_weight × agreement × idf"]
+    sig -->|"+ caption"| c["caption meaning<br/>caption-vec cosine ≥ gate<br/>(gate ≫ the 0.621 random-pair median)"]
 
-    v --> gate{"CONTENT GATE — shares a content signal?<br/>subject tag · caption meaning · visual near-dup"}
+    m --> gate{"CONTENT GATE — shares a content signal?<br/>image · subject · caption · moment<br/>(clearing the gate IS the content bar)"}
+    v --> gate
     t --> gate
     c --> gate
-    gate -->|no| drop["not similar<br/>(style/scene facets only RERANK, never qualify)"]
-    gate -->|yes| score["contributions sorted high→low,<br/>summed WITH decay<br/>→ one strong match beats many weak"]
-    score --> reasons["top-3 reasons + match %<br/>overlaid on each thumbnail (§13)"]
+    gate -->|no| drop["not similar<br/>(where/look/quality only RERANK,<br/>they never qualify)"]
+    gate -->|yes| score["evidence = weight × strength<br/>score = 1 − Π(1 − evidence) · noisy-OR<br/>→ true 0–1; weak signals cannot stack"]
+    score --> floor{"score ≥ similar_score_min?"}
+    floor -->|no| drop
+    floor -->|yes| reasons["top-3 reasons, strongest DRIVER first<br/>+ match % · overlaid on each thumbnail (§13)"]
 ```
 
 ### 9.1 Query planner
@@ -903,21 +968,45 @@ Cheapest layer first, and the deterministic questions never touch the model:
    message into `search_library`, `search_memories`, or `none` (general
    knowledge/chit-chat). Failure falls back to `none`.
 2. **Run the tool.** `search_library` → **SigLIP image↔text** (`search_photos`, §9.2:
-   query text vs each photo's *image* vector — NOT captions, plan 17);
-   `search_memories` → name/theme match; `none` → no retrieval.
+   query text vs each photo's *image* vector — NOT captions);
+   `search_memories` → name/theme match, pure SQL; `none` → no retrieval at all.
 3. **Answer (streamed, temp 0).** A tool result grounds the model on ONLY those
    photos/memories (id, date, caption, top tags, EXIF), citing `[photo:ID]`; the
    prompt forbids inventing a subject and reports none when nothing matches
    (honest-empty). `none` answers from the model's own knowledge — chat is a general
    assistant, not photo-limited.
 
-**Only a library question may load SigLIP.** `search`/`search_library` is the one chat
-op that runs the SigLIP text encoder, and on the Jetson SigLIP cannot be co-resident
-with gemma (§8.1) — a single stray search evicts gemma and pays a llama-server respawn
-mid-turn. So **both** paths decide on-topic BEFORE any tool: `route` returns `none` for
-anything about the world, and the fully-agentic loop's first instruction is to answer
-with no tool unless the message is about the user's own photos/memories. `search` is
-reserved for "show me my photos of X" — never for a count, never for general knowledge.
+#### Never wake SigLIP until the question is known to be about photos
+
+SigLIP and gemma cannot be co-resident on the Jetson — 3400 + 3800 against a 5000 MB
+budget (§8.1) — so loading one **evicts** the other, and bringing gemma back respawns
+`llama-server` and reloads ~3 GB: **~9 s, measured on the board, plus a lost prompt
+cache**. gemma is also the model most likely to be **already resident**, since every
+turn ends with it. That asymmetry decides the order:
+
+- **Guardrails ON — retrieve FIRST.** An off-topic message is refused, so anything
+  answered is about the library: the bet that this question needs photos always wins.
+  The turn is `siglip → gemma` — **one** swap — and the pool retrieved up front is
+  reused by `search_library` instead of embedding a second time.
+- **Guardrails OFF (default) — gemma FIRST.** Only the model can tell whether the
+  message is about the library, so it decides before anything is loaded. *"How many
+  planets are in the solar system"* then costs **no swap at all**; a photo question
+  pays one only when it genuinely needs photos.
+
+Speculatively priming SigLIP on every message is therefore **wrong** with guardrails
+off: it evicts a resident gemma and reloads it after, buying two swaps for a search
+that never happens. Retrieval-before-generation is an optimisation for the case where
+retrieval is certain — not a default.
+
+The same rule governs the fully-agentic loop: `agentic_gather(prime=…)` is passed
+`prefs.guardrails`, and its first instruction is to answer with no tool unless the
+message is about the user's own photos/memories. `search` is reserved for "show me my
+photos of X" — never for a count, never for general knowledge.
+
+**Query text is lower-cased before SigLIP** (`search_photos`). Its text tower is
+trained on lower-case web captions and is case-sensitive in a way that misleads:
+an upper-case word reads as text *printed in* the image, so `DOG` returned documents
+and ID cards while `dog` returned the dog photo at rank 1 — measured on the board.
 
 **Two per-owner toggles (`chat_prefs`), defaults reproducing the pipeline above:**
 **Direct answers** (on) — off skips the direct-DB step and runs a fully-agentic tool
@@ -936,17 +1025,18 @@ flowchart TB
     dpref -->|on| direct{"Direct-DB answerable?<br/>direct_answer — total · subject FTS · memory count · memory show/list · periods<br/>conservative: declines when unsure"}
     dpref -->|off| lease2["Take CHAT lease"]
     direct -->|yes| dbans["Answer straight from SQLite<br/>NO model call · memory-show also renders the Organize card(s) (event: memory)<br/>covers link ctx=chat-memory:key → page within the memory, close → /chat"]
-    direct -->|declines| gpre{"chat_prefs.guardrails ON?"}
+    direct -->|declines| gpre{"chat_prefs.guardrails ON?<br/>THE SigLIP GATE — does policy already know this is about photos?"}
     lease2 --> gpre
-    gpre -->|on| route{"1 · Route — planner, temp 0, schema (plan 17)<br/>is it about the user's OWN photos/memories?"}
-    gpre -->|off · direct on| route
-    gpre -->|off · direct off| agentic
+    gpre -->|"ON · on-topic is GUARANTEED"| prime["0 · RETRIEVE FIRST — no model call<br/>SigLIP image↔text on the question (search_photos, §9.2, lower-cased)<br/>query text vs each photo's IMAGE vector · top-k · NO captions/caption_vec<br/>the bet always wins here, so the turn is siglip → gemma = ONE swap (§8.1)"]
+    prime --> route
+    gpre -->|"OFF · direct on — gemma decides FIRST"| route{"Route — planner, temp 0, schema (plan 17)<br/>search_library · search_memories · none"}
+    gpre -->|"OFF · direct off — gemma decides FIRST"| agentic
     route -->|none & guardrails on & NOT app-topic| refuse["Refuse — fixed GUARDRAIL_REFUSAL<br/>NO model generation · NO search · persisted<br/>is_app_topic (counts/memories/albums/…) overrides → never refused"]
-    route -->|search_library| lib["2 · SigLIP image↔text (search_photos, §9.2)<br/>query text vs each photo's IMAGE vector · top-k<br/>NO captions / caption_vec"]
-    route -->|search_memories| mem["2 · Memory search by name/theme (memories_for_show)"]
-    route -->|none & guardrails off| gen["General answer from the model's own knowledge<br/>chat is NOT photo-limited · no search"]
-    agentic["Fully-agentic loop (direct OFF)<br/>STEP 1 — about the user's OWN photos/memories? no → answer, NO tool<br/>yes → model calls REAL tools: count_photos · list_memories · count_periods · search<br/>search is the only SigLIP op, so it is last-resort: only to SHOW photos<br/>gather facts + candidate photos, bounded rounds"] --> ground
-    lib --> ground["3 · Answer grounded ONLY on results/facts<br/>id·date·caption·tags·EXIF · cite [photo:id]<br/>strict: never invent · honest-empty when none match"]
+    route -->|search_library| lib["SigLIP image↔text (search_photos)<br/>guardrails ON: REUSE the primed pool, never embed twice<br/>guardrails OFF: embed NOW — the first moment photos are known to be needed"]
+    route -->|search_memories| mem["Memory search by name/theme (memories_for_show) · pure SQL"]
+    route -->|none| gen["General answer from the model's own knowledge<br/>SigLIP NEVER LOADED — no swap at all<br/>chat is NOT photo-limited · no search"]
+    agentic["Fully-agentic loop (direct OFF)<br/>prime=guardrails: pool retrieved up front ONLY under guardrails<br/>STEP 1 — about the user's OWN photos/memories? no → answer, NO tool, NO SigLIP<br/>yes → model calls REAL tools: count_photos · list_memories · count_periods · search<br/>search is the only SigLIP op, so it is last-resort: only to SHOW photos"] --> ground
+    lib --> ground["Answer grounded ONLY on results/facts<br/>id·date·caption·tags·EXIF · cite [photo:id]<br/>strict: never invent · honest-empty when none match"]
     mem --> ground
     ground --> ans["Stream SSE · temp 0 · cites render as thumbnails"]
     gen --> ans
@@ -1043,7 +1133,7 @@ bound context. Runs only over processed photos.
 ```mermaid
 flowchart TB
     mrstart["Rebuild memories (manual, background thread)<br/>agent tools + embeds call the models service (§5.1)<br/>embed calls: HIGH priority — preempt an in-flight caption on jetson (§8.1)"] --> lib
-    lib["Owner's PROCESSED photos<br/>caption + embedding present"] --> pool["1 · Pool (cheap, NO decisions)<br/>coarse sessions by time + ~50 km region<br/>— only to bound context"]
+    lib["Owner's PROCESSED photos<br/>caption + embedding present"] --> pool["1 · Pool (cheap, NO decisions)<br/>coarse sessions by time + ~50 km region<br/>6 h gap at home · 36 h while staying away<br/>(a week's trip is ONE session)<br/>— only to bound context"]
     pool --> events["2 · Compose events (AGENT, per session)<br/>reads summaries, decides the carve<br/>tools: similar · facets · nearby-in-time · same-subject"]
     lib --> themes["3 · Discover themes (AGENT + RAG)<br/>propose thread → retrieve candidates → curate"]
     events --> recon["4 · Reconcile (AGENT)<br/>dedupe, merge fragments, final titles/covers<br/>keeps event⇆theme overlap"]
@@ -1130,9 +1220,10 @@ in front of bfcache and break the `[grid, leaf]` invariant.
 2. **The leaf records its grid in a `ctx` URL parameter** — never guessed:
    - `ctx=library` (plus `q`/`f_`/`n_`/`t_`/`sort`/`date_*`) → the library grid.
    - `ctx=album:<by>:<grain>:<key>` → an Organize album grid.
-   - `ctx=similar:<id>` → the library grid; the origin photo `<id>` is shown as
-     clickable **context** (a thumbnail in the header), but it is **not** the
-     parent — close still goes up to the library.
+   - `ctx=similar:<id>` → the library grid, with the origin photo `<id>` as an
+     intermediate **step on the way up**: it is shown as clickable context (a
+     thumbnail in the header) AND it is what close returns to first. Close from
+     there goes up to the library. It is the one ctx whose close takes two steps.
    - `ctx=chat` → the grid is the **conversation**; close returns to `/chat`. A
      cited thumbnail carries this ctx, and it pages within the photos the current
      chat session cited (its evidence set), never the wider library.
@@ -1145,15 +1236,22 @@ in front of bfcache and break the `[grid, leaf]` invariant.
 
 3. **History invariant: `[grid, leaf]` — depth two, always.** Grid→leaf (clicking
    a photo in a grid) is the ONE `push`. Every move at the leaf level —
-   **prev/next paging, opening a similar photo, clicking the origin thumbnail** —
-   uses `location.replace`, never a push. History therefore never accumulates a
-   chain of visited photos.
+   **prev/next paging, opening a similar photo, clicking the origin thumbnail, and
+   closing a similar photo back to its origin** — uses `location.replace`, never a
+   push. History therefore never accumulates a chain of visited photos, and the
+   two-step close of rule 4 costs no extra depth.
 
-4. **Close / Esc goes UP to the grid, once.** It is `history.back()` (so the grid's
-   scroll and filter state restore via bfcache), with the computed grid URL
-   (`origin_url`) as the deep-link fallback. Because history is `[grid, leaf]`, back
-   always lands on the grid — it can never "replay" photos, because none are in
-   history.
+4. **Close / Esc goes UP exactly ONE level.** For a normal leaf that level is the
+   grid: `history.back()` (so the grid's scroll and filter state restore via
+   bfcache), with the computed grid URL (`origin_url`) as the deep-link fallback.
+   Because history is `[grid, leaf]`, back always lands on the grid — it can never
+   "replay" photos, because none are in history.
+
+   **A `similar:<id>` leaf has one extra level above it — the origin photo.** Close
+   there goes to `/photo/<id>` **in place** (`location.replace`, so the history entry
+   is swapped, never pushed), and closing *that* runs the normal `history.back()` to
+   the grid. Two closes: similar → origin → grid. The replace is what keeps rule 3
+   intact — the depth stays two, the leaf slot simply now holds the origin photo.
 
 5. **Prev/next move only *within* the current layer's order** (owner-scoped),
    carrying `ctx` forward — never leaking into a sibling album/memory or the wider

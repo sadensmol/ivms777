@@ -17,7 +17,12 @@ backend never blocks the light stage (§8, stages are independent):
 
 import logging
 
-from ingest.caption import backfill_caption_vectors, backfill_captions, caption_handler
+from ingest.caption import (
+    backfill_caption_embeds,
+    backfill_caption_vectors,
+    backfill_captions,
+    caption_handler,
+)
 from ingest.embed import backfill_embeds, embed_handler
 from ingest.facets import backfill_place_facets
 from ingest.folders import process_folder_deletions
@@ -107,9 +112,8 @@ def drain_pass(context, vocab, should_preempt=lambda: False) -> None:
     # so it shares no residency slot with them — a caption written in group 2b gets
     # its vector here or on the next drain. Best-effort: `backfill_caption_vectors`
     # swallows an embedder outage, so this never blocks the pass.
-    if conn.execute(
-        "SELECT 1 FROM photos WHERE caption IS NOT NULL AND caption_vec IS NULL LIMIT 1"
-    ).fetchone() is not None:
+    backfill_caption_embeds(conn)
+    if stage_counts(conn, "caption_embed")["pending"]:
         try:
             client, _ = settings.build_inference_client()
             backfill_caption_vectors(conn, client, settings.caption_embed_model)

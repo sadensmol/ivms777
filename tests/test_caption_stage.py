@@ -78,24 +78,64 @@ def test_caption_stage_writes_caption_title_description_and_no_tags(conn, tmp_pa
 
 
 def test_backfill_caption_vectors_embeds_only_captioned_photos(conn):
-    # The §9 caption-vector embed is its OWN step (pipeline group 2c), decoupled from
-    # the caption stage: it embeds every captioned photo that has no vector yet, via
+    # The §9 caption-vector embed is its OWN stage (`caption_embed`, drained in one
+    # batch in pipeline group 2c): it embeds the photos whose stage is pending, via
     # the dedicated text embedder (nomic in prod, fake here), and leaves un-captioned
     # photos alone.
     from embedding.store import read_caption_vector
     from inference.fakes import FakeInferenceClient
-    from ingest.caption import backfill_caption_vectors
+    from ingest.caption import backfill_caption_embeds, backfill_caption_vectors
 
     add_photo(conn, photo_id=1, content_hash="a" * 64, thumb_key="1.jpg", caption="a dog on a beach")
     add_photo(conn, photo_id=2, content_hash="b" * 64, thumb_key="2.jpg")  # no caption
 
+    assert backfill_caption_embeds(conn) == 1  # only the captioned one is queued
     n = backfill_caption_vectors(conn, FakeInferenceClient(), "fake")
 
     assert n == 1
     assert read_caption_vector(conn, 1) is not None
     assert read_caption_vector(conn, 2) is None
+    assert stage_counts(conn, "caption_embed")["done"] == 1
     # Idempotent: a second pass finds nothing pending.
     assert backfill_caption_vectors(conn, FakeInferenceClient(), "fake") == 0
+
+
+def test_photos_embedded_before_the_stage_existed_read_as_done(conn):
+    # A library whose captions were embedded by the old caption_vec-driven backfill
+    # has no job rows; without this it showed "0 done · 0 pending" next to four rows
+    # reading "206 done", which reads as a broken stage, not a finished one.
+    from embedding.vectors import to_blob
+    from ingest.caption import backfill_caption_embeds
+
+    add_photo(conn, photo_id=1, content_hash="a" * 64, thumb_key="1.jpg",
+              caption="a dog on a beach", caption_vec=to_blob([0.1, 0.2, 0.3]))
+    add_photo(conn, photo_id=2, content_hash="b" * 64, thumb_key="2.jpg", caption="a cat")
+
+    assert backfill_caption_embeds(conn) == 1  # only the un-embedded one is work
+    counts = stage_counts(conn, "caption_embed")
+    assert counts["done"] == 1 and counts["pending"] == 1
+
+
+def test_a_new_caption_requeues_its_vector(conn, tmp_path):
+    # A re-caption must not keep the OLD text's vector: writing a caption resets the
+    # photo's `caption_embed` stage, so the next drain re-embeds it.
+    from embedding.store import read_caption_vector
+    from inference.fakes import FakeInferenceClient
+    from ingest.caption import backfill_caption_vectors
+
+    derived = LocalStorage(tmp_path / "thumbs")
+    _photo_with_detail_thumb(conn, derived, 1, "aa" * 32)
+    backend = FakeCaptionBackend({
+        "caption": "a dog on a beach", "title": "Beach day",
+        "description": "A dog runs on the sand.", "model": "fake-vlm",
+    })
+    enqueue(conn, 1, "caption")
+    drain(conn, {"caption": caption_handler(derived, _models_client(backend), 1600)})
+
+    assert stage_counts(conn, "caption_embed")["pending"] == 1
+    backfill_caption_vectors(conn, FakeInferenceClient(), "fake")
+    assert read_caption_vector(conn, 1) is not None
+    assert stage_counts(conn, "caption_embed")["done"] == 1
 
 
 def test_caption_makes_a_photo_findable_by_keyword(conn, tmp_path):

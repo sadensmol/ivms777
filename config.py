@@ -5,6 +5,8 @@ from typing import Literal
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from search import signals
+
 Profile = Literal["mac", "jetson", "cloud"]
 
 # Model ids per profile. On mac/jetson `llama-server` serves ONE gemma GGUF for
@@ -100,15 +102,25 @@ class Settings(BaseSettings):
     page_size: int = Field(default=100, ge=1, le=500)
     # Minimum tag score for a model tag to count in the sidebar and filters.
     tag_score_min: float = Field(default=0.2, ge=0.0, le=1.0)
-    # "Similar photos": min image-vector cosine to count as a visual look-alike
-    # (§9). SigLIP image cosines have a HIGH baseline — any two real photos sit
-    # ~0.5–0.65 just for being photos, and genuinely-alike ones are 0.85–0.98 — so
-    # the floor is 0.8, well above the noise. Tag/caption matches always qualify;
-    # this only admits true look-alikes.
-    similar_min_cosine: float = Field(default=0.8, ge=0.0, le=1.0)
-    # "Similar photos": min caption-embedding cosine to count two captions as
-    # semantically matching (§9). Tune per embedding model.
-    similar_caption_min: float = Field(default=0.6, ge=0.0, le=1.0)
+    # "Similar photos" — the three GATES a caller may retune (§9). Weights and the
+    # remaining gates live in `search/signals.py`, which also carries the measured
+    # distribution behind each number. The one rule when changing these: NEVER set a
+    # gate below the library's random-pair median, or the signal scores pure chance.
+    #
+    # Image cosine. SigLIP image cosines have a HIGH baseline — two RANDOM photos of
+    # the reference library score a median 0.558 — so 0.80 (the top 4% of all pairs)
+    # is the bar for a genuine look-alike.
+    similar_min_cosine: float = Field(default=signals.IMAGE_GATE, ge=0.0, le=1.0)
+    # Caption-embedding cosine. Two RANDOM captions score a median 0.621, so the old
+    # 0.60 sat *below* the noise and 64% of all pairs cleared it — that is why a
+    # teddy bear matched a girl by a Christmas tree. 0.75 is the top 5%.
+    similar_caption_min: float = Field(default=signals.CAPTION_GATE, ge=0.0, le=1.0)
+    # Minimum FINAL score (0–1, a noisy-OR of the evidence) to be shown at all (§9).
+    # Without it the strip always returns its full k, so a photo with nothing
+    # genuinely like it got 12 fillers instead of an honest "nothing similar enough".
+    # Sized so a lone `moment` at same-hour/same-block (0.30) survives while
+    # same-afternoon/500 m (0.23) needs a second signal to agree.
+    similar_score_min: float = Field(default=signals.SCORE_MIN, ge=0.0, le=1.0)
     # Kill switch for the caption-meaning signal in "similar photos" (§9.3). False
     # drops it from BOTH halves — the candidate union and the scoring contribution —
     # leaving tags + image look-alike. It exists to measure what the caption signal

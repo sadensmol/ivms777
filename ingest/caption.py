@@ -6,7 +6,7 @@ from embedding.store import write_caption_vector
 from embedding.vectors import l2_normalize
 from inference.client import InferenceClient
 from inference.models_client import ModelsClient
-from ingest.jobs import enqueue
+from ingest.jobs import complete, enqueue, record_done_at, reprocess_one
 from ingest.taxonomy import reindex_fts
 from ingest.thumbs import thumb_key
 from ingest.worker import StageHandler
@@ -23,11 +23,11 @@ def caption_handler(
     `/caption` (design §5.1, plan 15 task 3) -> caption + AI title/description,
     written straight to the DB. It writes NO tags — the caption model no longer
     picks from the vocabulary; tags are owned by the SigLIP taxonomy stage (§7).
-    It does NOT embed the caption: the
-    caption-vector (§9) is a SEPARATE, batched step (`backfill_caption_vectors`,
-    pipeline group 2c) that embeds captions with the dedicated text embedder
-    (`nomic-embed-text`, in-process in the `models` service) — a different model,
-    so it is not interleaved with the caption call per photo. Drains last (§8). A
+    It does NOT embed the caption: the caption-vector (§9) is its OWN stage,
+    `caption_embed`, drained in one batch right after this one (pipeline group 2c,
+    `backfill_caption_vectors`) with the dedicated text embedder (`nomic-embed-text`,
+    in-process in the `models` service) — a different model, so it is not
+    interleaved with the caption call per photo. Drains last (§8). A
     `models_client.caption` error raises so the queue retries the job rather than
     writing half a row.
 
@@ -54,6 +54,10 @@ def caption_handler(
             (result["caption"], result["model"], result["title"], result["description"], photo_id),
         )
         reindex_fts(conn, photo_id)
+        # A NEW caption needs a NEW caption vector: queue the `caption_embed` stage
+        # (idempotent — the row usually exists from upload) and reset it, so a
+        # re-caption cannot leave the old text's vector behind.
+        reprocess_one(conn, photo_id, "caption_embed")
 
     return handle
 
@@ -61,16 +65,24 @@ def caption_handler(
 def backfill_caption_vectors(
     conn: sqlite3.Connection, client: InferenceClient, model: str, limit: int = 50
 ) -> int:
-    """Embed captions that have no caption-vector yet (§9) with the dedicated text
-    embedder `model` (`nomic-embed-text`, design §4) — this is the ONLY place caption
-    text is embedded (the caption stage just writes the text). Embedded in ONE batch
-    so the embedder loads once, a few per drain, so a freshly-captioned or pre-existing
-    library gains semantic similarity without a re-caption. Best-effort: an embedder
-    that is down must not fail the pass — the vectors retry next drain. Returns how
-    many were embedded."""
+    """Drain the `caption_embed` stage: embed the pending photos' captions (§9) with
+    the dedicated text embedder `model` (`nomic-embed-text`, design §4) — the ONLY
+    place caption text is embedded (the caption stage just writes the text).
+
+    **The queue says what to embed, the vector column does not.** Driving it off
+    `caption_vec IS NULL` meant a re-caption silently kept the old text's vector, and
+    the work was invisible to the UI. Now it claims pending `caption_embed` jobs, so
+    the stage shows its own done/pending/throughput next to the others and
+    Reprocess re-embeds exactly like every other stage.
+
+    Still ONE batched call so the embedder loads once, a few per drain, so a freshly
+    captioned or pre-existing library gains semantic similarity without a re-caption.
+    Best-effort: an embedder that is down must not fail the pass — the jobs stay
+    pending and retry next drain. Returns how many were embedded."""
     rows = conn.execute(
-        "SELECT id, caption FROM photos WHERE caption IS NOT NULL AND caption_vec IS NULL"
-        " LIMIT ?",
+        "SELECT p.id, p.caption FROM photos p JOIN jobs j ON j.photo_id = p.id"
+        " WHERE j.stage = 'caption_embed' AND j.status = 'pending' AND p.caption IS NOT NULL"
+        " ORDER BY p.id LIMIT ?",
         (limit,),
     ).fetchall()
     rows = [r for r in rows if r["caption"]]
@@ -84,7 +96,36 @@ def backfill_caption_vectors(
         return 0
     for row, vector in zip(rows, vectors):
         write_caption_vector(conn, row["id"], l2_normalize(vector))
+        complete(conn, row["id"], "caption_embed")
     return len(rows)
+
+
+def backfill_caption_embeds(conn: sqlite3.Connection) -> int:
+    """Give every photo predating the `caption_embed` stage its job row (self-healing,
+    the mirror of `backfill_captions`). Returns how many were queued to embed.
+
+    A photo that ALREADY has a vector gets a row marked `done`, not just skipped:
+    otherwise a library embedded before this stage existed showed "0 done · 0
+    pending" beside four rows reading "206 done", which looks like a broken stage
+    rather than a finished one.
+    """
+    missing = conn.execute(
+        "SELECT p.id, p.caption_vec IS NOT NULL AS embedded,"
+        "       COALESCE((SELECT j.updated_at FROM jobs j"
+        "                 WHERE j.photo_id = p.id AND j.stage = 'caption'), p.updated_at) AS done_at"
+        " FROM photos p"
+        " WHERE (p.caption IS NOT NULL OR p.caption_vec IS NOT NULL) AND NOT EXISTS ("
+        "   SELECT 1 FROM jobs j WHERE j.photo_id = p.id AND j.stage = 'caption_embed')"
+    ).fetchall()
+    queued = 0
+    for row in missing:
+        if row["embedded"]:
+            # Dated when the caption was written — that is when the vector followed.
+            record_done_at(conn, row["id"], "caption_embed", row["done_at"])
+        else:
+            enqueue(conn, row["id"], "caption_embed")
+            queued += 1
+    return queued
 
 
 def backfill_captions(conn: sqlite3.Connection) -> int:

@@ -112,7 +112,7 @@ listed in the UI. One bad file never stalls the queue.
 drain pass (`ingest/pipeline.py::drain_pass`, shared by the `worker` loop and the
 app's inline drain) runs in two groups: first the **GPU/inference-free** stages —
 thumbnail, EXIF place facets, folder deletions — then the **embedder/inference**
-stages (embed, taxonomy, caption). The embedder (`RemoteEmbedder`, an HTTP shim over
+stages (embed, taxonomy, caption, and the batched caption_embed). The embedder (`RemoteEmbedder`, an HTTP shim over
 the `models` service, §5.1) is built **inside the pass**, not eagerly at process
 start; if a call through it fails — e.g. the `models` service is unreachable, or its
 own CUDA init fails on jetson (the previously observed `RuntimeError 801`, now inside
@@ -137,7 +137,7 @@ captions — can be rebuilt without re-uploading. `POST /reprocess` resets a **r
 of stages (`from_stage` through an optional `to_stage`, inclusive) to `pending` for
 the owner's photos; the `worker` re-runs them in `STAGES` order on its next poll.
 The `/upload` UI puts a **Reprocess** button on **every stage row** — `thumbnail`,
-`embed`, `taxonomy`, `caption` — and each re-runs **only that one stage**
+`embed`, `taxonomy`, `caption`, `caption_embed` — and each re-runs **only that one stage**
 (`from=to=stage`). So re-tagging after a `vocab.yaml` change never rebuilds
 thumbnails, and re-embedding never re-captions; each stage is re-run in isolation.
 The `caption` button is styled as a destructive action and confirms first ("can take
@@ -156,8 +156,9 @@ its collection query intact.
 Every stage handler is idempotent — it overwrites its own output — so a reprocess is
 safe to trigger at any time. **Self-healing backfills** run automatically each
 drain: they queue `thumbnail` for a photo still without one, `embed` for one missing
-a vector, `taxonomy` for an embedded-but-untagged photo, and `caption` for a
-thumbnailed-but-uncaptioned one — so a library predating a stage, or a photo whose
+a vector, `taxonomy` for an embedded-but-untagged photo, `caption` for a
+thumbnailed-but-uncaptioned one, and `caption_embed` for a captioned photo with no
+caption vector — so a library predating a stage, or a photo whose
 thumbnail once failed, heals with no manual action. A photo that genuinely can't be
 thumbnailed is skipped by the later stages rather than crashing them.
 

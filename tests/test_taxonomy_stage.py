@@ -4,7 +4,7 @@ from embedding.fakes import FakeEmbedder
 from embedding.store import write_vector
 from embedding.vectors import siglip_probability
 from ingest.jobs import enqueue, stage_counts
-from ingest.taxonomy import label_prompt, select_dimension_tags, taxonomy_handler
+from ingest.taxonomy import label_prompts, select_dimension_tags, taxonomy_handler
 from ingest.vocab import load_vocab, seed_tags
 from ingest.worker import drain
 from storage.local import LocalStorage
@@ -45,8 +45,9 @@ def test_select_dimension_tags_empty_is_empty():
 def _photo_with_vector(conn, derived, pid, label_dim, label):
     make_jpeg(derived.local_path(f"{pid}_320.jpg"))  # thumbnail the pixel stats read
     add_photo(conn, photo_id=pid, content_hash=f"{pid:02x}" * 32, thumb_key=f"{pid}_320.jpg")
-    # vector == the label's prompt embedding -> that label scores 1.0
-    write_vector(conn, pid, FakeEmbedder().embed_texts([label_prompt(label_dim, label)])[0])
+    # vector == the label's own prompt embedding -> that label scores 1.0
+    prompt = label_prompts(VOCAB, label_dim, label)[0]
+    write_vector(conn, pid, FakeEmbedder().embed_texts([prompt])[0])
 
 
 def test_backfill_enqueues_taxonomy_for_embedded_photos(conn):
@@ -131,3 +132,45 @@ def test_taxonomy_reindexes_fts_with_tag_labels(conn, tmp_path):
     drain(conn, {"taxonomy": taxonomy_handler(derived, FakeEmbedder(), VOCAB)})
     hit = conn.execute("SELECT rowid FROM photo_fts WHERE photo_fts MATCH 'beach'").fetchone()
     assert hit is not None and hit["rowid"] == 1
+
+
+def test_a_label_says_itself_in_its_own_words_when_vocab_gives_prompts():
+    from dataclasses import replace
+
+    # No entry -> the dimension's template. `subject` falls back to "a photo of a
+    # {label}"; ungrammatical fallbacks are exactly what the prompts block fixes.
+    bare = replace(VOCAB, prompts={})
+    assert label_prompts(bare, "subject", "dog") == ["a photo of a dog"]
+    assert label_prompts(bare, "light", "night") == ["a photo taken in night light"]
+
+    # An entry replaces it — and the SAME label under another dimension is
+    # unaffected, since `playful` means different things in vibe and emotion.
+    v = replace(VOCAB, prompts={"vibe": {"playful": ["a lighthearted, playful scene"]}})
+    assert label_prompts(v, "vibe", "playful") == ["a lighthearted, playful scene"]
+    assert label_prompts(v, "emotion", "playful") == ["a photo of a playful moment"]
+
+
+def test_several_prompts_for_one_label_are_embedded_and_averaged(conn, tmp_path):
+    from dataclasses import replace
+
+    derived = LocalStorage(tmp_path / "thumbs")
+    # Two phrasings for `beach`; the photo's vector IS the second one. Ensembling
+    # must still put `beach` on top — no single phrasing decides the tag.
+    vocab = replace(VOCAB, prompts={**VOCAB.prompts, "setting": {
+        **VOCAB.prompts["setting"],
+        "beach": ["a photo taken on a sandy beach", "a photo of sand and waves"],
+    }})
+    seed_tags(conn, vocab)
+    make_jpeg(derived.local_path("1_320.jpg"))
+    add_photo(conn, photo_id=1, content_hash="ab" * 32, thumb_key="1_320.jpg")
+    write_vector(conn, 1, FakeEmbedder().embed_texts(["a photo of sand and waves"])[0])
+    enqueue(conn, 1, "taxonomy")
+
+    drain(conn, {"taxonomy": taxonomy_handler(derived, FakeEmbedder(), vocab)})
+
+    top = conn.execute(
+        "SELECT t.label FROM photo_tags pt JOIN tags t ON t.id = pt.tag_id"
+        " WHERE pt.photo_id = 1 AND t.dimension = 'setting'"
+        " ORDER BY pt.score DESC LIMIT 1"
+    ).fetchone()
+    assert top["label"] == "beach"

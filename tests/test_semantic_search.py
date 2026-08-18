@@ -128,19 +128,40 @@ def test_similar_of_an_unembedded_photo_is_empty(library):
 def test_similarity_breakdown_explains_the_match(library):
     from search.semantic import similarity_breakdown
 
-    _tag(library, 1, "subject", "dog", 0.9)
-    _tag(library, 3, "subject", "dog", 0.6)
-    _tag(library, 1, "quality", "sharp", 1.0)  # weight 0 -> excluded
-    _tag(library, 3, "quality", "sharp", 1.0)
-    rows = similarity_breakdown(library, owner_id=1, origin_id=1, current_id=3)
+    _tag(library, 1, "subject", "dog", 0.95)
+    _tag(library, 3, "subject", "dog", 0.85)
+    _tag(library, 1, "palette", "cool", 0.4)   # below the tag gate -> no row
+    _tag(library, 3, "palette", "cool", 0.4)
+    rows = similarity_breakdown(library, owner_id=1, origin_id=1, current_id=3,
+                                min_cosine=0.0, caption_min=0.0)
     params = [r["param"] for r in rows]
     assert "subject: dog" in params
-    assert "quality: sharp" not in params          # zero-weight dimension is excluded
-    assert rows[0]["param"] == "subject: dog"      # sorted by contribution, subject leads
+    assert "palette: cool" not in params        # under its gate, so it drove nothing
+    contribs = [r["contrib"] for r in rows]
+    assert contribs == sorted(contribs, reverse=True)  # what drove the match, on top
     dog = next(r for r in rows if r["param"] == "subject: dog")
-    assert dog["origin"] == "90%" and dog["current"] == "60%"
-    assert dog["match"] == 60                        # match is the weaker confidence
-    assert any(r["param"] == "visual (image)" for r in rows)  # visual always compared
+    assert dog["origin"] == "95%" and dog["current"] == "85%"
+    assert dog["match"] == 85                        # match is the weaker confidence
+    assert any(r["param"] == "visual (image)" for r in rows)  # visual compared
+
+    # A signal that scored NOTHING gets no row: below its gate the look-alike never
+    # contributed, so the panel must not report a match % for it.
+    quiet = similarity_breakdown(library, owner_id=1, origin_id=1, current_id=3,
+                                 min_cosine=0.999, caption_min=0.999)
+    assert [r["param"] for r in quiet] == ["subject: dog"]
+
+
+def test_a_below_gate_subject_tag_gets_no_row(library):
+    """The regression: a girl by a Christmas tree carried `subject: toy` at 0.58 and
+    was shown as a 58% match to a teddy bear. Below the gate it drove nothing, so the
+    panel must not claim it."""
+    from search.semantic import similarity_breakdown
+
+    _tag(library, 1, "subject", "toy", 0.99)
+    _tag(library, 3, "subject", "toy", 0.58)
+    rows = similarity_breakdown(library, owner_id=1, origin_id=1, current_id=3,
+                                min_cosine=0.999, caption_min=0.999)
+    assert [r["param"] for r in rows] == []
 
 
 # --- plan 12 task 3: similar_photos is now a thin wrapper over the core --------

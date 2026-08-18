@@ -43,6 +43,28 @@ def test_nearby_spots_in_one_town_stay_one_memory(conn):
     assert len(cands) == 1 and len(cands[0].photo_ids) == 6
 
 
+def test_a_multi_day_stay_away_from_home_is_ONE_memory(conn):
+    # A week in Batumi is "a week in Batumi", not seven day-fragments: people sleep,
+    # and a flat 6 h gap cut the trip at every night.
+    for pid in range(1, 10):  # home — the most photographed region
+        _p(conn, pid, f"2025-06-0{pid}T12:00:00", gps_lat=41.70, gps_lon=44.80)
+    for day, pid in enumerate((20, 21, 22, 23), start=12):
+        _p(conn, pid, f"2025-07-{day}T13:00:00", gps_lat=41.65, gps_lon=41.64)
+    trips = [c for c in seed_candidates(conn, owner_id=1, min_size=3)
+             if set(c.photo_ids) <= {20, 21, 22, 23}]
+    assert len(trips) == 1
+    assert sorted(trips[0].photo_ids) == [20, 21, 22, 23]
+
+
+def test_days_at_home_stay_separate_memories(conn):
+    # The wider trip gap must NOT weld ordinary days at home into one endless
+    # memory — home is where most photos are, and there the 6 h gap still rules.
+    for day in (12, 13, 14):
+        for n in (1, 2, 3):
+            _p(conn, day * 10 + n, f"2025-07-{day}T1{n}:00:00", gps_lat=41.70, gps_lon=44.80)
+    assert len(seed_candidates(conn, owner_id=1, min_size=3)) == 3
+
+
 def test_runs_below_min_size_are_dropped(conn):
     _p(conn, 1, "2025-07-12T09:00:00")
     _p(conn, 2, "2025-07-12T09:05:00")  # only two -> not a memory

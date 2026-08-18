@@ -26,10 +26,12 @@ from search.dates import date_where
 from search.facets import build_where, parse_filters
 from search.fusion import reciprocal_rank_fusion
 from search.keyword import keyword_search
+from search.moment import moment_similarity
 from search.scoring import (
     caption_contribution,
     fusion_rank_contribution,
     image_contribution,
+    moment_contribution,
     score_candidates,
     tag_contribution,
 )
@@ -39,6 +41,7 @@ from search.semantic import (
     _tag_similarity,
     search_photos,
 )
+from search.signals import CAPTION_GATE, IMAGE_GATE
 
 
 @dataclass
@@ -70,31 +73,38 @@ def candidates(
     owner_id: int,
     query: Query,
     *,
-    caption_min: float = 0.6,
+    caption_min: float = CAPTION_GATE,
 ) -> list[int]:
     """Phase 1 — fast candidate generation (§9.2). No scoring, no LLM.
 
-    A SEED query is the same UNION `similar_photos` has always used — image-vector
-    KNN alone is NARROWER: a photo sharing a strong `subject` tag, or whose caption
-    means the same thing, can sit outside the seed's top-K visual neighbours yet
-    still be "similar" (plan 12 task 3 parity fix). All three sources are cheap
-    SQL / local scans (`knn`, `_tag_similarity`, `_caption_similarity`) — it must
-    never touch the planner, the SigLIP text encoder, or keyword search (the
-    "similar stays incredible-fast" guarantee, plan 12). A TEXT query fuses
-    semantic (SigLIP text->image KNN) and keyword (FTS) via reciprocal-rank fusion.
+    A SEED query is a UNION, because image-vector KNN alone is NARROWER: a photo
+    sharing a strong `subject` tag, whose caption means the same thing, or taken in
+    the same `moment`, can sit outside the seed's top-K visual neighbours yet still be
+    "similar" (plan 12 task 3 parity fix). All four sources are cheap SQL / local
+    scans (`knn`, `_tag_similarity`, `_caption_similarity`, `moment_similarity`) — it
+    must never touch the planner, the SigLIP text encoder, or keyword search (the
+    "similar stays incredible-fast" guarantee, plan 12). A TEXT query fuses semantic
+    (SigLIP text->image KNN) and keyword (FTS) via reciprocal-rank fusion.
+
+    `moment` is the one source that needs NO embedding, so a photo with EXIF but no
+    vector yet still has similar photos — the strongest form of the graceful
+    degradation rule (§9.2).
     """
     if query.seed_photo_id is not None:
         seed_id = query.seed_photo_id
+        weights = query.weights or DEFAULT_SIMILAR_DIMENSION_WEIGHTS
+        moment_ids = set(moment_similarity(conn, owner_id, seed_id))
         vector = read_vector(conn, seed_id)
         if vector is None:
-            return []  # no embedding yet: nothing to compare against
+            # No embedding yet, so no visual/tag/caption comparison is possible — but
+            # EXIF time and place are already there, so the moment still stands.
+            return sorted(moment_ids)
         vector = l2_normalize(vector)
         knn_ids = [pid for pid, _ in knn(conn, owner_id, vector, max(query.k, 30), exclude_id=seed_id)]
-        weights = query.weights or DEFAULT_SIMILAR_DIMENSION_WEIGHTS
         tag_ids = set(_tag_similarity(conn, owner_id, seed_id, weights))
         caption_ids = set(_caption_similarity(conn, owner_id, seed_id, caption_min))
         seen = set(knn_ids)
-        extra = [pid for pid in (tag_ids | caption_ids) if pid not in seen]
+        extra = [pid for pid in (tag_ids | caption_ids | moment_ids) if pid not in seen]
         return knn_ids + extra
     if query.text and query.text.strip():
         k = max(query.k, 30)
@@ -113,8 +123,8 @@ def refine(
     ids: list[int],
     *,
     caption_model: str = "",
-    min_cosine: float = 0.5,
-    caption_min: float = 0.6,
+    min_cosine: float = IMAGE_GATE,
+    caption_min: float = CAPTION_GATE,
 ) -> list[dict]:
     """Phase 2 — hard pre-filter, then graceful additive scoring (§9.2).
 
@@ -156,8 +166,8 @@ def retrieve(
     query: Query,
     *,
     caption_model: str = "",
-    min_cosine: float = 0.5,
-    caption_min: float = 0.6,
+    min_cosine: float = IMAGE_GATE,
+    caption_min: float = CAPTION_GATE,
 ) -> list[dict]:
     """`retrieve() = refine(candidates())` — the synchronous convenience for search
     and memory. Chat/similar's two-phase UX calls the two stages separately."""
@@ -210,9 +220,9 @@ def _seed_contributions(
     min_cosine: float,
     caption_min: float,
 ) -> dict[int, list[dict]]:
-    """A seed's contributions: shared tags, caption meaning, and image look-alike —
-    the exact `similar_photos` math (§9), reused so the two paths agree by
-    construction rather than by convention."""
+    """A seed's contributions: shared tags, caption meaning, image look-alike, and the
+    shared moment — the exact `similar_photos` math (§9), reused so the two paths agree
+    by construction rather than by convention."""
     ids_set = set(ids)
     contributions: dict[int, list[dict]] = {pid: [] for pid in ids}
 
@@ -223,6 +233,12 @@ def _seed_contributions(
     for pid, cosine in _caption_similarity(conn, owner_id, seed_id, caption_min).items():
         if pid in ids_set:
             contrib = caption_contribution(cosine, caption_min)
+            if contrib is not None:
+                contributions[pid].append(contrib)
+
+    for pid, strength in moment_similarity(conn, owner_id, seed_id).items():
+        if pid in ids_set:
+            contrib = moment_contribution(strength)
             if contrib is not None:
                 contributions[pid].append(contrib)
 

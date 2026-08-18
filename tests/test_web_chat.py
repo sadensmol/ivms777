@@ -21,7 +21,13 @@ def _input(body, name):
 @pytest.fixture
 def chat_client(settings, monkeypatch):
     settings.data_dir.mkdir(parents=True, exist_ok=True)
-    fake_inf = FakeInferenceClient(streams=[["A beach ", "[photo:1]", "."]])
+    # A routing response per turn, so the grounded path really runs and photo 1 is
+    # in the context. Without it the router falls back to "none" (no photos), and a
+    # [photo:1] citation is a fabrication the CitationFilter strips by design.
+    fake_inf = FakeInferenceClient(
+        responses=[json.dumps({"tool": "search_library", "query": "beach"})] * 4,
+        streams=[["A beach ", "[photo:1]", "."]] * 4,
+    )
     monkeypatch.setattr(
         Settings, "build_inference_client", lambda self: (fake_inf, "fake")
     )
@@ -114,7 +120,8 @@ def test_chat_grounds_only_on_the_agent_verified_match(settings, monkeypatch):
     # recur.
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     fake = FakeInferenceClient(
-        responses=["yes", '{"semantic": "a dog on a beach"}',
+        responses=[json.dumps({"tool": "search_library", "query": "a dog on a beach"}),
+                   "yes", '{"semantic": "a dog on a beach"}',
                    json.dumps({"action": "answer", "photo_ids": [1]})],
         streams=[["Here ", "[photo:1]", "."]],
     )
@@ -398,3 +405,240 @@ def test_guardrails_on_never_refuses_an_app_count_question(settings, monkeypatch
         body = tc.get("/chat/stream?q=how+many+photos+do+I+have").text
     assert "only answer questions about your photos" not in body.lower()  # NOT refused
     assert "count: 4" in fake.calls[-1][1][1]["content"]                  # real count gathered
+
+
+def _chat_app(settings, monkeypatch, fake_inf):
+    """An app wired to `fake_inf`, with two photos to retrieve."""
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(Settings, "build_inference_client", lambda self: (fake_inf, "fake"))
+    app = create_app(settings)
+    conn = app.state.context.conn
+    fe = FakeEmbedder()
+    for pid, word in ((1, "beach"), (2, "keyboard")):
+        add_photo(conn, photo_id=pid, content_hash=word, thumb_key=f"{word}.jpg",
+                  caption=f"a {word}")
+        write_vector(conn, pid, fe.embed_texts([word])[0])
+    return app
+
+
+def test_a_general_question_never_wakes_siglip(settings, monkeypatch):
+    # THE rule (§10): never load SigLIP until something establishes the question is
+    # about photos. gemma is usually already resident, so a speculative SigLIP load
+    # evicts it and forces a ~9 s reload (§8.1) — "how many planets are in the solar
+    # system" would pay two swaps for a search it never needs.
+    fake = FakeInferenceClient(
+        responses=[json.dumps({"tool": "none", "query": None})],
+        streams=[["Eight."]],
+    )
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(Settings, "build_inference_client", lambda self: (fake, "fake"))
+    app = create_app(settings)
+    conn = app.state.context.conn
+    fe = FakeEmbedder()
+    embedded = []
+
+    class Spy(FakeEmbedder):
+        def embed_texts(self, texts):
+            embedded.extend(texts)
+            return super().embed_texts(texts)
+
+    monkeypatch.setattr(Settings, "build_embedder", lambda self: (Spy(), "fake"))
+    add_photo(conn, photo_id=1, content_hash="h1", thumb_key="1.jpg", caption="a beach")
+    write_vector(conn, 1, fe.embed_texts(["beach"])[0])
+    set_prefs(conn, 1, guardrails=False, direct_answers=True)
+    with TestClient(app) as tc:
+        tc.get("/chat/stream?q=how%20many%20planets%20are%20in%20the%20solar%20system")
+
+    assert embedded == []          # SigLIP never touched
+
+
+def test_guardrails_on_retrieves_before_the_model(settings, monkeypatch):
+    # Guardrails establishes on-topic BY POLICY, so retrieving up front always pays
+    # off: the turn becomes siglip -> gemma, one swap instead of two.
+    order = []
+
+    class Spy(FakeEmbedder):
+        def embed_texts(self, texts):
+            order.append("siglip")
+            return super().embed_texts(texts)
+
+    class OrderedClient(FakeInferenceClient):
+        def complete(self, *a, **k):
+            order.append("gemma")
+            return super().complete(*a, **k)
+
+        def stream(self, *a, **k):
+            order.append("gemma")
+            return super().stream(*a, **k)
+
+    fake = OrderedClient(
+        responses=[json.dumps({"tool": "search_library", "query": "beach"})],
+        streams=[["A beach."]],
+    )
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(Settings, "build_inference_client", lambda self: (fake, "fake"))
+    monkeypatch.setattr(Settings, "build_embedder", lambda self: (Spy(), "fake"))
+    app = create_app(settings)
+    conn = app.state.context.conn
+    add_photo(conn, photo_id=1, content_hash="h1", thumb_key="1.jpg", caption="a beach")
+    write_vector(conn, 1, FakeEmbedder().embed_texts(["beach"])[0])
+    set_prefs(conn, 1, guardrails=True, direct_answers=True)
+    with TestClient(app) as tc:
+        tc.get("/chat/stream?q=show%20me%20the%20beach")
+
+    assert order[0] == "siglip"                 # retrieval FIRST
+    assert order.count("siglip") == 1           # and only once — no re-embed
+
+
+def test_guardrails_on_still_routes_and_can_refuse(settings, monkeypatch):
+    # Guardrails is an explicit opt-in to a stricter gate, and its refusal depends
+    # on the router's verdict — so that path deliberately keeps the extra call.
+    fake = FakeInferenceClient(responses=[json.dumps({"tool": "none", "query": None})])
+    app = _chat_app(settings, monkeypatch, fake)
+    set_prefs(app.state.context.conn, 1, guardrails=True, direct_answers=True)
+    with TestClient(app) as tc:
+        body = tc.get("/chat/stream?q=what%20is%20the%20capital%20of%20France").text
+    assert len(fake.complete_kwargs) == 1    # the router DID run
+    assert "only answer questions about your photos" in body
+
+
+def test_the_photo_context_is_bounded_to_fit_the_smallest_context(conn):
+    # Regression: the merged prompt is BIGGER than the old one (longer system text,
+    # a memories line, and photo context on every turn), and with 12 photos it blew
+    # jetson's 2048-token window — llama-server answered 400 and the SSE stream died
+    # mid-answer with "the model service could not be reached".
+    from chat.context import MAX_CONTEXT_CHARS, build_context
+
+    ids = list(range(1, 31))
+    for pid in ids:
+        add_photo(conn, photo_id=pid, content_hash=f"h{pid}", thumb_key=f"{pid}.jpg",
+                  caption="a beach with a dog and a long descriptive caption " * 6)
+    block = build_context(conn, ids)
+    assert len(block) <= MAX_CONTEXT_CHARS + 200      # bounded, not all 30 blocks
+    assert "[photo:1]" in block                        # best matches kept, in order
+    # The model must know it saw a truncated list, not the whole library.
+    assert "lower-ranked photos not shown" in block
+
+
+def test_the_memories_line_shares_the_photo_budget(conn):
+    # Both go in the same prompt, so the photo block must shrink to make room —
+    # otherwise adding memories silently reintroduces the overflow.
+    from chat.context import MAX_CONTEXT_CHARS, build_context
+
+    ids = list(range(1, 31))
+    for pid in ids:
+        add_photo(conn, photo_id=pid, content_hash=f"h{pid}", thumb_key=f"{pid}.jpg",
+                  caption="a beach with a dog " * 10)
+    mem_line = "memories: " + "; ".join(f"Trip {i} (5 photos)" for i in range(20))
+    block = build_context(conn, ids, max_chars=MAX_CONTEXT_CHARS - len(mem_line))
+    assert len(block) + len(mem_line) <= MAX_CONTEXT_CHARS + 200
+
+
+def test_one_oversized_photo_still_yields_a_usable_prompt(conn):
+    # The budget must never produce an EMPTY context: a single photo whose caption
+    # alone exceeds the cap should still be shown, not dropped into nothing.
+    from chat.context import build_context
+
+    add_photo(conn, photo_id=1, content_hash="h1", thumb_key="1.jpg",
+              caption="x" * 9000)
+    block = build_context(conn, [1], max_chars=100)
+    assert "[photo:1]" in block
+
+
+def test_a_turn_records_and_renders_its_duration_and_time(settings, monkeypatch):
+    # "thought for N s" has to survive a reload, so the wait is PERSISTED with the
+    # turn, not just streamed — a turn that waited 40 s because it swapped models
+    # should still say so tomorrow.
+    from chat.history import add_message, session_messages
+
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(
+        Settings, "build_inference_client",
+        lambda self: (FakeInferenceClient(streams=[["hi"]]), "fake"),
+    )
+    app = create_app(settings)
+    conn = app.state.context.conn
+    with TestClient(app) as tc:
+        body = tc.get("/chat/stream?q=hello").text
+    # Announced BEFORE the answer, on its own event, so the UI can print it above
+    # the bubble as the first token lands — not after the whole answer has streamed.
+    assert body.index("event: thinking") < body.index("data:")
+    assert '"elapsed_ms"' in body
+
+    row = conn.execute("SELECT elapsed_ms FROM chat_messages ORDER BY id DESC").fetchone()
+    assert row["elapsed_ms"] is not None and row["elapsed_ms"] >= 0
+
+    session_id = conn.execute("SELECT id FROM chat_sessions ORDER BY id DESC").fetchone()["id"]
+    shown = session_messages(conn, session_id)[-1]
+    assert shown["took"]                                # rendered, e.g. "0.0 s"
+    assert len(shown["at"]) == 5 and ":" in shown["at"]  # HH:MM
+
+    # A turn written before this column existed must show no duration rather than a
+    # misleading "0 s".
+    add_message(conn, session_id, "old", "answer", [])
+    assert session_messages(conn, session_id)[-1]["took"] == ""
+
+
+def test_elapsed_is_formatted_for_humans():
+    from chat.history import format_elapsed
+
+    assert format_elapsed(None) == ""
+    assert format_elapsed(800) == "0.8 s"
+    assert format_elapsed(12400) == "12.4 s"
+    assert format_elapsed(65000) == "1m 05s"
+
+
+def test_a_count_line_can_never_become_a_photo_citation(settings, monkeypatch):
+    # The real bug, end to end. "find me all photos with dog" made the agentic loop
+    # gather ONLY `count: 1 photo(s) matching "dog"` — a QUANTITY, no photo blocks —
+    # and gemma4-E2B emitted `[photo:1]`, reading the count as an id and inventing a
+    # caption for it. Photo 1 was an unrelated portrait retrieval never returned.
+    # The prompt forbids this in capitals and was ignored, so it is enforced in code.
+    fake = FakeInferenceClient(
+        responses=[json.dumps({"action": "count_photos", "query": "dog", "grain": None}),
+                   json.dumps({"action": "answer", "query": None, "grain": None})],
+        streams=[["You have 1 photo of a dog: ", "[photo:1]", "."]],
+    )
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(Settings, "build_inference_client", lambda self: (fake, "fake"))
+    app = create_app(settings)
+    conn = app.state.context.conn
+    add_photo(conn, photo_id=1, content_hash="h1", thumb_key="1.jpg",
+              caption="A man with facial hair looks at the camera")
+    set_prefs(conn, 1, guardrails=False, direct_answers=False)
+    with TestClient(app) as tc:
+        body = tc.get("/chat/stream?q=find%20me%20all%20photos%20with%20dog").text
+
+    assert "[photo:1]" not in body            # the fabrication never reaches the user
+    assert "You have 1 photo of a dog" in body  # the prose itself is untouched
+    # ...and it is not persisted either, so a reload cannot resurrect it.
+    row = conn.execute("SELECT answer, sources FROM chat_messages ORDER BY id DESC").fetchone()
+    assert "[photo:1]" not in row["answer"]
+    assert json.loads(row["sources"]) == []
+
+
+def test_the_recorded_wait_excludes_streaming_time(settings, monkeypatch):
+    # "thought for" is time-to-first-token, NOT the whole turn: once tokens are
+    # arriving the user is reading, not waiting, so a long answer must not read as
+    # a slow one. A stream that dawdles between chunks must not inflate it.
+    import time as _time
+
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+
+    class SlowStream(FakeInferenceClient):
+        def stream(self, *args, **kwargs):
+            for chunk in ("hello ", "world"):
+                _time.sleep(0.05)   # 100 ms of pure streaming, after the first token
+                yield chunk
+
+    monkeypatch.setattr(
+        Settings, "build_inference_client", lambda self: (SlowStream(), "fake"),
+    )
+    app = create_app(settings)
+    conn = app.state.context.conn
+    with TestClient(app) as tc:
+        tc.get("/chat/stream?q=hello")
+
+    row = conn.execute("SELECT elapsed_ms FROM chat_messages ORDER BY id DESC").fetchone()
+    # The second chunk's 50 ms sleep lands after the wait has already been stamped.
+    assert row["elapsed_ms"] < 100

@@ -29,18 +29,32 @@ def backfill_taxonomy(conn: sqlite3.Connection) -> int:
     return len(rows)
 
 # Per-dimension prompt templates for zero-shot scoring (§7). "{label}" is filled in.
+# These are the FALLBACK: a label listed under `prompts:` in vocab.yaml says itself
+# in its own words instead. Measured on a hand-labelled sample, the template alone
+# gets `subject` right 37% of the time — it produces prompts like "a photo of
+# portrait" and "a photo of top-down", and SigLIP's text tower is trained on real
+# captions, so ungrammatical phrasing costs real accuracy (§7).
 _TEMPLATES = {
+    "setting": "a photo taken in a {label}",
+    "occasion": "a photo taken at a {label}",
+    "season_weather": "a photo taken in {label} weather",
+    "composition": "a photo composed as a {label}",
     "vibe": "a photo with a {label} mood",
-    "emotion": "a {label} photo",
+    "emotion": "a photo of a {label} moment",
     "light": "a photo taken in {label} light",
     "palette": "a {label} colored photo",
     "quality": "a {label} photo",
 }
-_DEFAULT_TEMPLATE = "a photo of {label}"
+_DEFAULT_TEMPLATE = "a photo of a {label}"
 
 
-def label_prompt(dimension: str, label: str) -> str:
-    return _TEMPLATES.get(dimension, _DEFAULT_TEMPLATE).format(label=label)
+def label_prompts(vocab: Vocab, dimension: str, label: str) -> list[str]:
+    """What to SAY to the text tower for one label — its own sentences from
+    `vocab.prompts` if it has any, else the dimension's template (§7)."""
+    own = vocab.prompts.get(dimension, {}).get(label)
+    return list(own) if own else [
+        _TEMPLATES.get(dimension, _DEFAULT_TEMPLATE).format(label=label)
+    ]
 
 
 def select_dimension_tags(
@@ -95,8 +109,18 @@ def taxonomy_handler(derived: Storage, embedder: Embedder, vocab: Vocab) -> Stag
     # group the normalized vectors by dimension so each is scored on its own.
     by_dim: dict[str, list[tuple[str, list[float]]]] = {}
     for dimension, labels in vocab.dimensions.items():
-        vectors = embedder.embed_texts([label_prompt(dimension, lbl) for lbl in labels])
-        by_dim[dimension] = [(lbl, l2_normalize(v)) for lbl, v in zip(labels, vectors)]
+        # A label may be said several ways (§7). Embed every sentence, then average
+        # a label's vectors into one — prompt ensembling, so a single unlucky
+        # phrasing cannot decide the tag.
+        said = [label_prompts(vocab, dimension, lbl) for lbl in labels]
+        vectors = embedder.embed_texts([p for prompts in said for p in prompts])
+        by_dim[dimension] = []
+        at = 0
+        for lbl, prompts in zip(labels, said):
+            group = [l2_normalize(v) for v in vectors[at : at + len(prompts)]]
+            at += len(prompts)
+            mean = [sum(axis) / len(group) for axis in zip(*group)]
+            by_dim[dimension].append((lbl, l2_normalize(mean)))
 
     def handle(conn: sqlite3.Connection, photo_id: int) -> None:
         ids = tag_id_map(conn)

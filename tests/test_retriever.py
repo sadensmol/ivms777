@@ -7,8 +7,9 @@ additive scoring phase; `retrieve() = refine(candidates())`.
 from embedding.fakes import FakeEmbedder
 from embedding.store import write_caption_vector, write_vector
 from inference.fakes import FakeInferenceClient
-from search import retriever
+from search import retriever, signals
 from search.retriever import Query, candidates, retrieve
+from search.signals import CAPTION_GATE
 from tests.factories import add_photo
 
 
@@ -129,9 +130,9 @@ def test_floor_cuts_only_when_set(conn):
 
     floored = retrieve(
         conn, embedder, client, 1,
-        Query(text="a dog on a beach", k=8, floor=0.8), caption_model="fake",
+        Query(text="a dog on a beach", k=8, floor=0.5), caption_model="fake",
     )
-    assert [r["id"] for r in floored] == [1]  # only the strong match clears 0.8
+    assert [r["id"] for r in floored] == [1]  # only the strong match clears the floor
 
 
 # --- (f) seed perf guarantee: candidates() never touches text-query machinery -
@@ -157,3 +158,116 @@ def test_seed_candidates_never_touch_text_query_machinery(conn, monkeypatch):
     ids = candidates(conn, embedder, 1, Query(seed_photo_id=1, k=8))
 
     assert ids == [2]
+
+
+# --- (g) card reasons lead with what DROVE the match (same rule as the why-similar table)
+
+def test_reasons_lead_with_what_drove_the_match_not_the_biggest_percent():
+    from search.scoring import score_candidates
+
+    # A big percentage is not a big reason. `quality: sharp` agrees at 100% on almost
+    # every pair in the library and drives ~0.01 — sorting reasons by match % put it
+    # at the top of 403 result cards.
+    contribs = [
+        {"text": "quality: sharp", "pct": 100, "evidence": 0.012,
+         "tag": ("quality", "sharp")},
+        {"text": "subject: dog", "pct": 88, "evidence": 0.62, "content": True,
+         "tag": ("subject", "dog")},
+        {"text": "light: low light", "pct": 95, "evidence": 0.04,
+         "tag": ("light", "low light")},
+    ]
+    [result] = score_candidates({7: contribs})
+
+    assert [r["text"] for r in result["reasons"]] == [
+        "subject: dog", "light: low light", "quality: sharp"
+    ]
+
+
+# --- (h) every signal is gated above its measured noise floor -----------------
+
+def test_a_caption_at_the_noise_floor_is_absent_not_weak():
+    from search.scoring import caption_contribution, tag_contribution
+
+    # Two RANDOM captions in the real library sit at cosine 0.62. The old bar was
+    # 0.60 — BELOW that median — so 64% of all pairs cleared it and the caption
+    # scored pure chance. Above its real gate the signal is simply absent.
+    assert caption_contribution(0.62) is None
+    assert caption_contribution(0.74) is None
+
+    # Crossing the gate is immediately worth half the caption's weight, so admitting
+    # a pair actually buys something.
+    at_gate = caption_contribution(CAPTION_GATE)
+    assert at_gate["pct"] == 50
+    tag = tag_contribution("subject", "dog", agreement=0.85, idf=0.35,
+                           dimension_weight=signals.TAG_TIERS["subject"].weight)
+    strong = caption_contribution(0.9)
+    assert strong["evidence"] > at_gate["evidence"] > 0
+    assert strong["evidence"] > tag["evidence"]  # a caption that truly means the same leads
+
+
+def test_style_facets_alone_never_qualify_a_pair():
+    from search.scoring import caption_contribution, score_candidates, tag_contribution
+
+    look = tag_contribution("palette", "pastel", agreement=0.9, idf=0.5,
+                            dimension_weight=signals.TAG_TIERS["look"].weight)
+    where = tag_contribution("setting", "indoor", agreement=0.9, idf=0.5,
+                             dimension_weight=signals.TAG_TIERS["where"].weight)
+    # However many style/scene facets agree, none of them is CONTENT.
+    assert score_candidates({1: [look, where]}) == []
+    # One real content signal qualifies the same candidate.
+    assert [r["id"] for r in score_candidates({1: [caption_contribution(0.9), look]})] == [1]
+
+
+def test_a_half_believed_subject_tag_cannot_qualify_a_pair():
+    from search.scoring import score_candidates, tag_contribution
+
+    subject_weight = signals.TAG_TIERS["subject"].weight
+    # This is the real failure: a girl by a Christmas tree carried `subject: toy` at
+    # 0.58 (runner-up `person` at 0.31) and was called similar to a teddy bear.
+    guess = tag_contribution("subject", "toy", agreement=0.58, idf=0.41,
+                             dimension_weight=subject_weight)
+    believed = tag_contribution("subject", "dog", agreement=0.85, idf=0.5,
+                                dimension_weight=subject_weight)
+    style = tag_contribution("palette", "cool", agreement=0.9, idf=0.5,
+                             dimension_weight=signals.TAG_TIERS["look"].weight)
+
+    assert guess is None                                         # below the subject gate
+    assert score_candidates({1: [style]}) == []                  # style alone is not content
+    assert [r["id"] for r in score_candidates({1: [believed, style]})] == [1]
+
+
+def test_the_score_is_a_bounded_zero_to_one():
+    from search.scoring import caption_contribution, image_contribution, score_candidates
+
+    [result] = score_candidates({1: [image_contribution(0.99), caption_contribution(0.99)]})
+    assert 0.0 < result["score"] < 1.0
+
+
+def test_score_min_drops_results_nothing_really_supports(conn):
+    embedder = FakeEmbedder()
+    _photo(conn, embedder, 1, "a dog on a beach")
+    _photo(conn, embedder, 2, "a plate of pasta")
+    client = FakeInferenceClient()
+    query = Query(text="a dog on a beach", k=8)
+
+    unfloored = retrieve(conn, embedder, client, 1, query, caption_model="fake")
+    weakest = min(r["score"] for r in unfloored)
+
+    floored = Query(text="a dog on a beach", k=8, floor=weakest + 0.01)
+    kept = retrieve(conn, embedder, client, 1, floored, caption_model="fake")
+    assert len(kept) < len(unfloored)
+    assert all(r["score"] >= weakest for r in kept)
+
+
+def test_caption_below_the_bar_is_absent_from_the_breakdown(conn):
+    from search.semantic import similarity_breakdown
+
+    embedder = FakeEmbedder()
+    _photo(conn, embedder, 1, "a dog on a beach")
+    _photo(conn, embedder, 2, "a plate of pasta")
+
+    params = [
+        r["param"]
+        for r in similarity_breakdown(conn, 1, 1, 2, caption_min=0.99)
+    ]
+    assert "caption (meaning)" not in params  # no contribution -> no row (§9.3)

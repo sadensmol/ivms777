@@ -20,6 +20,13 @@ by design: one photo may sit in one event and several themes, which `group_photo
    bound context size — this is not the memory boundary, just a tractable batch the
    agent can read at once. Only processed photos participate, so composition is run
    **after** captioning/embedding.
+
+   **A stay away from home is one session, not one per day.** The gap that ends a run
+   is 6 h at home but **36 h while the region does not change and is not home**
+   (`albums/seeds.py`), so a week in Batumi arrives as ONE candidate — people sleep,
+   and a flat 6 h gap cut every trip into night-separated fragments. *Home* is simply
+   the region holding the most photos; without that exception the wider gap would weld
+   months of ordinary days at home into one endless memory.
 2. **Compose events (agent, per session).** For each session the agent reads compact
    per-photo summaries (date, place, caption, tags) and **decides the carve** — one
    memory, or several chapters, or skip — pulling extra context on demand via bounded
@@ -44,16 +51,27 @@ by design: one photo may sit in one event and several themes, which `group_photo
    prose ("a moment filled with sharp, joyful holiday cheer") and they crowded out the
    tags that carry meaning.
 
-   **Voice — this is written for the person whose life it is.** The title is short and
-   warm and names the place ("A winter day in Borjomi"); the description is 2-4
-   sentences about the day as one whole — never a per-photo list ("another view
-   shows…", "There were scenes of…").
+   **Voice — a person remembering, not a machine reporting.** The title is short and
+   warm and names the town; the description is 2-3 easy sentences that **say what the
+   day was**: a cake with a number is a birthday and the number is the age ("she
+   turned four"), a lit tree with gifts is Christmas. It never mentions the photos
+   themselves — no "image", "picture", "another view shows", "these photos capture",
+   "the occasion was" — never retells the photo lines one by one, and never lists
+   objects or colours. Saying "we" is fine: they were there, they took the photos.
+
+   **The prompt is deliberately SHORT.** The long version — every rule spelled out,
+   ~450 tokens — read well but a 2B model obeyed its first few lines and dropped the
+   rest, so the voice rules at the bottom never landed; it answered in inventory prose
+   ("Another image shows a man and a young girl beside a cake box"). Fewer, blunter
+   sentences with the voice first is what changed the output. The answer schema stays
+   spelled out at the end with **all four keys**, because compressing that part is what
+   made the model omit `description` entirely.
 
    **Warmth never buys invention.** A 2B model told to be warm fills in the humans it
    expects: two photos of a birthday cake became "Friends gathered around the sweet
-   treats". So the rule is hard — **only people a caption mentions may appear, described
-   as the caption describes them; if no caption mentions a person, the memory has no
-   people in it** (no friends, family, guests, "everyone", "we", "you"). Warmth comes
+   treats". So the rule is hard — **only people a photo line mentions may appear,
+   described as it describes them; never friends, family, guests, or a crowd that is
+   not there**. Warmth comes
    from the real place, light, season, and occasion. Tags are hints, not words to
    quote: a `summer` tag on a November day loses to the date. The one thing the model
    may add from its own knowledge is a **short, well-known touch about a place the

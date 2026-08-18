@@ -49,6 +49,7 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("photos", "ai_description", "TEXT"),
     ("photos", "caption_vec", "BLOB"),
     ("groups", "description", "TEXT"),
+    ("chat_messages", "elapsed_ms", "INTEGER"),
 )
 
 

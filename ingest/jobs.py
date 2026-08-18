@@ -1,7 +1,11 @@
 import sqlite3
 from datetime import datetime, timezone
 
-STAGES: tuple[str, ...] = ("thumbnail", "embed", "taxonomy", "caption")
+# `caption_embed` is the §9 caption-meaning vector. It is a real stage like the
+# others — queued per photo, counted, reprocessable — but it is DRAINED IN ONE
+# BATCH (pipeline group 2c) rather than photo by photo, because the text embedder
+# loads once and embeds 50 captions in a single call.
+STAGES: tuple[str, ...] = ("thumbnail", "embed", "taxonomy", "caption", "caption_embed")
 MAX_ATTEMPTS = 3
 STATUSES = ("pending", "running", "done", "failed")
 
@@ -54,6 +58,22 @@ def complete(conn: sqlite3.Connection, photo_id: int, stage: str) -> None:
         "UPDATE jobs SET status = 'done', error = NULL, updated_at = ?"
         " WHERE photo_id = ? AND stage = ?",
         (_now(), photo_id, stage),
+    )
+
+
+def record_done_at(conn: sqlite3.Connection, photo_id: int, stage: str, when: str) -> None:
+    """Mark a job done with a GIVEN timestamp — for work that happened before it was
+    a stage, and is only now being written down.
+
+    It matters because `stage_speed` reads `updated_at`: stamping a whole backfilled
+    library with `now` puts hundreds of completions on one instant and the UI reports
+    a fictional 6327/s. The photo's own caption time is when the work really happened.
+    """
+    enqueue(conn, photo_id, stage)
+    conn.execute(
+        "UPDATE jobs SET status = 'done', error = NULL, updated_at = ?"
+        " WHERE photo_id = ? AND stage = ?",
+        (when, photo_id, stage),
     )
 
 

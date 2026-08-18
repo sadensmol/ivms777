@@ -158,17 +158,53 @@ def test_similar_strip_lists_other_photos_with_reasons_and_ctx(client):
     assert f'href="/photo/{other}?ctx=similar:{base}"' in body   # drills into the similar layer
 
 
-def test_similar_photo_shows_origin_context_but_closes_to_the_library(client):
+def test_similar_photo_closes_up_to_its_origin_photo_then_to_the_grid(client):
     ctx = client.app.state.context
     fake = FakeEmbedder()
     base = _first_id(client)
     write_vector(ctx.conn, base, fake.embed_texts(["a"])[0])
     other = add_photo(ctx.conn, content_hash="cc" * 32, thumb_key="cc.jpg", caption="x")
     write_vector(ctx.conn, other, fake.embed_texts(["a"])[0])
+
     body = client.get(f"/photo/{other}?ctx=similar:{base}").text
-    assert "Similar to" in body                                      # origin shown as context
-    assert f'href="/photo/{base}"' in body                           # origin thumbnail, jump back
-    # A photo is one level below its grid: close goes UP to the library, never to
-    # a prior photo (§13). The origin thumbnail replaces history, never pushes.
-    assert 'class="photo-close" href="/library"' in body
-    assert "location.replace(this.href)" in body
+
+    assert "Similar to" in body  # origin shown as context
+    # Close goes UP one level — to the origin photo, in its own library layer, so
+    # ITS close then goes up to the grid (§13.1 rule 4): similar -> origin -> grid.
+    assert f'class="photo-close" href="/photo/{base}?ctx=library"' in body
+    assert "location.replace(ivmsOrigin)" in body  # replace, never a push (rule 3)
+    assert "var ivmsCloseReplaces = true" in body
+
+    # …and the origin photo itself closes to the grid with a plain history.back().
+    origin_body = client.get(f"/photo/{base}?ctx=library").text
+    assert 'class="photo-close" href="/library"' in origin_body
+    assert "var ivmsCloseReplaces = false" in origin_body
+
+
+def test_similar_layer_shows_both_photos_own_words_before_the_table(client):
+    # What is being compared is read BEFORE how it scored: the base photo's and this
+    # photo's own title/description/caption, in the table's Base|This order (§13).
+    ctx = client.app.state.context
+    fake = FakeEmbedder()
+    base = _first_id(client)
+    write_vector(ctx.conn, base, fake.embed_texts(["a"])[0])
+    other = add_photo(ctx.conn, content_hash="dd" * 32, thumb_key="dd.jpg")
+    write_vector(ctx.conn, other, fake.embed_texts(["a"])[0])
+    for pid, title, desc, cap in (
+        (base, "Beach day", "A dog runs on the sand.", "a dog on a beach"),
+        (other, "Park day", "A dog runs on the grass.", "a dog in a park"),
+    ):
+        ctx.conn.execute(
+            "UPDATE photos SET ai_title=?, ai_description=?, caption=? WHERE id=?",
+            (title, desc, cap, pid),
+        )
+
+    body = client.get(f"/photo/{other}?ctx=similar:{base}").text
+
+    head = body[: body.index("Why similar")]
+    for text in ("Beach day", "A dog runs on the sand.", "a dog on a beach",
+                 "Park day", "A dog runs on the grass.", "a dog in a park"):
+        assert text in head
+    assert head.index("Beach day") < head.index("Park day")  # Base, then This
+    # …and the leaf's own block below the table does not repeat them.
+    assert body.count("Park day") == 1

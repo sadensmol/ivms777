@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import threading
 import time
 from pathlib import Path
@@ -31,11 +32,13 @@ from chat.agent import (
     agentic_gather,
     direct_answer,
     is_app_topic,
+    is_photo_show,
     memories_for_show,
     route,
     search_library,
     search_memories,
 )
+from chat.citations import CitationFilter
 from chat.context import build_context as build_chat_context
 from chat.history import (
     add_message,
@@ -101,6 +104,19 @@ DUPES_ONLY = (
 )
 
 DEFAULT_ORDER = " ORDER BY COALESCE(p.shot_at, p.created_at) DESC, p.id DESC"
+
+
+def _context_photo_ids(messages: list[dict]) -> set[int]:
+    """Photo ids the model was actually shown, from the prompt it is about to answer.
+
+    Read back off the built messages rather than threaded through every branch, so
+    it cannot drift out of sync with what was really sent — the whole point is that
+    the allow-list matches the prompt exactly.
+    """
+    text = "".join(
+        m["content"] for m in messages if isinstance(m.get("content"), str)
+    )
+    return {int(pid) for pid in re.findall(r"\[photo:(\d+)\]", text)}
 
 
 def _has_member_collage(ctx_param: str | None) -> bool:
@@ -582,6 +598,7 @@ def create_app(settings: Settings) -> FastAPI:
                         ctx.conn, owner, origin["id"], k=12,
                         min_cosine=ctx.settings.similar_min_cosine,
                         caption_min=ctx.settings.similar_caption_min,
+                        score_min=ctx.settings.similar_score_min,
                         dimension_weights=vocab.dimension_weights,
                         use_captions=ctx.settings.similar_use_captions,
                     )
@@ -590,6 +607,11 @@ def create_app(settings: Settings) -> FastAPI:
                 return {
                     "ids": ids, "title": f"Similar to {label}", "description": None,
                     "origin_id": origin["id"],  # the photo this layer is similar to
+                    # The base photo's own words, so the leaf can show what it is
+                    # being compared TO right above the comparison table (§13).
+                    "origin_title": origin["ai_title"],
+                    "origin_description": origin["ai_description"],
+                    "origin_caption": origin["caption"],
                 }
             # The origin is gone — fall back to the library.
         if ctx_param == "chat":
@@ -638,14 +660,15 @@ def create_app(settings: Settings) -> FastAPI:
     def _lookup_photo(conn, owner_id: int, raw_id: str):
         try:
             return conn.execute(
-                "SELECT id, ai_title, caption FROM photos WHERE id = ? AND owner_id = ?",
+                "SELECT id, ai_title, ai_description, caption FROM photos"
+                " WHERE id = ? AND owner_id = ?",
                 (int(raw_id), owner_id),
             ).fetchone()
         except (ValueError, TypeError):
             return None
 
     def _origin_url(ctx_param: str | None, params: dict[str, str]) -> str:
-        # The layer a photo was opened from — where "close" returns to.
+        # ONE level up from this leaf — where "close" goes (§13.1 rule 4).
         if ctx_param == "chat" or (ctx_param and ctx_param.startswith("chat-memory:")):
             # A memory shown in chat pages within the memory, but "close" goes back
             # UP to the conversation it was surfaced in, not to Organize (§13.1).
@@ -655,11 +678,16 @@ def create_app(settings: Settings) -> FastAPI:
             if len(parts) == 4:
                 _, by, grain, _key = parts
                 return f"/organize?by={by}" + (f"&grain={grain}" if grain else "")
-        # A similar photo's grid is the library (a photo is always exactly one level
-        # below a grid — §13). The origin photo is reachable via its thumbnail in
-        # the header, but "close" goes UP to the grid, never sideways to a photo.
         library_query = _query_string(params)
-        return "/library" + (f"?{library_query}" if library_query else "")
+        library_url = "/library" + (f"?{library_query}" if library_query else "")
+        if ctx_param and ctx_param.startswith("similar:"):
+            # The origin photo is the ONE extra level above a similar leaf: close
+            # returns to it (carrying the library's own state so ITS close still
+            # lands on the filtered grid), and closing there goes up to the grid.
+            origin_id = ctx_param.split(":", 1)[1]
+            sep = "&" if library_query else ""
+            return f"/photo/{origin_id}?ctx=library{sep}{library_query}"
+        return library_url
 
     @app.get("/photo/{photo_id}", response_class=HTMLResponse)
     def photo_detail(request: Request, photo_id: int) -> HTMLResponse:
@@ -709,6 +737,8 @@ def create_app(settings: Settings) -> FastAPI:
             similarity = similarity_breakdown(
                 ctx.conn, ctx.settings.owner_id, collection["origin_id"], photo_id,
                 dimension_weights=vocab.dimension_weights,
+                min_cosine=ctx.settings.similar_min_cosine,
+                caption_min=ctx.settings.similar_caption_min,
                 use_captions=ctx.settings.similar_use_captions,
             )
 
@@ -753,6 +783,7 @@ def create_app(settings: Settings) -> FastAPI:
             ctx.conn, ctx.settings.owner_id, photo_id, k=12,
             min_cosine=ctx.settings.similar_min_cosine,
             caption_min=ctx.settings.similar_caption_min,
+            score_min=ctx.settings.similar_score_min,
             dimension_weights=vocab.dimension_weights,
             use_captions=ctx.settings.similar_use_captions,
         )
@@ -882,9 +913,22 @@ def create_app(settings: Settings) -> FastAPI:
         model = ctx.settings.planner_model or "fake"
         session_id = current_session(ctx.conn, owner_id)
 
+        # "Thinking" is the wait BEFORE the answer starts — from the request landing
+        # here to the first token going out. It covers routing, retrieval and, on the
+        # Jetson, a model swap (a ~9 s llama-server reload, §8.1), which is the part
+        # the user actually waits through. Streaming is deliberately NOT counted:
+        # once tokens are arriving the user is reading, not waiting, and a long
+        # answer is not a slow one.
+        turn_started = time.monotonic()
+        thinking_ms: int | None = None
+
+        def _turn_ms() -> int:
+            return int((time.monotonic() - turn_started) * 1000)
+
         def _done(**stats) -> str:
             # The done event carries the model and, for a generated answer, its
-            # measured decode speed (tokens/sec) so the UI can show model info.
+            # measured decode speed (tokens/sec). The wait is reported earlier, by
+            # the `thinking` event — by `done` the user has read the whole answer.
             return "event: done\ndata: " + json.dumps({"model": model, **stats}) + "\n\n"
 
         prefs = get_prefs(ctx.conn, owner_id)
@@ -894,6 +938,20 @@ def create_app(settings: Settings) -> FastAPI:
             # down — see §8.1) is streamed to the UI as a plain error turn, never a
             # silent "(no answer)" bubble, and the partial answer + note is persisted.
             parts: list[str] = []
+
+            def _thinking() -> str:
+                """Stop the wait clock and announce it — emitted ONCE, immediately
+                before the first text of the turn, so the UI can print "thought for
+                12.4 s" ABOVE the answer as it starts rather than after it ends."""
+                nonlocal thinking_ms
+                if thinking_ms is None:
+                    thinking_ms = _turn_ms()
+                return (
+                    "event: thinking\ndata: "
+                    + json.dumps({"elapsed_ms": thinking_ms})
+                    + "\n\n"
+                )
+
             try:
                 # The direct-DB layer (§10) — ONLY when "Direct answers" is on (default).
                 # Every question the DB can answer unambiguously — counts, memory
@@ -905,18 +963,35 @@ def create_app(settings: Settings) -> FastAPI:
                 if prefs.direct_answers:
                     quick = direct_answer(ctx.conn, owner_id, q)
                     if quick is not None:
+                        yield _thinking()
                         yield f"data: {json.dumps({'delta': quick})}\n\n"
-                        add_message(ctx.conn, session_id, q, quick, [])
+                        add_message(ctx.conn, session_id, q, quick, [], thinking_ms)
                         card = _memory_card_html(q)
                         if card is not None:
                             yield "event: memory\ndata: " + json.dumps({"html": card}) + "\n\n"
                         yield _done()
                         return
-                # One routing decision (plan 17, §10). Needed for the direct-ON one-shot
-                # path AND, when "Guardrails" is on, as the on-topic gate. The
-                # fully-agentic + guardrails-off case picks its own tools, so it needs no
-                # route. Model load/evict + GPU serialization live in the `models`
-                # conveyor (plan 18): the chat turn is a plain sequence of HTTP calls.
+                # NEVER wake SigLIP until something has established this question is
+                # about the photos (§10). gemma (3800) and siglip (3400) cannot both
+                # fit the 5000 MB jetson budget (§8.1), so loading one evicts the
+                # other, and bringing gemma back respawns `llama-server` with ~3 GB
+                # of weights — ~9 s, measured. gemma is also the model most likely to
+                # be ALREADY resident, so a speculative SigLIP load is not free: it
+                # costs an eviction now and a reload after, and "how many planets are
+                # in the solar system" pays both for a search it never needed.
+                #
+                # Guardrails ON establishes it BY POLICY — an off-topic message is
+                # refused, so anything answered is about the library. Only then is
+                # retrieving up front the cheap order (siglip → gemma, ONE swap).
+                #
+                # Guardrails OFF means only the model can decide, so gemma goes
+                # first: a general question then costs NO swap at all, and a photo
+                # question pays one only when it genuinely needs photos.
+                primed_ids: list[int] | None = None
+                if prefs.guardrails:
+                    embedder, _ = ctx.settings.build_embedder()
+                    primed_ids = search_library(ctx.conn, embedder, owner_id, q, k=12)
+
                 decision = None
                 if prefs.guardrails or prefs.direct_answers:
                     decision = route(client, model, q)
@@ -926,18 +1001,23 @@ def create_app(settings: Settings) -> FastAPI:
                 # memories, albums, uploads, tags…) are NEVER off-topic — `is_app_topic`
                 # overrides the weak router so app functionality is never turned away.
                 if prefs.guardrails and decision["tool"] == "none" and not is_app_topic(q):
+                    yield _thinking()
                     yield f"data: {json.dumps({'delta': GUARDRAIL_REFUSAL})}\n\n"
-                    add_message(ctx.conn, session_id, q, GUARDRAIL_REFUSAL, [])
+                    add_message(ctx.conn, session_id, q, GUARDRAIL_REFUSAL, [], thinking_ms)
                     yield _done()
                     return
                 if prefs.direct_answers:
-                    # Direct-ON one-shot path: SigLIP image↔text (search_library), memory
-                    # search, or a direct general answer. Grounded answers cite [photo:ID].
                     if decision["tool"] == "search_library":
-                        embedder, _ = ctx.settings.build_embedder()
-                        ids = search_library(
-                            ctx.conn, embedder, owner_id, decision["query"] or q, k=12
-                        )
+                        if primed_ids is not None:
+                            # Guardrails ON: retrieval already ran BEFORE gemma, so
+                            # reuse it — embedding again here would evict gemma and
+                            # pay a ~9 s reload to bring it straight back.
+                            ids = primed_ids
+                        else:
+                            embedder, _ = ctx.settings.build_embedder()
+                            ids = search_library(
+                                ctx.conn, embedder, owner_id, decision["query"] or q, k=12
+                            )
                         messages = chat_messages(q, build_chat_context(ctx.conn, ids))
                     elif decision["tool"] == "search_memories":
                         mems = search_memories(ctx.conn, owner_id, decision["query"] or q)
@@ -955,26 +1035,61 @@ def create_app(settings: Settings) -> FastAPI:
                     # those facts. Memory-show is prose here (no card). Nothing gathered ->
                     # answer from general knowledge.
                     embedder, _ = ctx.settings.build_embedder()
+                    # `prime` only under guardrails — see the note above the router.
+                    # With guardrails off, the loop's own STEP 1 decides whether this
+                    # is even a photo question, and gemma (usually already resident)
+                    # answers a general one without ever waking SigLIP.
+                    # Prime when we KNOW the question is about photos, without a
+                    # model: guardrails guarantees it by policy, and "find/show me
+                    # photos of X" says it outright. Both license waking SigLIP
+                    # first; a general question still never loads it.
                     block, grounded = agentic_gather(
-                        ctx.conn, embedder, client, model, owner_id, q
+                        ctx.conn, embedder, client, model, owner_id, q,
+                        prime=prefs.guardrails or is_photo_show(q),
+                        prime_as_evidence=is_photo_show(q),
                     )
                     messages = (
                         agentic_answer_messages(q, block) if grounded
                         else general_chat_messages(q)
                     )
+                # A citation is a claim about the user's own library, so it may only
+                # name a photo the model was actually GIVEN. The prompt says so in
+                # capitals and gemma4-E2B still emitted `[photo:1]` off a
+                # `count: 1 photo(s)` line — reading a quantity as an id. Enforced
+                # here instead, over the stream, because the answer arrives a
+                # character at a time and a bad citation must never render at all.
+                citations = CitationFilter(_context_photo_ids(messages))
                 started_at = None
+                chunks = 0
                 for delta in client.stream(model, messages, temperature=0):
                     if started_at is None:  # clock starts at the first token, not the wait before it
                         started_at = time.monotonic()
-                    parts.append(delta)
-                    yield f"data: {json.dumps({'delta': delta})}\n\n"
+                    chunks += 1
+                    clean = citations.feed(delta)
+                    if clean:
+                        parts.append(clean)
+                        # The wait ends at the first text the user SEES — a citation
+                        # filtered out of the leading chunks is not an answer yet.
+                        if thinking_ms is None:
+                            yield _thinking()
+                        yield f"data: {json.dumps({'delta': clean})}\n\n"
+                tail = citations.flush()
+                if tail:
+                    parts.append(tail)
+                    if thinking_ms is None:  # the whole answer was held back until now
+                        yield _thinking()
+                    yield f"data: {json.dumps({'delta': tail})}\n\n"
+                if citations.dropped:
+                    logger.warning(
+                        "dropped fabricated citation(s) %s for q=%r", citations.dropped, q
+                    )
                 # Chunk count is a close proxy for tokens with an OpenAI-style stream
                 # (one token per chunk); good enough for a live decode-speed readout.
                 elapsed = (time.monotonic() - started_at) if started_at else 0.0
-                tok_per_sec = round(len(parts) / elapsed, 1) if elapsed > 0 else None
+                tok_per_sec = round(chunks / elapsed, 1) if elapsed > 0 else None
                 answer = "".join(parts)
-                add_message(ctx.conn, session_id, q, answer, cited_ids(answer))
-                yield _done(tok_per_sec=tok_per_sec, tokens=len(parts))
+                add_message(ctx.conn, session_id, q, answer, cited_ids(answer), thinking_ms)
+                yield _done(tok_per_sec=tok_per_sec, tokens=chunks)
             except Exception:
                 logger.exception("chat stream failed for q=%r", q)
                 note = (
@@ -983,8 +1098,10 @@ def create_app(settings: Settings) -> FastAPI:
                 )
                 # A break if partial text already streamed, so the note stays legible.
                 delta = ("\n\n" + note) if parts else note
+                if thinking_ms is None:
+                    yield _thinking()
                 yield f"data: {json.dumps({'delta': delta})}\n\n"
-                add_message(ctx.conn, session_id, q, "".join(parts) + delta, [])
+                add_message(ctx.conn, session_id, q, "".join(parts) + delta, [], thinking_ms)
                 yield _done(error=True)
 
         return StreamingResponse(events(), media_type="text/event-stream")

@@ -80,7 +80,7 @@ CREATE INDEX photo_tags_tag ON photo_tags(tag_id);
 
 jobs (
   photo_id   INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
-  stage      TEXT NOT NULL,           -- thumbnail | embed | taxonomy | caption
+  stage      TEXT NOT NULL,           -- thumbnail | embed | taxonomy | caption | caption_embed
   status     TEXT NOT NULL,           -- pending | running | done | failed
   attempts   INTEGER NOT NULL DEFAULT 0,
   error      TEXT,
