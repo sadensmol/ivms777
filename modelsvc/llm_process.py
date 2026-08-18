@@ -46,6 +46,7 @@ class SubprocessLlm:
         *,
         health_url: str,
         vision_args: list[str] | None = None,
+        vision_command: list[str] | None = None,
         ready_timeout_s: float = 120.0,
         poll_interval_s: float = 0.5,
         env: dict[str, str] | None = None,
@@ -53,6 +54,10 @@ class SubprocessLlm:
     ) -> None:
         self._cmd = command
         self._vision_args = list(vision_args or [])
+        # A DIFFERENT GGUF for the caption slot (design §4.1): the vision mode then
+        # replaces the whole command, not just appends the projector. When both slots
+        # hold the same weights this stays None and vision is text + `--mmproj`.
+        self._vision_cmd = list(vision_command) if vision_command else None
         self._health = health_url
         self._timeout = ready_timeout_s
         self._poll = poll_interval_s
@@ -62,7 +67,11 @@ class SubprocessLlm:
         self._vision = False  # mode of the RUNNING child
 
     def command_for(self, *, vision: bool) -> list[str]:
-        return [*self._cmd, *self._vision_args] if vision else list(self._cmd)
+        if not vision:
+            return list(self._cmd)
+        if self._vision_cmd is not None:
+            return list(self._vision_cmd)
+        return [*self._cmd, *self._vision_args]
 
     def load(self, *, vision: bool = False) -> None:
         if self._proc is not None:
@@ -122,21 +131,36 @@ class RemoteLlm:
         return True
 
 
-def build_llm_process(settings) -> LlmProcess:
-    """Pick the gemma actuator for the profile: supervised child (mac/jetson) or
-    remote (cloud). GGUF paths mirror ``scripts/llama-server-entrypoint.sh`` and
-    the Makefile ``LLAMA_GGUF``/``LLAMA_MMPROJ`` defaults."""
+def build_llm_process(settings, *, planner=None, caption=None) -> LlmProcess:
+    """Pick the llm actuator for the profile: supervised child (mac/jetson) or
+    remote (cloud).
+
+    ``planner``/``caption`` are the selected catalog entries (design §4.1); they
+    default to the profile's defaults so a bare ``build_llm_process(settings)``
+    still describes the shipping configuration. GGUF paths mirror
+    ``scripts/llama-server-entrypoint.sh`` and the Makefile
+    ``LLAMA_GGUF``/``LLAMA_MMPROJ`` defaults.
+    """
+    from models import catalog
+    from modelsvc.slots import gguf_paths
+
     if not settings.llm_managed:
         return RemoteLlm(health_url=settings.llm_health_url)
+    planner = planner or catalog.get("planner", catalog.default_key("planner", settings.profile))
+    caption = caption or catalog.get("caption", catalog.default_key("caption", settings.profile))
     model_dir = settings.data_dir / "models"
-    gguf = model_dir / "gemma-4-E2B-it-Q4_K_M.gguf"
+    gguf, _ = gguf_paths(planner, model_dir)
+    caption_gguf, caption_mmproj = gguf_paths(caption, model_dir)
+    # `IVMS777_MMPROJ_NAME` still overrides the projector the entry names.
+    if settings.mmproj_name:
+        caption_mmproj = str(model_dir / settings.mmproj_name)
     # The projector is NOT part of the base command: it is appended only for the
     # vision (captioning) mode, so a text chat never loads it (design §3.1).
-    vision_args = ["--mmproj", str(model_dir / settings.mmproj_name)]
+    vision_args = ["--mmproj", caption_mmproj] if caption_mmproj else []
     cmd = [
         settings.llm_bin or "llama-server",
         "-m",
-        str(gguf),
+        gguf,
     ]
     # -ngl: pin a fixed GPU layer count, or (None) omit it so llama.cpp AUTO-FITS
     # layers to free GPU RAM and offloads the rest to CPU. On the 8 GB jetson gemma
@@ -163,6 +187,16 @@ def build_llm_process(settings) -> LlmProcess:
     # without shadowing the models process's own cu132 torch libs.
     ldpath = os.environ.get("IVMS777_LLM_LDPATH")
     env = {"LD_LIBRARY_PATH": ldpath} if ldpath else None
+    # Two DIFFERENT models in the caption and planner slots ⇒ the vision mode is a
+    # whole other command, not the text one plus a projector (design §4.1).
+    vision_command = None
+    if caption_gguf != gguf:
+        # cmd is [bin, "-m", <planner gguf>, …flags]; swap the weights, keep the flags.
+        vision_command = [*cmd[:2], caption_gguf, *cmd[3:], *vision_args]
     return SubprocessLlm(
-        cmd, health_url=settings.llm_health_url, vision_args=vision_args, env=env
+        cmd,
+        health_url=settings.llm_health_url,
+        vision_args=vision_args,
+        vision_command=vision_command,
+        env=env,
     )

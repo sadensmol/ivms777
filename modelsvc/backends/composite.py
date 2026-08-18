@@ -14,8 +14,10 @@ fails loudly.
 
 from collections.abc import Iterator
 
+from models import catalog
 from modelsvc.activity import Activity
 from modelsvc.scheduler import Priority
+from modelsvc.slots import LLM_UNITS, catalog_payload
 
 
 class CompositeBackend:
@@ -28,7 +30,10 @@ class CompositeBackend:
         registry=None,
         governor=None,
         scheduler=None,
-        text_embed_needs: tuple[str, ...] = ("nomic",),
+        text_embed_needs: tuple[str, ...] = ("text_embed",),
+        slots=None,
+        downloads=None,
+        profile: str = "mac",
     ) -> None:
         self._embed = embed
         self._caption = caption
@@ -37,6 +42,11 @@ class CompositeBackend:
         self._governor = governor
         self._scheduler = scheduler
         self._text_embed_needs = text_embed_needs
+        # The `SlotManager` (design §4.1) — which model each slot holds, and the
+        # generation `app` compares against. None in bare unit tests.
+        self._slots = slots
+        self._downloads = downloads
+        self._profile = profile
         # The current in-flight op label, for the resource bar (§13).
         self._activity = Activity()
 
@@ -49,40 +59,40 @@ class CompositeBackend:
         if self._scheduler is None:
             return tracked()
         result = self._scheduler.run(list(needed), priority, tracked)
-        # A SigLIP/nomic op just ran; proactively unload gemma (either mode) if it has
+        # An embedder op just ran; proactively unload the llm (either mode) if it has
         # gone idle past its TTL, freeing GB for the rest of a long batch (no-op on
         # mac/cloud).
-        if not any(n.startswith("gemma") for n in needed):
-            self._scheduler.reap_idle(["gemma", "gemma-vision"])
+        if not any(n.startswith("llm") for n in needed):
+            self._scheduler.reap_idle(list(LLM_UNITS))
         return result
 
     # --- SigLIP ---
     def embed_image(self, images: list[bytes]) -> list[list[float]]:
-        return self._run(["siglip"], Priority.INTERACTIVE, "embedding",
+        return self._run(["image_embed"], Priority.INTERACTIVE, "embedding",
                          lambda: self._embed.embed_image(images))
 
     def embed_text(self, texts: list[str]) -> list[list[float]]:
-        return self._run(["siglip"], Priority.INTERACTIVE, "embedding",
+        return self._run(["image_embed"], Priority.INTERACTIVE, "embedding",
                          lambda: self._embed.embed_text(texts))
 
     def tag(self, image: bytes, dimensions: list[str]) -> dict[str, list[str]]:
-        return self._run(["siglip"], Priority.INTERACTIVE, "tagging",
+        return self._run(["image_embed"], Priority.INTERACTIVE, "tagging",
                          lambda: self._embed.tag(image, dimensions))
 
     def calibration(self) -> dict:
-        return self._run(["siglip"], Priority.INTERACTIVE, "embedding",
+        return self._run(["image_embed"], Priority.INTERACTIVE, "embedding",
                          lambda: self._embed.calibration())
 
-    # --- captioning (gemma-vision, batch) ---
+    # --- captioning (llm_vision, batch) ---
     def caption(self, image: bytes) -> dict:
-        # The ONLY op that sends an image to gemma, so the ONLY one that needs the
-        # vision projector loaded (design §3.1). Chat/planner use text-only `gemma`.
+        # The ONLY op that sends an image to the llm, so the ONLY one that needs the
+        # vision projector loaded (design §3.1). Chat/planner use text-only `llm`.
         if self._caption is None:
             raise NotImplementedError("caption backend not wired")
-        return self._run(["gemma-vision"], Priority.BATCH, "captioning",
+        return self._run(["llm_vision"], Priority.BATCH, "captioning",
                          lambda: self._caption.caption(image))
 
-    # --- text generation (gemma) ---
+    # --- text generation (llm) ---
     def text_complete(
         self,
         model: str,
@@ -94,7 +104,7 @@ class CompositeBackend:
     ) -> str:
         if self._text is None:
             raise NotImplementedError("text backend not wired")
-        return self._run(["gemma"], Priority.INTERACTIVE, "planning",
+        return self._run(["llm"], Priority.INTERACTIVE, "planning",
                          lambda: self._text.text_complete(
                              model, messages, json_schema=json_schema,
                              temperature=temperature, max_tokens=max_tokens))
@@ -103,14 +113,14 @@ class CompositeBackend:
         if self._text is None:
             raise NotImplementedError("text backend not wired")
 
-        # A generator: hold the slot (and gemma) for the WHOLE stream, not just
-        # until the generator object is built, so gemma is not evicted mid-answer.
+        # A generator: hold the slot (and the llm) for the WHOLE stream, not just
+        # until the generator object is built, so it is not evicted mid-answer.
         def stream() -> Iterator[str]:
             if self._scheduler is None:
                 with self._activity.track("chat"):
                     yield from self._text.text_stream(model, messages)
                 return
-            with self._scheduler.reserve(["gemma"], Priority.INTERACTIVE), self._activity.track("chat"):
+            with self._scheduler.reserve(["llm"], Priority.INTERACTIVE), self._activity.track("chat"):
                 yield from self._text.text_stream(model, messages)
 
         return stream()
@@ -131,15 +141,66 @@ class CompositeBackend:
             raise NotImplementedError("text backend not wired")
         self._text.text_evict(model)
 
+    # --- slot control (plan 21, design §4.1) ---
+    def _slot_keys(self) -> dict:
+        if self._slots is not None:
+            return self._slots.state()["slots"]
+        return dict(catalog.DEFAULTS[self._profile])
+
+    def _generation(self) -> int:
+        return self._slots.generation if self._slots is not None else 0
+
+    def _download_status(self, entry) -> dict:
+        if self._downloads is None:
+            return {"state": "ready", "bytes": 0, "total": 0, "error": None}
+        return self._downloads.status(entry)
+
+    def catalog(self) -> dict:
+        return catalog_payload(
+            self._profile, self._slot_keys(), self._generation(), self._download_status
+        )
+
+    def set_slots(self, slots: dict) -> dict:
+        if self._slots is None:
+            raise ValueError("this backend has no switchable slots")
+        self._slots.apply(slots)  # ValueError on an unknown / not-offered key
+        return self._slots.state()
+
+    def download(self, slot: str, key: str) -> dict:
+        entry = catalog.get(slot, key)  # KeyError on an unknown model
+        if self._downloads is None:
+            raise ValueError("this backend downloads nothing")
+        self._downloads.start(entry)
+        return self._downloads.status(entry)
+
+    def embed_spec(self) -> dict:
+        """Calibration AND the image embedder's preprocessing contract, in one
+        round trip (design §5.1). The caller resizes by this, never by a constant."""
+        entry = (
+            self._slots.entry("image_embed")
+            if self._slots is not None
+            else catalog.get("image_embed", catalog.default_key("image_embed", self._profile))
+        )
+        pre = entry.preprocess
+        return self.calibration() | {
+            "preprocess": {
+                "input_px": pre.input_px,
+                "resample": pre.resample,
+                "mode": pre.mode,
+            },
+            "generation": self._generation(),
+        }
+
     # --- conveyor control (plan 18, control API) ---
     def models_state(self) -> dict:
+        slots = {"slots": self._slot_keys(), "generation": self._generation()}
         if self._governor is None:
             resident = list(self._registry.resident()) if self._registry is not None else []
             return {"resident": resident, "budget_mb": 0, "free_mb": 0.0,
-                    "used_mb": 0, "active": self._activity.current()}
+                    "used_mb": 0, "active": self._activity.current()} | slots
         st = self._governor.state()
         return {"resident": st.resident, "budget_mb": st.budget_mb, "free_mb": st.free_mb,
-                "used_mb": st.used_mb, "active": self._activity.current()}
+                "used_mb": st.used_mb, "active": self._activity.current()} | slots
 
     def model_ensure(self, name: str) -> None:
         if self._scheduler is not None:
@@ -161,8 +222,8 @@ class CompositeBackend:
         if self._registry is not None:
             resident = list(self._registry.resident())
         else:
-            resident = ["siglip"] if self._embed is not None else []
-        # The text model (gemma) is reported by the registry now (it is a managed
+            resident = ["image_embed"] if self._embed is not None else []
+        # The text model is reported by the registry now (it is a managed
         # model). When no registry is wired (bare tests), fall back to the text
         # backend's own view so the resource bar still shows it.
         if self._registry is None and self._text is not None:
@@ -171,4 +232,9 @@ class CompositeBackend:
                 for model in text_fn():
                     if model not in resident:
                         resident.append(model)
-        return {"resident": resident, "active": active}
+        return {
+            "resident": resident,
+            "active": active,
+            "slots": self._slot_keys(),
+            "generation": self._generation(),
+        }

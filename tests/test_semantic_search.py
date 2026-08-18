@@ -69,7 +69,7 @@ def test_similar_requires_a_content_match_style_tags_alone_do_not_qualify(librar
     _tag(library, 3, "subject", "dog", 0.8)
     _tag(library, 1, "vibe", "cozy", 0.9)
     _tag(library, 2, "vibe", "cozy", 0.9)
-    by_id = {r["id"]: r for r in similar_photos(library, owner_id=1, photo_id=1, k=5)}
+    by_id = {r["id"]: r for r in similar_photos(library, owner_id=1, photo_id=1, k=5, score_min=0.0)}
     assert 3 in by_id and 2 not in by_id            # subject qualifies, style-only doesn't
     assert ("subject", "dog") in by_id[3]["tags"]
     assert any("dog" in r["text"] for r in by_id[3]["reasons"])
@@ -85,7 +85,7 @@ def test_style_tags_rerank_content_matches(library):
         _tag(library, pid, "subject", "dog", 0.9)
     _tag(library, 1, "vibe", "cozy", 0.9)
     _tag(library, 3, "vibe", "cozy", 0.9)
-    ids = _ids(similar_photos(library, owner_id=1, photo_id=1, k=5))
+    ids = _ids(similar_photos(library, owner_id=1, photo_id=1, k=5, score_min=0.0))
     assert ids[0] == 3 and 2 in ids                 # 3 (subject+style) ranks above 2 (subject)
 
 
@@ -94,7 +94,7 @@ def test_reasons_are_capped_at_three(library):
                        ("light", "night"), ("emotion", "joyful")):
         _tag(library, 1, dim, label, 0.9)
         _tag(library, 3, dim, label, 0.9)
-    reasons = {r["id"]: r for r in similar_photos(library, owner_id=1, photo_id=1, k=5)}[3]["reasons"]
+    reasons = {r["id"]: r for r in similar_photos(library, owner_id=1, photo_id=1, k=5, score_min=0.0)}[3]["reasons"]
     assert len(reasons) == 3                         # only the 3 strongest shown
     assert reasons[0]["text"] == "subject: dog"      # most relevant (importance) leads
 
@@ -108,7 +108,7 @@ def test_caption_meaning_connects_photos_tags_missed(library):
     vec = [1.0, 0.0, 0.0, 0.0]
     write_caption_vector(library, 1, vec)
     write_caption_vector(library, 3, vec)  # same meaning as #1
-    results = similar_photos(library, owner_id=1, photo_id=1, k=5)
+    results = similar_photos(library, owner_id=1, photo_id=1, k=5, score_min=0.0)
     by_id = {r["id"]: r for r in results}
     assert 3 in by_id and 2 not in by_id            # 2 has no caption vector
     assert any("caption" in r["text"] for r in by_id[3]["reasons"])
@@ -116,13 +116,13 @@ def test_caption_meaning_connects_photos_tags_missed(library):
 
 def test_similar_of_a_one_off_photo_is_empty(library):
     # No shared tags, no caption, near-orthogonal fake vectors -> nothing similar.
-    assert similar_photos(library, owner_id=1, photo_id=1, k=5) == []
+    assert similar_photos(library, owner_id=1, photo_id=1, k=5, score_min=0.0) == []
 
 
 def test_similar_of_an_unembedded_photo_is_empty(library):
     # No embedding -> the photo can't be compared to anything yet (tier 0).
     add_photo(library, photo_id=99, content_hash="novec")
-    assert similar_photos(library, owner_id=1, photo_id=99, k=5) == []
+    assert similar_photos(library, owner_id=1, photo_id=99, k=5, score_min=0.0) == []
 
 
 def test_similarity_breakdown_explains_the_match(library):
@@ -188,7 +188,7 @@ def test_similar_photos_delegates_to_the_retriever_core(library, monkeypatch):
 
     _tag(library, 1, "subject", "dog", 0.9)
     _tag(library, 3, "subject", "dog", 0.8)
-    results = similar_photos(library, owner_id=1, photo_id=1, k=5)
+    results = similar_photos(library, owner_id=1, photo_id=1, k=5, score_min=0.0)
 
     assert calls == ["candidates", "refine"]
     assert {r["id"] for r in results} == {3}
@@ -211,7 +211,7 @@ def test_similar_photos_seed_path_touches_no_text_or_llm_machinery(library, monk
     _tag(library, 1, "subject", "dog", 0.9)
     _tag(library, 3, "subject", "dog", 0.8)
 
-    results = similar_photos(library, owner_id=1, photo_id=1, k=5)
+    results = similar_photos(library, owner_id=1, photo_id=1, k=5, score_min=0.0)
 
     assert {r["id"] for r in results} == {3}
 
@@ -238,6 +238,6 @@ def test_similar_finds_a_tag_match_outside_the_seeds_image_knn_top(conn):
         add_photo(conn, photo_id=pid, content_hash=f"h{pid}", thumb_key=f"{pid}.jpg")
         write_vector(conn, pid, embedder.embed_texts([f"distractor {pid}"])[0])
 
-    results = similar_photos(conn, owner_id=1, photo_id=1, k=5)
+    results = similar_photos(conn, owner_id=1, photo_id=1, k=5, score_min=0.0)
 
     assert 2 in {r["id"] for r in results}

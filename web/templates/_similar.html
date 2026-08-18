@@ -1,12 +1,18 @@
-<div id="similar">
-<h3>Similar photos</h3>
+{# The similar strip (§9, §13). Rendered twice by the same template: the STRICT
+   pass on load, and — after "Show more" — the LOOSE pass, which is APPENDED below
+   so a weaker match can never sit above a real one. #}
+{% if not loose %}<div id="similar">
+<h3>Similar photos</h3>{% endif %}
 {% if similar %}
-<div class="similar-strip">
+<div class="similar-strip{% if loose %} similar-loose{% endif %}">
   {% for s in similar %}
     {# Open a similar photo IN its similar-to-<this> layer. REPLACE (not push) so
        history stays [grid, photo] and close always goes up to the grid, never
-       replaying the chain of photos visited (§13, CLAUDE.md navigation rules). #}
-    <a class="similar-item" href="/photo/{{ s.id }}?ctx=similar:{{ photo['id'] }}"
+       replaying the chain of photos visited (§13, CLAUDE.md navigation rules).
+       A loose thumbnail carries `:more` so prev/next pages the set the user can
+       actually SEE, instead of stopping at the strict strip. Colon, not `+`: a `+`
+       in a query string decodes to a space and breaks the lookup. #}
+    <a class="similar-item" href="/photo/{{ s.id }}?ctx=similar:{{ photo['id'] }}{% if loose %}:more{% endif %}"
        onclick="location.replace(this.href);return false;">
       <img src="/thumb/{{ s.id }}?size=detail" loading="lazy" alt="">
       <div class="similar-why">
@@ -17,7 +23,18 @@
     </a>
   {% endfor %}
 </div>
-{% else %}
-<p class="hint">No similar photos — nothing in the library shares this one's tags, caption words, or looks close enough.</p>
+{% elif not loose %}
+<p class="hint">No similar photos — nothing in the library shares this one's subject, caption meaning, look, or time and place.</p>
 {% endif %}
-</div>
+{% if loose and not similar %}
+<p class="hint">Nothing more — even at the looser bar, the library has no other match for this photo.</p>
+{% endif %}
+{% if can_widen %}
+  {# Only offered when the strict pass did not fill the strip. It swaps ITSELF for
+     the looser results, so the strict ones above stay exactly where they are. #}
+  <button class="show-more" hx-get="/photo/{{ photo['id'] }}/similar?loose=1{% if ctx_query %}&{{ ctx_query }}{% endif %}"
+          hx-target="this" hx-swap="outerHTML">
+    Show more — looser matches
+  </button>
+{% endif %}
+{% if not loose %}</div>{% endif %}

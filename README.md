@@ -19,8 +19,11 @@ text (planner/chat) and vision (caption)** — Docker Desktop on macOS has no GP
 passthrough, so the LLM runs natively for Metal — then runs the `models` service,
 `worker`, and `app` as plain **host processes — no containers on mac**.
 `app`/`worker` are thin HTTP clients with no torch; SigLIP and the caption-text
-embedder live only in the `models` service, and captioning is an OpenAI call to
-`llama-server` (design §5.1). Ctrl-C stops the three app processes; the host
+embedder live only in the `models` service — on the **Apple GPU via torch's `mps`
+backend** (`embed_device=mps`), never the CPU — and captioning is an OpenAI call
+to `llama-server` (design §3.1, §5.1). There is **no containerised mac path**: a
+container gets no Metal and would fall back to the CPU, which the design forbids.
+Ctrl-C stops the three app processes; the host
 `llama-server` keeps running (`make llama-stop` to stop it). Data lives under
 `$HOME/.ivms777`.
 
@@ -168,18 +171,18 @@ uv run ruff check .
 to run the `models` service itself or its `slow`-marked tests
 (`uv run pytest -m slow`).
 
-### Hot reload (containerised — jetson/cloud, or as an alternative to native `make up` on mac)
+### Hot reload (jetson/cloud)
 
 Add `compose.dev.yaml` last. It bind-mounts the source and restarts `app` and
 `models` (uvicorn `--reload`) and `worker` (`watchfiles`) on every edit.
 Templates and CSS need no restart at all.
 
 ```bash
-docker compose -f compose.yaml -f compose.mac.yaml -f compose.dev.yaml up -d
+docker compose -f compose.yaml -f compose.jetson.yaml -f compose.dev.yaml up -d
 ```
 
-Polling is forced on, because inotify events do not cross Docker's bind mount
-on macOS.
+On mac there is nothing to add: `make up` already runs `app` with `--reload` and
+`worker` under `watchfiles`, natively.
 
 ## Compare caption models
 

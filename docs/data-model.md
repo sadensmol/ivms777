@@ -26,7 +26,7 @@ photos (
   caption         TEXT,
   caption_model   TEXT,
   caption_vec     BLOB,               -- caption text embedding, for §9 similarity
-  embedding_model TEXT,
+  embedding_model TEXT,               -- the resolved `image_embed` catalog key (§4.1); NULL = no vector
   exif_json       TEXT,               -- full EXIF as captured, for reference
   created_at      TEXT NOT NULL,
   updated_at      TEXT NOT NULL,

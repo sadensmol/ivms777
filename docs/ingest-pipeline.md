@@ -48,11 +48,11 @@ and the captioner. Draining embed/taxonomy first means search and "show similar"
 work across the entire collection within minutes of the upload finishing, while
 captions fill in over the following hours.
 
-## In-process residency — SigLIP ensure-loaded
+## In-process residency — the model conveyor
 
 All model work lives in the one `models` service (§5.1), so deciding which heavy
-model is loaded right now is an **in-process** concern —
-`modelsvc/residency.py::Residency` — not a cross-process DB lease. The earlier
+model is loaded right now is an **in-process** concern — the registry + governor +
+scheduler of design §8.1 — not a cross-process DB lease. The earlier
 `model_lease` table and `models/coordinator.py::ModelCoordinator` (a DB row,
 heartbeat thread, and stale-reclaim logic that coordinated the separate `app` and
 `worker` processes, back when each loaded its own SigLIP) are gone.
@@ -64,39 +64,39 @@ heartbeat thread, and stale-reclaim logic that coordinated the separate `app` an
 no edit even though there is nothing left for them to coordinate: `app` and `worker`
 hold no models, so `require()` now loads nothing, refuses nothing, and never raises.
 
-Since plan 16 removed the in-process caption VLM (captioning is now a remote OpenAI
-call to `llama-server`), **SigLIP is the only heavy in-process model** in the
-service. Nothing contends with it for the GPU, so residency is no longer a
-swap/preempt arbiter — it is a plain **ensure-loaded** guard. A sub-backend never
-loads its model directly; it wraps its call in `residency.use(name)` and the manager
-loads it once:
+Since plan 18 the ensure-loaded guard is a **conveyor**: a `MemoryGovernor`
+(`modelsvc/governor.py`) over a `ModelRegistry`, driven by a `Scheduler`. A
+sub-backend never loads its model directly; `CompositeBackend` names the residency
+units an op needs and the scheduler makes them resident first:
 
 ```python
-with residency.use("siglip", priority=HIGH):
-    ...            # SigLIP is loaded once, then reused
+self._run(["image_embed"], Priority.INTERACTIVE, "embedding", fn)
 ```
 
-`SiglipBackend` wraps every `/embed/image`, `/embed/text`, `/tag`, and
-`/embed/calibration` call in `use("siglip", priority=HIGH)` — search, chat, memory
-rebuild, and ingest embed/taxonomy all look identical from here, an HTTP request
-against the same endpoint, so there is no per-caller workload taxonomy the way the
-old coordinator needed one. `priority` is retained as a readability hint only; with
-a single registered model there is nothing to prioritise against, so `use()` loads
-once and never evicts or preempts. Captioning is not registered with `Residency` at
-all — it is a remote call. Neither is the in-process `nomic` text embedder (tiny,
-~0.3 GB, loaded once by `TextBackend`).
+The units are named by **slot**, not by model (design §4.1), so switching a model
+changes nothing here: `image_embed`, `text_embed`, `llm`, `llm_vision`.
+`SiglipBackend` routes every `/embed/image`, `/embed/text`, `/tag` and
+`/embed/spec` call through `["image_embed"]` — search, chat, memory rebuild, and
+ingest embed/taxonomy all look identical from here, an HTTP request against the
+same endpoint, so there is no per-caller workload taxonomy the way the old
+coordinator needed one. `Priority` is real: interactive ops (search/chat) preempt
+queued batch captioning on the single-slot Jetson.
 
-Because captioning left the GPU-sharing picture, the whole caption-preemption path
-is gone too: no `should_preempt`, no `CaptionPreempted`/503, no
-`ModelsCaptionPreempted`. A caption is a plain HTTP call that either returns or
-errors (and retries like any stage). This removes the `StoppingCriteria` +
-`threading.Condition` machinery the two-model swap used to need.
+Captioning IS registered — as `llm_vision`, the `llama-server` child's vision mode
+(§8.1). It is a remote HTTP call, but the child is ours to start and kill, so its
+memory is the governor's business like any other resident.
 
-What is resident (`residency.resident()` — `["siglip"]` once loaded, **plus the
-llama-server / vLLM text model**, e.g. `gemma4-E2B`, a separate always-on process
-serving both text and captioning, so it is reported in EVERY state — the bar shows
-it during captioning/idle too, not only chat/planning), the models-process RAM, the
-**GPU load**, and the **current in-flight op** (`active` — `embedding` / `tagging` /
+The old **caption-preemption** path is gone: no `should_preempt`, no
+`CaptionPreempted`/503, no `ModelsCaptionPreempted`. A caption is a plain HTTP call
+to a supervised child that either returns or errors (and retries like any stage),
+and contention is handled by the scheduler's priorities instead. This removed the
+`StoppingCriteria` + `threading.Condition` machinery the in-process two-model swap
+used to need.
+
+What is resident (the registry's units — `image_embed`, `text_embed`, `llm`,
+`llm_vision` — which the bar renders as the model each slot actually holds, e.g.
+`gemma4-E2B +vision`, via `models/resources.py::display_names`), which model each
+slot holds (§4.1), and the **current in-flight op** (`active` — `embedding` / `tagging` /
 `captioning` / `planning` / `chat`, or `null` when idle; tracked by
 `modelsvc/activity.py` since the service is the one place that sees every call) are
 all reported by `CompositeBackend.resources()` on `GET /resources`, which

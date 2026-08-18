@@ -17,7 +17,8 @@ Query = {
   soft_tags: dict             # {dimension: [label, ...]} — planner hints, SCORE only
   k: int
   weights: dict[str, float] | None   # per-dimension importance, vocab.yaml
-  floor: float | None         # caller-set relevance floor; None = rank, don't cut
+  floor: float | None         # caller-set relevance floor; None = the profile's
+  gates: Gates                # STRICT (default) or LOOSE — see "Similar-photo scoring"
 }
 ```
 
@@ -84,18 +85,27 @@ pipeline:
 
 Every signal is described by exactly two numbers — a **gate** (below it the signal is
 *absent*, never a small number) and a **weight** (the most it may claim on its own, on
-one shared 0–1 scale). All of them live in `search/signals.py`; the three gates a
-deployment may retune are in `config.py`, and the four tier weights are in `vocab.yaml`.
+one shared 0–1 scale). Gates come in two profiles: `STRICT` is the default strip,
+`LOOSE` is what "Show more" reveals. Both live in `search/signals.py`; the three
+strict gates a deployment may retune are in `config.py`, and the four tier weights
+are in `vocab.yaml`.
 
-| # | Signal | Gate | Weight | Content? | Why this gate |
-|---|---|---|---|---|---|
-| 1 | **image** — SigLIP image↔image cosine | **0.80** | **0.95** | ✔ | top 4 % of all pairs; a random pair scores 0.558 |
-| 2 | **subject** — shared `subject` tag | **0.80** | **0.75** | ✔ | median top-`subject` is 0.83; 93 % clear 0.5, so 0.5 gates nothing |
-| 3 | **caption** — caption-embedding cosine | **0.75** | **0.65** | ✔ | top 5 %; a random pair scores 0.621 |
-| 4 | **where** — `setting`, `occasion` | 0.50 | **0.40** | ✘ rerank | 38 % / 51 % of photos clear 0.5 |
-| 5 | **moment** — time × place | **0.20** | **0.35** | ✔ | ≈ top 4 % of pairs (below) |
-| 6 | **look** — `light`, `season_weather`, `palette`, `vibe`, `composition`, `emotion` | 0.50 | **0.12** | ✘ rerank | least reliable: `emotion` clears 0.5 on 28 % |
-| 7 | **quality** — `sharp`, `blurry`, … | 0.50 | **0.03** | ✘ rerank | pure tiebreak; `sharp` is on 201/206 photos |
+| # | Signal | Weight | `STRICT` | `LOOSE` | Content? | Why the strict gate |
+|---|---|---|---|---|---|---|
+| 1 | **image** — SigLIP image↔image cosine | **0.95** | **0.80** | 0.66 | ✔ | top 4 % of all pairs; a random pair scores 0.558 |
+| 2 | **subject** — shared `subject` tag | **0.75** | **0.80** | 0.55 | ✔ | median top-`subject` is 0.83; 93 % clear 0.5, so 0.5 gates nothing |
+| 3 | **caption** — caption-embedding cosine | **0.65** | **0.75** | 0.68 | ✔ | top 5 %; a random pair scores 0.621 |
+| 4 | **where** — `setting`, `occasion` | **0.40** | 0.50 | 0.35 | ✘ rerank | 38 % / 51 % of photos clear 0.5 |
+| 5 | **moment** — time × place | **0.35** | **0.20** | 0.08 | ✔ | ≈ top 4 % of pairs (below) |
+| 6 | **look** — `light`, `season_weather`, `palette`, `vibe`, `composition`, `emotion` | **0.12** | 0.50 | 0.35 | ✘ rerank | least reliable: `emotion` clears 0.5 on 28 % |
+| 7 | **quality** — `sharp`, `blurry`, … | **0.03** | 0.50 | 0.35 | ✘ rerank | pure tiebreak; `sharp` is on 201/206 photos |
+| — | *final score floor* | — | **0.45** | 0.12 | | see "Score floor" below |
+
+**Weights are identical in both profiles.** Only gates relax. Changing weights would
+reshuffle results that already rank below the strict ones and make the two passes
+incomparable. `LOOSE` still keeps every cosine gate above its random-pair median —
+that rule is not a strictness setting, it is what separates a weak signal from a
+meaningless one.
 
 A text query has no seed image vector, so its **fused rank** stands in for signal 1 at
 weight **0.60** — deliberately lighter, because a fused rank says "this matched the
@@ -113,7 +123,7 @@ tags:
     agreement ≥ gate  →  evidence = w × agreement × (0.4 + 0.6 × idf)
 
 score = 1 − Π (1 − evidence)          # noisy-OR, a true 0–1
-qualify if ≥1 CONTENT signal present AND score ≥ similar_score_min (0.25)
+qualify if ≥1 CONTENT signal present AND score ≥ gates.score_min
 ```
 
 **Why cosines get a 0.5 entry ramp and tags do not.** A cosine's gate must sit well
@@ -163,10 +173,21 @@ same-afternoon/500 m (0.23) needs a second signal to agree.
 second threshold. `where`, `look` and `quality` **only rerank** — they never qualify a
 pair, however many of them agree.
 
-**Score floor.** A result below `similar_score_min` (default **0.25** on the 0–1 score)
+**Score floor.** A result below `similar_score_min` (default **0.45** on the 0–1 score)
 is not shown. Without it the strip always returned its full `k`, so a photo with nothing
-genuinely like it got 12 fillers. On the reference library this leaves 2 % of photos
-with an honest empty strip and a median of 9 results.
+genuinely like it got 12 fillers.
+
+At 0.25 the tail filled with moment-only pairs: a tire close-up matched a plastic
+container photographed the same minute, a document matched a building site at 0.27.
+Same outing, unrelated object — worth *offering*, not worth showing by default. 0.45
+keeps them out of the strip and `LOOSE` (0.12) is where they surface.
+
+**"Show more".** When the strict pass does not fill the strip (`k = 12`), the UI offers
+a button that re-runs with `LOOSE` and **appends** up to `LOOSE_LIMIT` (6) more, minus
+everything strict already showed. Appended, never merged, so a weak match can never
+outrank a real one; dimmed and captioned, so the difference is visible. A loose
+thumbnail carries `ctx=similar:<id>:more` (a colon — a `+` in a query string decodes to
+a space) so prev/next pages the set the user can actually see, per §13.1 rule 6.
 
 **Reasons.** Each result carries its **top 3 contributions by evidence, in that order** —
 what actually drove the match leads. The match % shown beside each is the *agreement*

@@ -173,6 +173,18 @@ h1 { margin: 0 0 1rem; }
   line-height: 1.5; }
 .why-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .why-pct { color: #6ee7b7; font-variant-numeric: tabular-nums; flex: 0 0 auto; }
+/* The "Show more" tail (§9). Dimmed and captioned so a looser match never reads as
+   an equal of the strict strip above it; hovering restores full opacity so the
+   photo itself is still inspectable. */
+.similar-loose { opacity: 0.72; }
+.similar-loose .similar-item:hover { opacity: 1; }
+.similar-loose::before { content: "Looser matches"; grid-column: 1 / -1;
+  color: #aaa; font-size: 0.82rem; letter-spacing: 0.04em; text-transform: uppercase; }
+.similar-loose .why-pct { color: #9ca3af; }
+.show-more { display: block; margin: 4px 0 12px; padding: 8px 14px; cursor: pointer;
+  background: #1c1c1c; color: #ddd; border: 1px solid #333; border-radius: 8px;
+  font: inherit; font-size: 0.9rem; }
+.show-more:hover { background: #262626; color: #fff; }
 .similarity { width: 100%; border-collapse: collapse; font-size: 0.85rem; margin: 4px 0 8px; }
 .similarity th { text-align: left; color: #9aa0a6; font-weight: 500; padding: 2px 6px; }
 .similarity td { padding: 2px 6px; border-top: 1px solid #262626; }
@@ -280,6 +292,56 @@ img.cite { height: 40px; width: 40px; object-fit: cover; border-radius: 4px;
    answer bubble. Reuses .album / .album-* styles verbatim (§10, §13.1). */
 .msg-memory { margin-top: 8px; width: 300px; max-width: 100%; }
 
+/* ---- Model settings overlay (§13, §4.1) ---- the ⚙ beside the resource bar
+   opens a <dialog>. It is an overlay, not a route: no history entry, no URL
+   change, so the [grid, leaf] invariant (§13.1) is untouched. */
+.settings-open { background: none; border: 0; color: #888; font-size: 15px; cursor: pointer;
+  padding: 0 0.15rem; line-height: 1; }
+.settings-open:hover { color: #fff; }
+
+.settings-dialog { width: min(46rem, 92vw); max-height: 82vh; overflow-y: auto; padding: 1.5rem;
+  border: 1px solid #303030; border-radius: 10px; background: #1c1c1c; color: #ddd; }
+.settings-dialog::backdrop { background: rgba(0, 0, 0, 0.55); }
+.settings-close { position: absolute; top: 0.6rem; right: 0.85rem; background: none; border: 0;
+  color: #888; font-size: 20px; line-height: 1; cursor: pointer; }
+.settings-close:hover { color: #fff; }
+.settings-title { margin: 0 0 1rem; font-size: 1.05rem; }
+.settings-error { color: #d98c3c; font-size: 13px; }
+
+.slot { border-top: 1px solid #262626; padding: 0.9rem 0; }
+.slot h3 { margin: 0 0 0.15rem; font-size: 0.95rem; }
+.slot-blurb { margin: 0 0 0.6rem; color: #8a8a8a; font-size: 12px; }
+.slot-locked { margin: 0 0 0.6rem; color: #8a8a8a; font-size: 12px; font-style: italic; }
+
+.model-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.5rem; }
+.model { padding: 0.5rem 0.65rem; border: 1px solid #262626; border-radius: 8px; }
+.model.is-current { border-color: #3a3a3a; background: #202020; }
+.model label { display: flex; align-items: center; gap: 0.5rem; cursor: pointer; }
+.model-name { font-weight: 500; }
+.model-meta { margin: 0.3rem 0 0; color: #8a8a8a; font: 12px/1.7 ui-monospace, monospace;
+  display: flex; align-items: center; flex-wrap: wrap; gap: 0.4rem; }
+.model-note { margin: 0.35rem 0 0; color: #7d7d7d; font-size: 12px; }
+/* Part of the entry is already on disk (a file shared with another slot). */
+.model-partial { margin: 0.25rem 0 0; color: #9a9a7d; font-size: 12px; }
+.model-partial strong { color: #c9c9a8; font-weight: 500; }
+.model-meta button { background: #2a2a2a; border: 1px solid #3a3a3a; border-radius: 6px;
+  color: #ddd; font-size: 12px; padding: 0.15rem 0.5rem; cursor: pointer; }
+.model-meta progress { width: 8rem; height: 0.5rem; }
+
+.badge { font-size: 11px; border-radius: 999px; padding: 0.05rem 0.45rem; }
+.badge-current { background: #2f4f2f; color: #cfe8cf; }
+.badge-estimate { background: #4a3a1e; color: #e8d3a8; }
+.state-ready { color: #8fbc8f; }
+.state-error { color: #d98c8c; }
+
+.switch-confirm { margin-top: 0.7rem; padding: 0.7rem 0.8rem; border-radius: 8px;
+  background: #232323; border: 1px solid #333; font-size: 13px; }
+.switch-confirm p { margin: 0 0 0.6rem; }
+.switch-confirm button { background: #35506e; border: 1px solid #446488; border-radius: 6px;
+  color: #eee; padding: 0.3rem 0.9rem; cursor: pointer; }
+.switch-confirm button[disabled] { opacity: 0.5; cursor: not-allowed; }
+.switch-confirm .hint { color: #8a8a8a; font-size: 12px; margin-left: 0.5rem; }
+
 /* ---- Small screens / mobile ---- */
 @media (max-width: 760px) {
   main { padding: 1rem; }
@@ -306,4 +368,7 @@ img.cite { height: 40px; width: 40px; object-fit: cover; border-radius: 4px;
   /* Chat: use more of the narrow width. */
   .msg { max-width: 92%; }
   .msg-memory { width: 100%; }
+
+  /* Settings: full-width sheet rather than a centred card. */
+  .settings-dialog { width: 96vw; padding: 1rem; }
 }

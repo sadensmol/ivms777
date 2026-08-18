@@ -28,8 +28,8 @@ from modelsvc.backends.fake import FakeBackend
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
-def _client() -> ModelsClient:
-    app = create_models_app(FakeBackend())
+def _client(profile: str = "mac") -> ModelsClient:
+    app = create_models_app(FakeBackend(profile=profile))
     transport = TestClient(app)._transport
     return ModelsClient("http://modelsvc", transport=transport)
 
@@ -41,9 +41,9 @@ def test_embed_images_round_trips_through_the_fake_backend():
     assert len(vectors[0]) > 0
 
 
-def _captured_payload(images: list[Image.Image]) -> list[bytes]:
+def _captured_payload(images: list[Image.Image], client: ModelsClient | None = None) -> list[bytes]:
     """Return the PNG bytes `embed_images` actually puts on the wire."""
-    client = _client()
+    client = client or _client()
     sent: list[bytes] = []
 
     def capture(payload, **kwargs):
@@ -55,7 +55,7 @@ def _captured_payload(images: list[Image.Image]) -> list[bytes]:
     return sent
 
 
-def test_images_are_downscaled_to_siglips_384px_input_before_encoding():
+def test_images_are_downscaled_to_the_models_384px_input_before_encoding():
     # SigLIP 2 so400m/patch14-384 squashes every input to 384x384 (its own
     # preprocessor_config.json: do_resize, size 384x384, resample BILINEAR), so
     # sending the full-resolution original is pure waste: on the Jetson the PNG
@@ -92,20 +92,56 @@ def test_calibration_matches_fake_embedder_values():
     assert embedder.logit_bias == -5.0
 
 
-def test_calibration_is_fetched_once_and_cached():
+def test_the_spec_is_fetched_once_and_cached():
     client = _client()
     calls = []
-    original = client.calibration
+    original = client.embed_spec
 
-    def counting_calibration(*args, **kwargs):
+    def counting_spec(*args, **kwargs):
         calls.append(1)
         return original(*args, **kwargs)
 
-    client.calibration = counting_calibration
+    client.embed_spec = counting_spec
     embedder = RemoteEmbedder(client, "fake")
     assert embedder.logit_scale == 10.0
     assert embedder.logit_bias == -5.0  # second attr access, still one HTTP call
+    embedder.embed_images([Image.new("RGB", (8, 8))])  # and the resize reuses it
     assert len(calls) == 1
+
+
+def test_the_resize_follows_the_selected_model_not_a_constant():
+    # Switching to the 512px checkpoint must change what goes on the wire, with no
+    # code change and no constant to edit (design §4.1).
+    client = _client()
+    client.set_slots({"image_embed": "siglip2-so400m-512"})
+    sent = _captured_payload([Image.new("RGB", (3024, 4032))], client)
+    with Image.open(BytesIO(sent[0])) as encoded:
+        assert encoded.size == (512, 512)
+
+
+def test_native_mode_keeps_the_aspect_ratio():
+    # NaFlex / native-resolution encoders consume the real aspect ratio; squashing
+    # one of those would throw away signal (design §4.1).
+    client = _client()
+    client.embed_spec = lambda **kw: {
+        "logit_scale": 1.0,
+        "logit_bias": 0.0,
+        "preprocess": {"input_px": 512, "resample": "bicubic", "mode": "native"},
+        "generation": 0,
+    }
+    sent = _captured_payload([Image.new("RGB", (3000, 2000))], client)
+    with Image.open(BytesIO(sent[0])) as encoded:
+        assert encoded.size == (512, 341)
+
+
+def test_refresh_drops_the_cached_spec():
+    client = _client()
+    embedder = RemoteEmbedder(client, "fake")
+    assert embedder.generation == 0
+    client.set_slots({"image_embed": "siglip2-so400m-512"})
+    assert embedder.generation == 0  # cached: a stale spec until told otherwise
+    embedder.refresh()
+    assert embedder.generation == 1
 
 
 def _assert_module_import_is_torch_free(module: str) -> None:

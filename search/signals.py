@@ -64,36 +64,33 @@ SIGNAL_OFF = 2.0
 
 @dataclass(frozen=True)
 class TagTier:
-    """One weight/gate shared by several taxonomy dimensions.
+    """One weight shared by several taxonomy dimensions.
 
     Per-dimension weights were collapsed into tiers because ten hand-tuned numbers
     could not be reasoned about, and `idf` already handles the part that actually
-    varies — how rare a specific label is.
+    varies — how rare a specific label is. Gates live in `Gates` below, not here, so
+    a whole profile can be relaxed at once.
     """
 
     dimensions: tuple[str, ...]
     weight: float
-    gate: float
     content: bool
 
 
 TAG_TIERS: dict[str, TagTier] = {
-    # What the photo IS — the only tag tier that can qualify a pair. The gate is 0.80
-    # because `subject`'s median top-score is 0.83 and 93% of photos clear 0.5, so a
-    # 0.5 bar gates nothing: it admitted `subject: toy` @ 0.58 on a girl by a
-    # Christmas tree (runner-up `person` @ 0.31) and called it a teddy bear's twin.
-    "subject": TagTier(("subject",), 0.75, 0.80, content=True),
+    # What the photo IS — the only tag tier that can qualify a pair.
+    "subject": TagTier(("subject",), 0.75, content=True),
     # WHERE / WHICH event. Reliable enough to reorder, never to qualify.
-    "where": TagTier(("setting", "occasion"), 0.40, 0.50, content=False),
+    "where": TagTier(("setting", "occasion"), 0.40, content=False),
     # How it LOOKS. Measured worst: `emotion` clears 0.5 on 28% of photos and
     # `surprised` lands on half the library, objects included.
     "look": TagTier(
         ("light", "season_weather", "palette", "vibe", "composition", "emotion"),
-        0.12, 0.50, content=False,
+        0.12, content=False,
     ),
     # Sharpness says almost nothing about similarity — a pure tiebreak. `sharp` sits
     # on 201/206 photos, so idf reduces it to ~0.01 evidence in practice.
-    "quality": TagTier(("quality",), 0.03, 0.50, content=False),
+    "quality": TagTier(("quality",), 0.03, content=False),
 }
 
 # How much of a tag's weight survives when the label is on EVERY photo. Without a
@@ -114,9 +111,64 @@ MOMENT_TAU_HOURS = 12.0   # time constant: same afternoon still counts, next day
 MOMENT_SCALE_M = 1000.0   # distance constant: same block counts, across town does not
 MOMENT_NO_GPS = 0.5       # place unknown -> time alone, capped: a much weaker claim
 
-# Minimum FINAL score to be shown at all. Sized so a lone `moment` at same-hour /
-# same-block (0.30) survives, while same-afternoon / 500 m (0.23) needs corroboration.
-SCORE_MIN = 0.25
+@dataclass(frozen=True)
+class Gates:
+    """One complete admission profile — every gate, plus the final score floor.
+
+    Two profiles exist. **`STRICT`** is what the similar strip shows by default:
+    every gate sits in the top few per cent of its measured distribution, so a result
+    is there because something real matched. **`LOOSE`** is what the "Show more"
+    button reveals — the same signals and the same weights, admitted at lower bars.
+
+    Weights are deliberately IDENTICAL in both. Relaxing gates is what finds more
+    photos; changing weights would only reshuffle results that are already ranked
+    below the strict ones, and would make the two passes incomparable.
+
+    `LOOSE` still obeys the one hard rule — no cosine gate may sit below its
+    random-pair median (image 0.558, caption 0.621), because under that line the
+    signal is measuring chance, not similarity. That is what makes "looser" honest
+    rather than "made up".
+    """
+
+    image: float
+    caption: float
+    moment: float
+    subject: float
+    tag: float        # where / look / quality share one bar
+    score_min: float
+
+    def for_dimension(self, dimension: str) -> float:
+        """The confidence a shared tag in `dimension` needs to count at all."""
+        return self.subject if dimension in content_dimensions() else self.tag
+
+
+STRICT = Gates(
+    # top 4% of pairs (random pair 0.558) · top 5% (random pair 0.621) · ~top 4%
+    image=0.80, caption=0.75, moment=0.20,
+    # `subject`'s median top-score is 0.83 and 93% of photos clear 0.5, so a 0.5 bar
+    # gates nothing: it admitted `subject: toy` @ 0.58 on a girl by a Christmas tree
+    # (runner-up `person` @ 0.31) and called it a teddy bear's twin.
+    subject=0.80, tag=0.50,
+    # Measured against the old model over 22 seeds: at 0.25 the strip's tail filled
+    # with moment-only pairs — a tire close-up matched a plastic container at 0.42
+    # because they were photographed in the same minute. Same outing, unrelated
+    # object. 0.45 keeps those out of the default strip; "Show more" is where they
+    # belong, because sometimes that IS what you are looking for.
+    score_min=0.45,
+)
+
+LOOSE = Gates(
+    image=0.66,     # still well above the 0.558 random-pair median
+    caption=0.68,   # still above the 0.621 random-pair median — the hard rule holds
+    moment=0.08,    # roughly "same day, within a few km"
+    subject=0.55,   # admits a subject the model is less sure of
+    tag=0.35,
+    score_min=0.12,
+)
+
+# How many extra photos "Show more" may reveal. Small on purpose: the point is a
+# second look, not an infinite scroll of ever-weaker matches.
+LOOSE_LIMIT = 6
 
 
 def cosine_strength(raw: float, gate: float) -> float | None:
@@ -190,15 +242,6 @@ def dimension_weights(tier_weights: dict[str, float] | None = None) -> dict[str,
     return {
         dimension: float(overrides.get(name, tier.weight))
         for name, tier in TAG_TIERS.items()
-        for dimension in tier.dimensions
-    }
-
-
-def dimension_gates() -> dict[str, float]:
-    """`{dimension: gate}` — the confidence a shared tag needs to count at all."""
-    return {
-        dimension: tier.gate
-        for tier in TAG_TIERS.values()
         for dimension in tier.dimensions
     }
 

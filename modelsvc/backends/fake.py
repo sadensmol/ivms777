@@ -27,6 +27,18 @@ def _vector_from_bytes(seed: bytes, dim: int = _DIM) -> list[float]:
 class FakeBackend:
     """Fixed, deterministic outputs for every `ModelBackend` method."""
 
+    def __init__(self, profile: str = "mac") -> None:
+        # The slot surface (design §4.1) is real here — `app`'s settings popup is
+        # tested against this backend, so switching and downloading must behave,
+        # just without weights: a "download" completes instantly.
+        from models import catalog
+
+        self._catalog = catalog
+        self._profile = profile
+        self._slots = dict(catalog.DEFAULTS[profile])
+        self._generation = 0
+        self._downloaded: set[tuple[str, str]] = set()
+
     def embed_image(self, images: list[bytes]) -> list[list[float]]:
         return [_vector_from_bytes(b"image:" + image) for image in images]
 
@@ -83,6 +95,8 @@ class FakeBackend:
             "gpu_pct": None,
             "resident": ["fake"],
             "active": None,
+            "slots": dict(self._slots),
+            "generation": self._generation,
         }
 
     def models_state(self) -> dict:
@@ -92,6 +106,8 @@ class FakeBackend:
             "free_mb": 0.0,
             "used_mb": 0,
             "active": None,
+            "slots": dict(self._slots),
+            "generation": self._generation,
         }
 
     def model_ensure(self, name: str) -> None:
@@ -99,3 +115,51 @@ class FakeBackend:
 
     def model_unload(self, name: str) -> None:
         return None
+
+    # --- slots (design §4.1) ---
+    def _download_status(self, entry) -> dict:
+        total = entry.size_mb * 1024 * 1024
+        ready = (entry.slot, entry.key) in self._downloaded or entry.key == self._slots.get(
+            entry.slot
+        )
+        return {
+            "state": "ready" if ready else "absent",
+            "bytes": total if ready else 0,
+            "total": total,
+            "error": None,
+        }
+
+    def catalog(self) -> dict:
+        from modelsvc.slots import catalog_payload
+
+        return catalog_payload(
+            self._profile, self._slots, self._generation, self._download_status
+        )
+
+    def set_slots(self, slots: dict) -> dict:
+        for slot, key in slots.items():
+            if slot not in self._catalog.SLOTS or not self._catalog.has(slot, key):
+                raise ValueError(f"unknown model for {slot}: {key}")
+            if self._profile not in self._catalog.get(slot, key).profiles:
+                raise ValueError(f"{key} is not offered on {self._profile}")
+        if any(self._slots.get(slot) != key for slot, key in slots.items()):
+            self._slots.update(slots)
+            self._generation += 1
+        return {"slots": dict(self._slots), "generation": self._generation}
+
+    def download(self, slot: str, key: str) -> dict:
+        entry = self._catalog.get(slot, key)  # KeyError on an unknown model
+        self._downloaded.add((slot, key))
+        return self._download_status(entry)
+
+    def embed_spec(self) -> dict:
+        entry = self._catalog.get("image_embed", self._slots["image_embed"])
+        pre = entry.preprocess
+        return self.calibration() | {
+            "preprocess": {
+                "input_px": pre.input_px,
+                "resample": pre.resample,
+                "mode": pre.mode,
+            },
+            "generation": self._generation,
+        }

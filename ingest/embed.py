@@ -34,6 +34,33 @@ def backfill_embeds(conn: sqlite3.Connection) -> int:
     return len(rows)
 
 
+def relabel_legacy_embeds(conn: sqlite3.Connection, model_name: str) -> int:
+    """Repair `embedding_model` stamps that name no model (design §4.1).
+
+    The stage used to stamp `settings.embed_model_name` — an HF repo id, not a
+    catalog key — so every photo claimed `siglip2-so400m-patch14-384` on the photo
+    page whatever the `image_embed` slot held. The VECTORS were always the slot's
+    (the `models` service picks the model), so only the label is wrong, and a
+    re-embed of the whole library would be a pointless way to fix a string.
+
+    A label that is a catalog key is left alone: it is a real answer, and a photo
+    still carrying an older key is one the current slot has not re-embedded yet
+    (`slots.switch` requeues it). Photos with no vector keep their NULL. Idempotent.
+    """
+    from models import catalog
+
+    # ONE statement, not a scan in Python: this runs on every worker poll (10 s),
+    # and on a converged library it must match no rows and be over.
+    honest = {e.key for e in catalog.CATALOG if e.slot == "image_embed"} | {model_name}
+    placeholders = ",".join("?" * len(honest))
+    cursor = conn.execute(
+        "UPDATE photos SET embedding_model = ?"
+        f" WHERE embedding_model IS NOT NULL AND embedding_model NOT IN ({placeholders})",
+        (model_name, *honest),
+    )
+    return cursor.rowcount
+
+
 def embed_handler(originals: Storage, embedder: Embedder, model_name: str) -> StageHandler:
     def handle(conn: sqlite3.Connection, photo_id: int) -> None:
         row = conn.execute(

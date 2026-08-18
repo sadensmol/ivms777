@@ -25,7 +25,8 @@ def test_every_model_fits_its_profile_budget(profile):
     headroom = _governor_headroom_mb()
     unsatisfiable = {
         name: cost
-        for name, cost in settings.model_cost_mb.items()
+        for name, cost in settings.model_cost_mb.items()  # overrides only; the
+        # catalog itself is checked by tests/test_catalog.py
         if cost + headroom > settings.ram_budget_mb
     }
     assert not unsatisfiable, (
@@ -40,7 +41,16 @@ def test_defaults_to_mac_profile():
     # One gemma4-E2B GGUF on llama-server serves text + vision (plan 16).
     assert s.caption_model == "gemma4-E2B"
     assert s.planner_model == "gemma4-E2B"
-    assert s.embed_device == "cpu"
+    # Metal, never the CPU: `make up` runs the models service host-native, so
+    # torch reaches the M-series GPU through MPS (design §3.1).
+    assert s.embed_device == "mps"
+
+
+def test_no_profile_ever_defaults_to_the_cpu():
+    # design §3.1: "Everything model-related runs on the GPU — never the CPU.
+    # There is no CPU offload, on any profile."
+    for profile in ("mac", "jetson", "cloud"):
+        assert Settings(profile=profile, data_dir=Path("/tmp/pl")).embed_device != "cpu"
 
 
 def test_jetson_profile_overrides_model_and_device():
@@ -88,17 +98,10 @@ def test_conveyor_profile_defaults():
     assert jetson.gpu_concurrency == 1
     assert jetson.llm_managed is True
     assert jetson.llm_idle_ttl_s == 120
-    # Measured on the board, not guessed (§8.1) — these MUST track reality or
-    # the governor loads a model on top of one it should have evicted.
-    assert jetson.model_cost_mb["siglip"] == 3400
-    assert jetson.model_cost_mb["nomic"] == 2200
-    # Text-only gemma is cheaper than the vision mode by the projector (§3.1).
-    # Both measured on the board as the drop in available RAM: gemma 3606 MB,
-    # gemma-vision 3936 MB (peaks 3374 / 4047). gemma-vision was 5000 — an
-    # over-estimate that exceeded the 5000 budget and made captioning impossible.
-    assert jetson.model_cost_mb["gemma"] == 3800
-    assert jetson.model_cost_mb["gemma-vision"] == 4300
-    assert jetson.model_cost_mb["gemma"] < jetson.model_cost_mb["gemma-vision"]
+    # Costs live in the CATALOG since plan 21 (design §4.1); this map is only the
+    # board-side override, so it must ship empty — a stale default here would
+    # silently outrank the measured figure for whatever model the slot holds.
+    assert jetson.model_cost_mb == {}
 
     mac = Settings(profile="mac", data_dir=Path("/tmp/pl"))
     assert mac.gpu_concurrency == 3

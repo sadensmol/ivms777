@@ -10,10 +10,10 @@ inside the one `models` service (design §5.1), loaded once — never in
 
 | Slot | Default model | Backend (inside the `models` service) | Residency unit |
 |---|---|---|---|
-| `image_embed` — image and text embeddings, zero-shot tags | SigLIP 2 `so400m-patch14-384` | `TorchWorker` child, `transformers` — CPU (mac) / CUDA (jetson) | `image_embed` |
+| `image_embed` — image and text embeddings, zero-shot tags | SigLIP 2 `so400m-patch14-384` | `TorchWorker` child, `transformers` — MPS (mac) / CUDA (jetson) | `image_embed` |
 | `caption` — captions (caption sentence only — no tags) | `gemma4-E2B` GGUF (mac/jetson) · `qwen2.5vl:7b` (cloud) | OpenAI `/v1` call to `llama-server` (mac/jetson) / vLLM (cloud) | `llm_vision` |
 | `planner` — query planning, chat answers | `gemma4-E2B` GGUF (mac/jetson) · `qwen2.5:3b` (cloud) | OpenAI `/v1` call to `llama-server` (mac/jetson) / vLLM (cloud) | `llm` |
-| `text_embed` — caption text embeddings (§9 similar) | `nomic-embed-text-v1.5` (dedicated text embedder) | `TorchWorker` child, `transformers` — CPU (mac) / CUDA (jetson) | `text_embed` |
+| `text_embed` — caption text embeddings (§9 similar) | `nomic-embed-text-v1.5` (dedicated text embedder) | `TorchWorker` child, `transformers` — MPS (mac) / CUDA (jetson) | `text_embed` |
 
 Each slot is switchable at runtime from the settings popup (design §4.1, §13);
 the table gives the defaults. `caption` and `planner` share one `llama-server`
@@ -94,7 +94,7 @@ The caption text is embedded by a **dedicated text embedder,
 NOT the planner (a chat model has no embedding head) and NOT SigLIP (its text
 tower is trained image↔text, so text↔text has no separation — measured). Since
 plan 16 dropped Ollama it has no server, so it runs **in-process in the `models`
-service** (`embedding/text_embedder.py`, `TextBackend.text_embed`), on CPU (mac) /
+service** (`embedding/text_embedder.py`, `TextBackend.text_embed`), on MPS (mac) /
 CUDA (jetson). The resulting `caption_vec` is a **text-meaning retrieval index**,
 consumed as **top-k KNN** (never a fixed cosine floor).
 
@@ -137,9 +137,9 @@ consumed as **top-k KNN** (never a fixed cosine floor).
   Gemma 3 27B by roughly 20 MMMU-Pro points at a third of the memory — and is not used.
 - **SigLIP 2 over OpenCLIP** on zero-shot and retrieval. It stays in-process rather
   than behind the inference service because neither `llama-server` nor vLLM exposes
-  an image-embedding endpoint. On `mac` it runs on CPU inside the container: roughly
-  1 s/photo (~1.5 h one-time for 5,000 photos) and ~30 ms per search query — the
-  price of containerising the app on a Mac.
+  an image-embedding endpoint. On `mac` it runs host-native on the Apple GPU
+  (`embed_device=mps`) — never on the CPU, and never in a container, which gets no
+  Metal (design §3.1).
 
 ## Model download
 
@@ -155,6 +155,10 @@ vLLM fetches its model from Hugging Face. All these caches survive restarts.
 GGUF (+ its mmproj) into the same `/data/models` dir `llama-server` is pointed at.
 Progress (`bytes`/`total`, plus a terminal `error`) is kept in a thread-safe dict
 and read back through `GET /models/catalog`, which is what the settings popup polls.
+A GGUF reports its own bytes as it streams; `snapshot_download` exposes no
+callback, so a watcher thread samples the repo's HF cache `blobs/` directory
+(partial `.incomplete` files included) and the denominator comes from the repo's
+real file sizes — a multi-GB pull stuck at 0% is indistinguishable from a stall.
 "Already downloaded" is a probe of the cache path, not a flag — a manually placed
 GGUF counts. Downloads never run inside a request, and a download in flight never
 blocks inference: it holds no scheduler slot and loads nothing.

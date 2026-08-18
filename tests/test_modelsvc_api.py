@@ -96,11 +96,16 @@ def test_text_evict_returns_empty_body():
     assert resp.json() == {}
 
 
-def test_calibration_returns_fake_backend_values():
+def test_embed_spec_returns_fake_backend_calibration_and_preprocessing():
     with _client() as tc:
-        resp = tc.get("/embed/calibration")
+        resp = tc.get("/embed/spec")
     assert resp.status_code == 200
-    assert resp.json() == {"logit_scale": 10.0, "logit_bias": -5.0}
+    assert resp.json() == {
+        "logit_scale": 10.0,
+        "logit_bias": -5.0,
+        "preprocess": {"input_px": 384, "resample": "bilinear", "mode": "squash"},
+        "generation": 0,
+    }
 
 
 def test_resources_reports_resident_models_and_nothing_else():
@@ -112,7 +117,10 @@ def test_resources_reports_resident_models_and_nothing_else():
     assert resp.status_code == 200
     data = resp.json()
     assert isinstance(data["resident"], list)
-    assert set(data) == {"resident", "active"}
+    # No machine metrics here — they are host-wide reads `app` does itself (§5.1).
+    assert not {"ram_used_mb", "ram_total_mb", "cpu_pct", "gpu_pct"} & data.keys()
+    # It also reports the live slot selection, which only this service knows (§4.1).
+    assert set(data) == {"resident", "active", "slots", "generation"}
 
 
 def test_text_stream_streams_tokens_as_sse():

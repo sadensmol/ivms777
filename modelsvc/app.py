@@ -11,7 +11,7 @@ import base64
 import json
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -77,9 +77,32 @@ class TextModelRequest(BaseModel):
     model: str
 
 
-class CalibrationResponse(BaseModel):
+class Preprocess(BaseModel):
+    """How the CALLER must resize an image before sending it (design §4.1)."""
+
+    input_px: int
+    resample: str
+    mode: str  # "squash" | "native"
+
+
+class EmbedSpecResponse(BaseModel):
+    """Calibration AND the selected image embedder's preprocessing contract, in one
+    round trip. `generation` moves when a slot is switched, which is the cache
+    invalidation signal for `RemoteEmbedder`."""
+
     logit_scale: float
     logit_bias: float
+    preprocess: Preprocess
+    generation: int
+
+
+class SetSlotsRequest(BaseModel):
+    slots: dict[str, str]
+
+
+class DownloadRequest(BaseModel):
+    slot: str
+    key: str
 
 
 class ResourcesResponse(BaseModel):
@@ -92,16 +115,27 @@ class ResourcesResponse(BaseModel):
 
     resident: list[str]
     active: str | None = None  # current in-flight op for the bar (embedding/captioning/chat/…)
+    # Which model each slot holds RIGHT NOW (design §4.1). `app` compares this with
+    # its own stored selection on every poll and re-pushes when they diverge — that
+    # is how a restarted service (which has no DB, so it boots on the profile
+    # defaults) converges back without any shared store.
+    slots: dict[str, str] = {}
+    generation: int = 0
 
 
 class ModelsStateResponse(BaseModel):
-    """Conveyor state (plan 18) — what the governor holds resident vs its budget."""
+    """Conveyor state (plan 18) — what the governor holds resident vs its budget,
+    plus the slot selection and its `generation` (plan 21): `app` compares that
+    generation on its resources poll and re-pushes the stored slots when the
+    service has restarted onto the profile defaults (design §4.1)."""
 
     resident: list[str]
     budget_mb: int
     free_mb: float
     used_mb: int
     active: str | None = None
+    slots: dict[str, str] = {}
+    generation: int = 0
 
 
 def create_models_app(backend: ModelBackend) -> FastAPI:
@@ -121,9 +155,9 @@ def create_models_app(backend: ModelBackend) -> FastAPI:
         image = base64.b64decode(req.image)
         return backend.tag(image, req.dimensions)
 
-    @app.get("/embed/calibration", response_model=CalibrationResponse)
-    def calibration() -> CalibrationResponse:
-        return CalibrationResponse(**backend.calibration())
+    @app.get("/embed/spec", response_model=EmbedSpecResponse)
+    def embed_spec() -> EmbedSpecResponse:
+        return EmbedSpecResponse(**backend.embed_spec())
 
     @app.post("/caption", response_model=CaptionResponse)
     def caption(req: CaptionRequest) -> CaptionResponse:
@@ -169,6 +203,26 @@ def create_models_app(backend: ModelBackend) -> FastAPI:
     @app.get("/models", response_model=ModelsStateResponse)
     def models_state() -> ModelsStateResponse:
         return ModelsStateResponse(**backend.models_state())
+
+    # --- slot control (design §4.1). Registered BEFORE `/models/{name}/…` so the
+    # literal paths are not swallowed by the path parameter.
+    @app.get("/models/catalog")
+    def models_catalog() -> dict:
+        return backend.catalog()
+
+    @app.put("/models/slots")
+    def set_slots(req: SetSlotsRequest) -> dict:
+        try:
+            return backend.set_slots(req.slots)
+        except (ValueError, KeyError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/models/download")
+    def download(req: DownloadRequest) -> dict:
+        try:
+            return backend.download(req.slot, req.key)
+        except (ValueError, KeyError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/models/{name}/ensure")
     def model_ensure(name: str) -> dict:

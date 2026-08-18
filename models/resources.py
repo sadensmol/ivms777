@@ -29,18 +29,18 @@ from models.thermal import read_temps
 
 
 def display_names(resident, *, planner_model, caption_model, embed_model, text_embed_model):
-    """Registry keys -> the FULL model names the bar shows (design §13).
+    """Residency units -> the FULL model names the bar shows (design §13).
 
-    The conveyor's keys are internal handles (`gemma`, `gemma-vision`, `siglip`,
-    `nomic`); the bar must name the actual model that is loaded, so "gemma" reads as
-    `gemma4-E2B`. `gemma-vision` is the same weights plus the projector, so it is
-    labelled with the caption model and marked as the vision mode (§3.1).
+    The conveyor's keys are the four SLOT units (`llm`, `llm_vision`, `image_embed`,
+    `text_embed`, design §4.1); the bar must name the model each one currently holds,
+    so `llm` reads as whatever the planner slot selected. `llm_vision` is the caption
+    slot's model with its projector, so it is marked as the vision mode (§3.1).
     """
     names = {
-        "gemma": planner_model,
-        "gemma-vision": f"{caption_model} +vision" if caption_model else None,
-        "siglip": embed_model,
-        "nomic": text_embed_model,
+        "llm": planner_model,
+        "llm_vision": f"{caption_model} +vision" if caption_model else None,
+        "image_embed": embed_model,
+        "text_embed": text_embed_model,
     }
     return [names.get(key) or key for key in resident]
 
@@ -80,6 +80,10 @@ def snapshot(
         return snap
     return snap | {
         "active": r.get("active"),          # embedding / captioning / chat / planning / …
+        # Not shown in the bar: `app` compares these with its stored selection and
+        # re-pushes when the service has drifted back to the defaults (§4.1).
+        "slots": r.get("slots", {}),
+        "generation": r.get("generation", 0),
         # What is ACTUALLY loaded right now, by FULL model name.
         "models": display_names(
             r.get("resident", []),

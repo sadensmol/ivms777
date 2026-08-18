@@ -29,10 +29,18 @@ class ModelBackend(Protocol):
     def calibration(self) -> dict:
         """SigLIP's zero-shot calibration: `logit_scale`, `logit_bias`.
 
-        `RemoteEmbedder` fetches this once and caches it, so its `Embedder`-
-        protocol `logit_scale`/`logit_bias` attrs stay cheap after first use
-        (taxonomy tagging, §9, computes probabilities client-side — ruling R2
-        of plan 15 task 2).
+        Reached over HTTP as part of `embed_spec()`; taxonomy tagging (§9)
+        computes probabilities client-side from it.
+        """
+        ...
+
+    def embed_spec(self) -> dict:
+        """`calibration()` plus the SELECTED image embedder's preprocessing
+        contract and the slots' `generation` (design §4.1, §5.1).
+
+        Keys: `logit_scale`, `logit_bias`, `preprocess`
+        (`input_px`/`resample`/`mode`), `generation`. `RemoteEmbedder` caches it
+        and resizes by it, so no caller holds a resolution constant.
         """
         ...
 
@@ -97,4 +105,21 @@ class ModelBackend(Protocol):
 
     def model_unload(self, name: str) -> None:
         """Unload a managed model now, freeing its memory."""
+        ...
+
+    def catalog(self) -> dict:
+        """The repo catalog joined with live state (design §4.1): every entry this
+        profile can offer, which one each slot holds, and each one's download
+        state. Keys: `profile`, `slots`, `generation`, `entries`."""
+        ...
+
+    def set_slots(self, slots: dict) -> dict:
+        """Point one or more slots at a different catalog entry. Evicts what it
+        replaces; loads nothing eagerly. Raises `ValueError` for a key that is
+        unknown or not offered on this profile. Returns `{slots, generation}`."""
+        ...
+
+    def download(self, slot: str, key: str) -> dict:
+        """Start fetching a catalog entry's weights in the background and return
+        its download status (`state`/`bytes`/`total`/`error`). Idempotent."""
         ...

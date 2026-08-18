@@ -92,8 +92,28 @@ class ModelsClient:
         response = self._client.post("/text/evict", json={"model": model}, timeout=timeout)
         response.raise_for_status()
 
-    def calibration(self, *, timeout: float = 10.0) -> dict:
-        response = self._client.get("/embed/calibration", timeout=timeout)
+    def embed_spec(self, *, timeout: float = 10.0) -> dict:
+        """Calibration + the selected image embedder's preprocessing contract +
+        the slots' `generation` (design §4.1). One round trip: the caller needs
+        all three to embed an image correctly."""
+        response = self._client.get("/embed/spec", timeout=timeout)
+        response.raise_for_status()
+        return response.json()
+
+    def catalog(self, *, timeout: float = 10.0) -> dict:
+        response = self._client.get("/models/catalog", timeout=timeout)
+        response.raise_for_status()
+        return response.json()
+
+    def set_slots(self, slots: dict, *, timeout: float = 30.0) -> dict:
+        response = self._client.put("/models/slots", json={"slots": slots}, timeout=timeout)
+        response.raise_for_status()
+        return response.json()
+
+    def download(self, slot: str, key: str, *, timeout: float = 10.0) -> dict:
+        response = self._client.post(
+            "/models/download", json={"slot": slot, "key": key}, timeout=timeout
+        )
         response.raise_for_status()
         return response.json()
 

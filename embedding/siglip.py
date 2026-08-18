@@ -5,13 +5,13 @@ from transformers import AutoModel, AutoProcessor
 
 from embedding.base import EMBED_DIM
 
-# Hugging Face id for SigLIP 2 so400m/14 at 384px. The short name in config maps
-# here so config stays terse and the actual repo id lives in one place.
-_HF_ID = "google/siglip2-so400m-patch14-384"
-
 
 class SiglipEmbedder:
     def __init__(self, model_name: str, device: str) -> None:
+        # `model_name` is the HF repo id of the entry the `image_embed` SLOT holds
+        # (`models.catalog`, design §4.1) — never a hardcoded checkpoint. Switching
+        # the slot rebuilds this worker with the new repo, so hardcoding one would
+        # make the settings popup a silent no-op.
         self.device = device
         # fp16 on cuda: this ~1B-param model is ~4 GB in float32 but ~2 GB in
         # float16 — on the 8 GB unified Jetson that difference is the whole caption
@@ -25,9 +25,9 @@ class SiglipEmbedder:
         # referenced. `device_map` streams shard-by-shard straight to the device, so
         # the host copy never exists. Needs `accelerate` (the `models` extra).
         self.model = AutoModel.from_pretrained(
-            _HF_ID, dtype=self.dtype, device_map=device
+            model_name, dtype=self.dtype, device_map=device
         ).eval()
-        self.processor = AutoProcessor.from_pretrained(_HF_ID)
+        self.processor = AutoProcessor.from_pretrained(model_name)
         # SigLIP's learned zero-shot calibration (see embedding.vectors); read from
         # the model so it is always exact for this checkpoint.
         self.logit_scale = float(self.model.logit_scale.exp().item())

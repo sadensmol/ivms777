@@ -5,7 +5,7 @@ from pathlib import Path
 from embedding.fakes import FakeEmbedder
 from embedding.store import knn, read_vector, write_vector
 from embedding.vectors import l2_normalize
-from ingest.embed import embed_handler
+from ingest.embed import embed_handler, relabel_legacy_embeds
 from ingest.jobs import enqueue, stage_counts
 from ingest.worker import drain
 from storage.keys import content_key
@@ -63,6 +63,35 @@ def test_knn_is_owner_scoped(conn):
     write_vector(conn, 2, vec)
     hits = knn(conn, owner_id=1, vector=vec, k=10)
     assert [pid for pid, _ in hits] == [1]
+
+
+def _labels(conn) -> dict:
+    return {
+        row["id"]: row["embedding_model"]
+        for row in conn.execute("SELECT id, embedding_model FROM photos")
+    }
+
+
+def test_a_legacy_stamp_is_relabelled_to_the_current_slot(conn):
+    # Photos embedded before the stamp used the slot carry a config constant
+    # (`siglip2-so400m-patch14-384`, an HF id, never a catalog key). Their vectors
+    # DID come from the selected slot, so the label is the only thing wrong.
+    add_photo(conn, photo_id=1, content_hash="a", embedding_model="siglip2-so400m-patch14-384")
+
+    assert relabel_legacy_embeds(conn, "siglip2-so400m-384") == 1
+    assert _labels(conn) == {1: "siglip2-so400m-384"}
+
+
+def test_relabelling_leaves_honest_labels_alone(conn):
+    # A catalog key is a real answer — even a different one, which is a photo the
+    # current slot has not re-embedded yet. Never touch it, and never invent a
+    # label for a photo that has no vector.
+    add_photo(conn, photo_id=1, content_hash="a", embedding_model="siglip2-so400m-512")
+    add_photo(conn, photo_id=2, content_hash="b")
+    add_photo(conn, photo_id=3, content_hash="c", embedding_model="fake")
+
+    assert relabel_legacy_embeds(conn, "fake") == 0
+    assert _labels(conn) == {1: "siglip2-so400m-512", 2: None, 3: "fake"}
 
 
 def test_embed_handler_populates_the_vector_table(conn, tmp_path):

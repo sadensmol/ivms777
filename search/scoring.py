@@ -22,28 +22,28 @@ A contribution is one fact about a candidate:
 """
 
 from search.signals import (
-    CAPTION_GATE,
     CAPTION_WEIGHT,
-    IMAGE_GATE,
     IMAGE_WEIGHT,
-    MOMENT_GATE,
     MOMENT_WEIGHT,
     RANK_WEIGHT,
-    TAG_TIERS,
+    STRICT,
+    Gates,
     combine,
     content_dimensions,
     cosine_strength,
-    dimension_gates,
     tag_strength,
 )
 
-_TAG_GATES = dimension_gates()
 _CONTENT_DIMENSIONS = content_dimensions()
-_DEFAULT_TAG_GATE = TAG_TIERS["look"].gate
 
 
 def tag_contribution(
-    dimension: str, label: str, agreement: float, idf: float, dimension_weight: float
+    dimension: str,
+    label: str,
+    agreement: float,
+    idf: float,
+    dimension_weight: float,
+    gates: Gates = STRICT,
 ) -> dict | None:
     """One shared tag (§9). None when the dimension is silenced, the tag is on every
     photo, or the two photos do not agree strongly enough for this dimension's gate.
@@ -54,8 +54,7 @@ def tag_contribution(
     """
     if dimension_weight <= 0.0 or idf <= 0.0:
         return None
-    gate = _TAG_GATES.get(dimension, _DEFAULT_TAG_GATE)
-    strength = tag_strength(agreement, idf, gate)
+    strength = tag_strength(agreement, idf, gates.for_dimension(dimension))
     if strength is None:
         return None
     return {
@@ -67,7 +66,7 @@ def tag_contribution(
     }
 
 
-def caption_contribution(cosine: float, gate: float = CAPTION_GATE) -> dict | None:
+def caption_contribution(cosine: float, gate: float = STRICT.caption) -> dict | None:
     """The candidate's caption MEANS something close to the query/seed caption (§9) —
     a text-embedding cosine, not a shared word."""
     strength = cosine_strength(cosine, gate)
@@ -81,7 +80,7 @@ def caption_contribution(cosine: float, gate: float = CAPTION_GATE) -> dict | No
     }
 
 
-def image_contribution(cosine: float, gate: float = IMAGE_GATE) -> dict | None:
+def image_contribution(cosine: float, gate: float = STRICT.image) -> dict | None:
     """A genuine visual near-dup — the image-vector cosine (§9), and the heaviest
     signal there is: above the gate it is the top 4 % of all pairs."""
     strength = cosine_strength(cosine, gate)
@@ -95,7 +94,7 @@ def image_contribution(cosine: float, gate: float = IMAGE_GATE) -> dict | None:
     }
 
 
-def moment_contribution(strength: float, gate: float = MOMENT_GATE) -> dict | None:
+def moment_contribution(strength: float, gate: float = STRICT.moment) -> dict | None:
     """Same stretch of time, same place (§9) — the one signal that does not look at
     the picture. `strength` comes from `search/moment.py`."""
     ramped = cosine_strength(strength, gate)

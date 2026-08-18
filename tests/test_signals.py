@@ -61,8 +61,8 @@ def test_moment_decays_with_time_and_distance():
     same_afternoon_nearby = signals.moment_strength(3.0, 500.0)
     next_day_across_town = signals.moment_strength(24.0, 5000.0)
     assert same_hour_same_block > same_afternoon_nearby > next_day_across_town
-    assert same_hour_same_block > signals.MOMENT_GATE
-    assert next_day_across_town < signals.MOMENT_GATE
+    assert same_hour_same_block > signals.STRICT.moment
+    assert next_day_across_town < signals.STRICT.moment
 
 
 def test_moment_without_gps_falls_back_to_time_alone():
@@ -130,12 +130,18 @@ def test_weights_follow_the_agreed_order():
     assert order == sorted(order, reverse=True)
 
 
-def test_a_lone_moment_at_same_hour_same_block_clears_the_score_floor():
-    # `moment` is a CONTENT signal, so a visually different photo taken at the same
-    # time and place must survive on its own (§9).
+def test_a_lone_moment_belongs_behind_show_more():
+    # `moment` is a CONTENT signal, so a visually different photo from the same time
+    # and place always QUALIFIES. But measured on the real library, a moment-only
+    # pair is a tire close-up matching a plastic container photographed the same
+    # minute — same outing, unrelated object. It is worth offering, not worth putting
+    # in the default strip, so it clears the LOOSE floor and not the STRICT one (§9).
     strength = signals.moment_strength(1.0, 200.0)
-    ramped = signals.cosine_strength(strength, gate=signals.MOMENT_GATE)
-    assert signals.combine([signals.MOMENT_WEIGHT * ramped]) >= signals.SCORE_MIN
+    lone = signals.combine([
+        signals.MOMENT_WEIGHT * signals.cosine_strength(strength, signals.STRICT.moment)
+    ])
+    assert lone < signals.STRICT.score_min
+    assert lone >= signals.LOOSE.score_min
 
 
 def test_dimension_weights_expand_from_tier_weights():
@@ -146,7 +152,24 @@ def test_dimension_weights_expand_from_tier_weights():
     assert weights["palette"] == signals.TAG_TIERS["look"].weight
 
 
-def test_dimension_gates_cover_every_dimension():
-    gates = signals.dimension_gates()
-    assert gates["subject"] == signals.TAG_TIERS["subject"].gate
-    assert gates["emotion"] == signals.TAG_TIERS["look"].gate
+def test_the_subject_gate_is_separate_from_every_other_tag_gate():
+    assert signals.STRICT.for_dimension("subject") == signals.STRICT.subject
+    assert signals.STRICT.for_dimension("emotion") == signals.STRICT.tag
+    assert signals.STRICT.for_dimension("setting") == signals.STRICT.tag
+
+
+def test_loose_relaxes_every_gate_but_never_below_the_noise_floor():
+    # "Looser" must still mean "measured", not "made up": a cosine gate under its
+    # random-pair median would be scoring chance. Those medians are 0.558 (image)
+    # and 0.621 (caption) on the reference library.
+    for field in ("image", "caption", "moment", "subject", "tag", "score_min"):
+        assert getattr(signals.LOOSE, field) < getattr(signals.STRICT, field), field
+    assert signals.LOOSE.image > 0.558
+    assert signals.LOOSE.caption > 0.621
+
+
+def test_loose_and_strict_share_identical_weights():
+    # Only gates relax. Changing weights would reshuffle results that are already
+    # ranked below the strict ones and make the two passes incomparable.
+    assert not hasattr(signals.LOOSE, "weight")
+    assert signals.TAG_TIERS["subject"].weight == 0.75

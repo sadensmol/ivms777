@@ -41,7 +41,7 @@ from search.semantic import (
     _tag_similarity,
     search_photos,
 )
-from search.signals import CAPTION_GATE, IMAGE_GATE
+from search.signals import STRICT, Gates
 
 
 @dataclass
@@ -65,6 +65,7 @@ class Query:
     k: int = 30
     weights: dict[str, float] | None = None
     floor: float | None = None
+    gates: Gates = STRICT
 
 
 def candidates(
@@ -72,8 +73,6 @@ def candidates(
     embedder: Embedder,
     owner_id: int,
     query: Query,
-    *,
-    caption_min: float = CAPTION_GATE,
 ) -> list[int]:
     """Phase 1 — fast candidate generation (§9.2). No scoring, no LLM.
 
@@ -93,7 +92,7 @@ def candidates(
     if query.seed_photo_id is not None:
         seed_id = query.seed_photo_id
         weights = query.weights or DEFAULT_SIMILAR_DIMENSION_WEIGHTS
-        moment_ids = set(moment_similarity(conn, owner_id, seed_id))
+        moment_ids = set(moment_similarity(conn, owner_id, seed_id, query.gates.moment))
         vector = read_vector(conn, seed_id)
         if vector is None:
             # No embedding yet, so no visual/tag/caption comparison is possible — but
@@ -102,7 +101,7 @@ def candidates(
         vector = l2_normalize(vector)
         knn_ids = [pid for pid, _ in knn(conn, owner_id, vector, max(query.k, 30), exclude_id=seed_id)]
         tag_ids = set(_tag_similarity(conn, owner_id, seed_id, weights))
-        caption_ids = set(_caption_similarity(conn, owner_id, seed_id, caption_min))
+        caption_ids = set(_caption_similarity(conn, owner_id, seed_id, query.gates.caption))
         seen = set(knn_ids)
         extra = [pid for pid in (tag_ids | caption_ids | moment_ids) if pid not in seen]
         return knn_ids + extra
@@ -123,8 +122,6 @@ def refine(
     ids: list[int],
     *,
     caption_model: str = "",
-    min_cosine: float = IMAGE_GATE,
-    caption_min: float = CAPTION_GATE,
 ) -> list[dict]:
     """Phase 2 — hard pre-filter, then graceful gated scoring (§9.2).
 
@@ -147,11 +144,11 @@ def refine(
     weights = query.weights or DEFAULT_SIMILAR_DIMENSION_WEIGHTS
     if query.seed_photo_id is not None:
         contributions = _seed_contributions(
-            conn, owner_id, query.seed_photo_id, ids, weights, min_cosine, caption_min
+            conn, owner_id, query.seed_photo_id, ids, weights, query.gates
         )
     else:
         contributions = _text_contributions(
-            conn, client, owner_id, query, ids, weights, caption_model, caption_min
+            conn, client, owner_id, query, ids, weights, caption_model, query.gates
         )
     results = score_candidates(contributions)
     if query.floor is not None:
@@ -167,12 +164,10 @@ def retrieve(
     query: Query,
     *,
     caption_model: str = "",
-    min_cosine: float = IMAGE_GATE,
-    caption_min: float = CAPTION_GATE,
 ) -> list[dict]:
     """`retrieve() = refine(candidates())` — the synchronous convenience for search
     and memory. Chat/similar's two-phase UX calls the two stages separately."""
-    ids = candidates(conn, embedder, owner_id, query, caption_min=caption_min)
+    ids = candidates(conn, embedder, owner_id, query)
     return refine(
         conn,
         embedder,
@@ -181,8 +176,6 @@ def retrieve(
         query,
         ids,
         caption_model=caption_model,
-        min_cosine=min_cosine,
-        caption_min=caption_min,
     )
 
 
@@ -218,8 +211,7 @@ def _seed_contributions(
     seed_id: int,
     ids: list[int],
     weights: dict[str, float],
-    min_cosine: float,
-    caption_min: float,
+    gates: Gates,
 ) -> dict[int, list[dict]]:
     """A seed's contributions: shared tags, caption meaning, image look-alike, and the
     shared moment — the exact `similar_photos` math (§9), reused so the two paths agree
@@ -231,15 +223,15 @@ def _seed_contributions(
         if pid in ids_set:
             contributions[pid].extend(contribs)
 
-    for pid, cosine in _caption_similarity(conn, owner_id, seed_id, caption_min).items():
+    for pid, cosine in _caption_similarity(conn, owner_id, seed_id, gates.caption).items():
         if pid in ids_set:
-            contrib = caption_contribution(cosine, caption_min)
+            contrib = caption_contribution(cosine, gates.caption)
             if contrib is not None:
                 contributions[pid].append(contrib)
 
-    for pid, strength in moment_similarity(conn, owner_id, seed_id).items():
+    for pid, strength in moment_similarity(conn, owner_id, seed_id, gates.moment).items():
         if pid in ids_set:
-            contrib = moment_contribution(strength)
+            contrib = moment_contribution(strength, gates.moment)
             if contrib is not None:
                 contributions[pid].append(contrib)
 
@@ -251,7 +243,7 @@ def _seed_contributions(
             if cand_vec is None:
                 continue  # no embedding yet — skip this ONE contribution, keep the candidate
             cosine = sum(a * b for a, b in zip(seed_vec, l2_normalize(cand_vec)))
-            contrib = image_contribution(cosine, min_cosine)
+            contrib = image_contribution(cosine, gates.image)
             if contrib is not None:
                 contributions[pid].append(contrib)
 
@@ -266,7 +258,7 @@ def _text_contributions(
     ids: list[int],
     weights: dict[str, float],
     caption_model: str,
-    caption_min: float,
+    gates: Gates,
 ) -> dict[int, list[dict]]:
     """A text query's contributions: caption meaning vs the query — the query embedded
     by the SAME dedicated text embedder (`caption_model`, `nomic-embed-text`, design §4)
@@ -284,7 +276,7 @@ def _text_contributions(
         if cap_vec is None:
             continue  # caption vector not computed yet — unavailable, not zero
         cosine = sum(a * b for a, b in zip(query_vec, l2_normalize(cap_vec)))
-        contrib = caption_contribution(cosine, caption_min)
+        contrib = caption_contribution(cosine, gates.caption)
         if contrib is not None:
             contributions[pid].append(contrib)
 
@@ -295,7 +287,7 @@ def _text_contributions(
     if query.soft_tags:
         for pid in ids:
             contributions[pid].extend(
-                _soft_tag_contributions(conn, owner_id, pid, query.soft_tags, weights)
+                _soft_tag_contributions(conn, owner_id, pid, query.soft_tags, weights, gates)
             )
 
     return contributions
@@ -307,6 +299,7 @@ def _soft_tag_contributions(
     photo_id: int,
     soft_tags: dict[str, list[str]],
     weights: dict[str, float],
+    gates: Gates,
 ) -> list[dict]:
     """Planner tag hints matched against a candidate's OWN tags — SOFT, they only
     score (§10, the ADR). A hint the taxonomy never scored simply contributes
@@ -335,7 +328,9 @@ def _soft_tag_contributions(
         ).fetchall()
         for row in rows:
             idf = (math.log(total / (row["df"] or 1)) / log_total) if log_total > 0 else 1.0
-            contrib = tag_contribution(dimension, row["label"], row["score"], idf, dim_weight)
+            contrib = tag_contribution(
+                dimension, row["label"], row["score"], idf, dim_weight, gates
+            )
             if contrib is not None:
                 contribs.append(contrib)
     return contribs

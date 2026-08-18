@@ -26,7 +26,9 @@ class TextBackend:
         model_name: str | None = None,
     ) -> None:
         self._client = client
-        # nomic's `TorchWorker` (plan 20), or None on cloud (real /embeddings backend).
+        # A PROVIDER of the text embedder's `TorchWorker` (plan 20), or None on cloud
+        # (real /embeddings backend). A provider, not the worker itself: switching the
+        # `text_embed` slot builds a new child (design §4.1).
         self._text_worker = text_worker
         # The text model llama-server/vLLM keeps resident — for the resource bar (§13).
         self._model_name = model_name
@@ -53,7 +55,7 @@ class TextBackend:
         # returns its RAM; cloud has a real /embeddings backend and no worker.
         if self._text_worker is None:
             return self._client.embed(model, texts)
-        return self._text_worker.call("embed_texts", texts)
+        return self._text_worker().call("embed_texts", texts)
 
     def text_warm(self, model: str) -> None:
         self._client.warm(model)

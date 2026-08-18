@@ -49,6 +49,7 @@ def build_context(settings: Settings) -> AppContext:
     # afterwards and reads the already-migrated schema from the file.
     boot = connect(settings.db_path)
     migrate(boot)
+    _heal_vector_width(boot, settings)
     boot.close()
     return AppContext(
         settings=settings,
@@ -56,3 +57,21 @@ def build_context(settings: Settings) -> AppContext:
         derived=LocalStorage(settings.thumb_dir),
         originals=LocalStorage(settings.originals_dir),
     )
+
+
+def _heal_vector_width(conn: sqlite3.Connection, settings: Settings) -> None:
+    """Make `photo_vec` match the SELECTED image embedder (design §4.1).
+
+    A switch does this in one transaction, so normally there is nothing to heal.
+    This is for the case where that transaction never finished — the process died
+    mid-switch, or the stored slot was changed while this app was down. Left alone,
+    every KNN query would fail (or worse, rank against a foreign space), so the
+    table is rebuilt and the embed stage requeued, exactly as a switch would.
+    """
+    from db.vectors import ensure_vec_dim
+    from ingest.jobs import reprocess
+    from models.slots import resolve
+
+    dim = resolve(conn, settings)["image_embed"].dim
+    if ensure_vec_dim(conn, dim):
+        reprocess(conn, settings.owner_id, "embed", "taxonomy")

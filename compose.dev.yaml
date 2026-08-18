@@ -8,11 +8,14 @@
 # on mtime change and StaticFiles reads from disk per request.
 #
 # Layer it last:
-#   docker compose -f compose.yaml -f compose.mac.yaml -f compose.dev.yaml up
+#   docker compose -f compose.yaml -f compose.jetson.yaml -f compose.dev.yaml up
 #
-# WATCHFILES_FORCE_POLLING is required on macOS: Docker Desktop runs a Linux VM
-# and inotify events do not cross the bind mount, so the default event watcher
-# never fires. Polling costs a little CPU and is the only thing that works here.
+# For jetson/cloud only. mac is NOT containerised (design §3.1) — `make up`
+# already runs app/worker/models natively with reload.
+#
+# WATCHFILES_FORCE_POLLING: inotify events do not always cross a bind mount
+# (notably Docker Desktop's Linux VM), so the default event watcher never fires.
+# Polling costs a little CPU and is the only thing that works everywhere.
 services:
   app:
     command: ["uv", "run", "--no-sync", "uvicorn", "web.app:app_factory",

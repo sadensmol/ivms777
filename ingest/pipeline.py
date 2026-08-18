@@ -23,7 +23,7 @@ from ingest.caption import (
     backfill_captions,
     caption_handler,
 )
-from ingest.embed import backfill_embeds, embed_handler
+from ingest.embed import backfill_embeds, embed_handler, relabel_legacy_embeds
 from ingest.facets import backfill_place_facets
 from ingest.folders import process_folder_deletions
 from ingest.jobs import stage_counts
@@ -67,9 +67,14 @@ def drain_pass(context, vocab, should_preempt=lambda: False) -> None:
     # The service's conveyor loads/evicts SigLIP and serializes the GPU (plan 18).
     backfill_embeds(conn)
     backfill_taxonomy(conn)
+    # Naming a model costs no model: repairing the legacy stamps must happen on a
+    # pass that has no embed work left, so it is here and not inside the branch.
+    relabel_legacy_embeds(conn, settings.embed_model_key(conn))
     if stage_counts(conn, "embed")["pending"] or stage_counts(conn, "taxonomy")["pending"]:
         try:
-            embedder, model_name = settings.build_embedder()
+            # `conn` so the stamped `embedding_model` names the model the user
+            # actually selected, not the env override / profile default (§4.1).
+            embedder, model_name = settings.build_embedder(conn)
             drain(conn, {
                 "embed": embed_handler(context.originals, embedder, model_name),
                 "taxonomy": taxonomy_handler(context.derived, embedder, vocab),

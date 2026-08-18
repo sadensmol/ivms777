@@ -69,6 +69,23 @@ def test_full_pass_processes_when_the_embedder_is_available(ctx):
     assert embedded["status"] == "done"
 
 
+def test_a_pass_repairs_a_legacy_embedding_model_stamp(ctx):
+    # An already-embedded photo stamped with the old config constant. The pass has
+    # no embed work to do for it, and must still put the label right (§4.1) — the
+    # photo page reads this column.
+    pid = _uploaded_photo(ctx)
+    ctx.conn.execute(
+        "UPDATE photos SET embedding_model = 'siglip2-so400m-patch14-384' WHERE id = ?",
+        (pid,),
+    )
+
+    drain_pass(ctx, load_vocab(VOCAB_PATH))
+
+    assert ctx.conn.execute(
+        "SELECT embedding_model FROM photos WHERE id = ?", (pid,)
+    ).fetchone()["embedding_model"] == "fake"
+
+
 def test_idle_pass_never_builds_an_embedder(ctx, monkeypatch):
     # No photos at all → nothing pending in embed/taxonomy/caption → drain_pass must
     # not build an embedder / models client (which would reach the `models` service

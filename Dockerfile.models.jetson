@@ -40,12 +40,22 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       uv pip install --reinstall torch torchvision \
       --index-url https://download.pytorch.org/whl/cu132
 
-# Flat layout: only the modules the models service imports.
+# Flat layout: only the modules the models service imports. Two single-file
+# exceptions, both pure data with no dependencies of their own:
+#   models/catalog.py  — the model catalog the slot API serves (§4.1)
+#   models/slots.py    — the shared slot resolver; the service calls it with
+#                        conn=None for the profile defaults (§4.1). Its `db`/
+#                        `ingest` imports are lazy and only on conn paths, so
+#                        neither package is needed here.
+#   search/signals.py  — the similarity gates config.py reads for its defaults
+#                        (§9); the rest of search/ is app-side retrieval.
 COPY config.py vocab.yaml ./
 COPY modelsvc ./modelsvc
 COPY embedding ./embedding
 COPY captioning ./captioning
 COPY inference ./inference
+COPY models/__init__.py models/catalog.py models/slots.py ./models/
+COPY search/__init__.py search/signals.py ./search/
 
 # Drop CUDA forward-compat libs. The nvidia/cuda base ships /usr/local/cuda/compat_orin;
 # on Jetson forward-compat is never used (container CUDA 13.2 == host driver, torch cu132

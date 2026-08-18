@@ -12,9 +12,13 @@ def settings(tmp_path: Path) -> Settings:
     # is exercised only by the slow-marked test and by hand. `text_embed_model="fake"`
     # so the §9 caption embedder adds no task prefix (see embedding.caption_text) and
     # the deterministic fake vectors match between caption docs and queries.
+    # `models_base_url` is pinned to an unresolvable host on purpose. The mac
+    # profile now defaults to localhost:9000 (everything is host-native, §3.1),
+    # so a developer running `make up` would otherwise have the suite talk to
+    # their LIVE models service. The suite is offline and hermetic.
     return Settings(
         data_dir=tmp_path, use_fake_embedder=True, use_fake_inference=True,
-        text_embed_model="fake",
+        text_embed_model="fake", models_base_url="http://models.invalid:9000",
     )
 
 

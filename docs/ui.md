@@ -131,7 +131,11 @@ and Esc/backdrop/× just closes it.
   matched** — its top-3 reasons (shared tags / caption meaning / "looks alike" / "same
   time & place") with confidence percentages, one per line, **sorted by what actually
   drove the match**, not by the biggest percentage, overlaid on the image — so
-  similarity is never a black box (§9). Opening a similar photo opens in
+  similarity is never a black box (§9). When the strip comes back short, a
+  **"Show more — looser matches"** button appends up to 6 more, found at lower gates
+  and rendered **dimmed under a "Looser matches" heading** so they never read as
+  equals of the strip above; they are appended, never merged, and never repeat a
+  result already shown. Opening a similar photo opens in
   a **"Similar to <this photo>"** layer (`ctx=similar:<id>`) that shows the base
   photo's thumbnail (clickable, to jump back to it) and pages within this photo's
   similar set. **A photo is always exactly one level below a grid** (§13.1): every

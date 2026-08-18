@@ -18,8 +18,8 @@ L2-normalises.
 
 class TextEmbedder:
     """Mean-pooled, L2-normalised sentence embeddings from a HF encoder
-    (`nomic-embed-text-v1.5` by default) on `device` (cpu on mac, cuda on
-    jetson). Loaded once; `transformers`/`torch` imported lazily on first use."""
+    (`nomic-embed-text-v1.5` by default) on `device` (mps on mac, cuda on
+    jetson — never the CPU, design §3.1). Loaded once; `transformers`/`torch` imported lazily on first use."""
 
     def __init__(self, model_name: str, device: str) -> None:
         self._model_name = model_name

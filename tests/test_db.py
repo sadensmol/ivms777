@@ -21,11 +21,10 @@ def test_expected_tables_exist(conn):
     names = {r[0] for r in rows}
     for expected in [
         "photos", "photo_sources", "uploads", "tags", "photo_tags",
-        "photo_facets", "jobs", "groups", "group_photos",
+        "photo_facets", "jobs", "groups", "group_photos", "app_settings",
     ]:
         assert expected in names
     assert "scans" not in names
-    assert "app_settings" not in names
 
 
 def test_vector_table_accepts_and_returns_a_row(conn):

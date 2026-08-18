@@ -39,16 +39,19 @@ API.
 
 ### 3.1 Deploy profiles
 
-The same code runs in three places, selected by a base `compose.yaml` plus one
-per-profile overlay (`compose.mac.yaml` / `compose.jetson.yaml` / `compose.cloud.yaml`).
-The differences are which inference service is active, which model name is in
-config, and — on `jetson` only — which app image is built (see "Jetson image"
-below). Ingest is identical everywhere — photos always arrive by upload
-(section 3.2b), so no profile depends on a host bind mount.
+The same code runs in three places. `jetson` and `cloud` are containerised — a
+base `compose.yaml` plus one per-profile overlay (`compose.jetson.yaml` /
+`compose.cloud.yaml`). **`mac` is not containerised at all**: `make up` runs the
+models service, the worker and the app as plain host processes, because only a
+host process reaches the Apple GPU (see "Why `mac` is host-native" below). The
+differences are which inference service is active, which model name is in config,
+and — on `jetson` only — which app image is built (see "Jetson image" below).
+Ingest is identical everywhere — photos always arrive by upload (section 3.2b),
+so no profile depends on a host bind mount.
 
 | Profile | Inference | Caption model | Planner / chat model | Embed device |
 |---|---|---|---|---|
-| `mac` | `llama-server` on the **host** (Metal) | `gemma4-E2B` | `gemma4-E2B` | `cpu` |
+| `mac` | `llama-server` on the **host** (Metal) | `gemma4-E2B` | `gemma4-E2B` | `mps` |
 | `jetson` | `llama-server` in a container (sm_87 CUDA) | `gemma4-E2B` | `gemma4-E2B` | `cuda` |
 | `cloud` | vLLM in a container, `--gpus all` | `qwen2.5vl:7b` | `qwen2.5:3b` | `cuda` |
 
@@ -67,13 +70,24 @@ in-process caption VLM** — captioning is a plain OpenAI call to `llama-server`
 with the image as an `image_url` data-URI. `cloud` is unchanged by plan 16 (still
 vLLM; an open item).
 
-**Why `llama-server` runs on the host under `mac`.** Docker Desktop on macOS boots
-a Linux VM, and Apple exposes no GPU to Linux guests — there is no Metal in a
-container, and no configuration changes that. Apple's own `container` project
-does not support GPU passthrough either. Containerised inference on a Mac falls
-back to CPU and runs 3-6x slower. `llama-server` built natively with Metal
-(`-DGGML_METAL=ON`) gets full GPU, and the containerised app reaches it at
-`host.docker.internal:8080`.
+**Why `mac` is host-native — and why NOTHING on it may run on the CPU.** Docker
+Desktop on macOS boots a Linux VM, and Apple exposes no GPU to Linux guests —
+there is no Metal and no MPS in a container, and no configuration changes that.
+Apple's own `container` project does not support GPU passthrough either. A
+containerised model on a Mac silently falls back to the CPU: 3-6x slower for
+`llama-server`, and **54x** slower for SigLIP (§8.1). That fallback is forbidden
+here, so there is **no containerised `mac` path at all** — no `compose.mac.yaml`.
+Everything model-related is a host process on the Apple GPU:
+
+- `llama-server`, built natively with Metal (`-DGGML_METAL=ON`), on `:8080` —
+  started by `make llama-mac`, reused (not supervised) by the models service.
+- The `models` service itself, host-native, with **`embed_device=mps`**: SigLIP
+  and the nomic caption-text embedder load through torch's Metal backend.
+- `app` and `worker`, host processes reaching the models service at
+  `localhost:9000` — they hold no model either way (§5.1).
+
+`make up` starts all of it; the mac profile's defaults (`config.PROFILE_DEFAULTS`)
+are the host-native URLs, not container hostnames.
 
 On Linux this problem does not exist. Under `jetson` and `cloud` everything,
 including inference, runs in containers with real GPU access via the NVIDIA
@@ -96,8 +110,8 @@ its own CUDA context — far larger than the SigLIP (~1.6 GB) + nomic (~0.3 GB) 
 models the `models` service hosts in its `TorchWorker` children (§8.1). So **gemma and SigLIP CANNOT be
 resident together**: the memory governor (§8.1) evicts SigLIP before it loads gemma
 and reloads it afterwards — they **swap** across the embed↔caption stage boundary.
-The governor's per-model cost estimates (`IVMS777_MODEL_COST_MB`) must track these
-real figures: an under-estimate for gemma makes it skip the eviction and load gemma
+The catalog's per-model cost figures (§4.1, overridable with
+`IVMS777_MODEL_COST_MB`) must track these real figures: an under-estimate for gemma makes it skip the eviction and load gemma
 on top of SigLIP → OOM.
 
 Everything model-related runs **on the GPU — never the CPU. There is no CPU
@@ -108,10 +122,10 @@ conveyor makes room by evicting SigLIP + nomic first (§8.1).
 **gemma has two spawn modes, and the vision projector is loaded ONLY for
 captioning** — it is the model's vision half, useless to a text turn:
 
-| mode | registry name | spawn | used by |
-|---|---|---|---|
-| text | `gemma` | `-m gemma.gguf -ngl 99` | chat, planner |
-| vision | `gemma-vision` | text **+ `--mmproj`** | captioning |
+| mode | residency unit | slot | spawn | used by |
+|---|---|---|---|---|
+| text | `llm` | `planner` | `-m <planner gguf> -ngl 99` | chat, planner |
+| vision | `llm_vision` | `caption` | `-m <caption gguf>` **+ `--mmproj`** | captioning |
 
 The two are **mutually exclusive** — one `llama-server` child, one port — so loading
 either frees the other. Chat therefore never pays the projector's ~531 MB, which on
@@ -303,7 +317,7 @@ caption-embedding decision live in [`docs/models.md`](models.md).** The shipping
 defaults:
 
 - **SigLIP 2** does image + text embeddings and zero-shot tags, in a `TorchWorker`
-  child of the models service (CPU on mac, CUDA on jetson) — neither `llama-server`
+  child of the models service (MPS on mac, CUDA on jetson) — neither `llama-server`
   nor vLLM exposes an image-embedding endpoint, so it cannot move behind them.
 - **One `gemma4-E2B` GGUF on `llama-server`** does **both** captioning (vision) and
   planner/chat (text) on mac/jetson — one model, one process, on the GPU (§3.1).
@@ -378,11 +392,24 @@ stages exactly like any other reprocess, with the same per-stage progress rows (
 search and "similar" run against a thinning index until it finishes, which is why the
 popup states the photo count before it asks for confirmation.
 
+**Every vector records the slot that made it.** The `embed` stage stamps the
+**resolved** `image_embed` catalog key on `photos.embedding_model` (§6) — the column
+the photo page shows ("Embedded for semantic search (…)", §13). The env override is
+not the answer, and neither is a hardcoded id: reading `embed_model_name` directly
+made every photo claim `siglip2-so400m-patch14-384` regardless of the selection, the
+same bug the chat header had. A stamp that is **not** a catalog key is therefore a
+legacy one, and the next drain pass relabels it to the current slot rather than
+re-embedding a library to correct a string — the vectors were always the slot's,
+since only the `models` service ever picks the model (§5.1).
+
 The `models` service holds no database, so it cannot read the choice itself: it
-starts on the profile defaults and exposes a **`generation`** counter with its
-current slots. `app` compares that generation on the resource-bar poll it already
-makes (§13) and re-pushes when they diverge — so a `models` restart converges back
-to the user's selection without a coordinating store.
+starts on the profile defaults and reports **which model each slot currently holds**
+(on `GET /resources` and `GET /models`, alongside a `generation` counter that moves
+on every switch). `app` compares those reported slots with its own resolved selection
+on the resource-bar poll it already makes (§13) and re-pushes when they differ — so a
+`models` restart converges back to the user's selection without a coordinating store,
+and no second polling loop exists. The `generation` is what invalidates the caller's
+cached `/embed/spec` (§5.1).
 
 ## 5. Architecture
 
@@ -401,10 +428,10 @@ flowchart TB
         sync["ivms777-sync CLI<br/>plan · apply · undo · verify"]
     end
 
-    subgraph gpu["The GPU box · docker compose"]
+    subgraph gpu["The GPU box · docker compose (jetson/cloud) · host processes (mac)"]
         app["app · FastAPI + Jinja + HTMX<br/>UI · read queries · upload receipt · /api/manifest<br/>NO models, NO torch — a thin client of the models service"]
         worker["worker · ingest pipeline (primary writer)<br/>facets · thumbs · taxonomy · caption · memories · deletions<br/>NO models, NO torch — a thin client of the models service"]
-        models["models · THE ONE INFERENCE GATEWAY (§5.1)<br/>the only process that imports torch/transformers AND the only client of the inference server<br/>hosts the image/text embedder in KILLABLE TorchWorker children (parent imports no torch) · memory governor swaps embedder↔LLM under budget (§8.1)<br/>owns the model slots + downloads (§4.1)<br/>HTTP: /embed/image · /embed/text · /embed/spec · /tag · /caption · /plan · /chat · /resources · /models/*"]
+        models["models · THE ONE INFERENCE GATEWAY (§5.1)<br/>the only process that imports torch/transformers AND the only client of the inference server<br/>hosts the image/text embedder in KILLABLE TorchWorker children (parent imports no torch) on the GPU — mps (mac) / cuda (jetson, cloud), NEVER cpu (§3.1) · memory governor swaps embedder↔LLM under budget (§8.1)<br/>owns the model slots + downloads (§4.1)<br/>HTTP: /embed/image · /embed/text · /embed/spec · /tag · /caption · /plan · /chat · /resources · /models/*"]
         infer["inference · llama.cpp llama-server (mac/jetson) | vLLM (cloud)<br/>ONE gemma4-E2B GGUF — text (planner/chat) AND vision (caption), on the GPU<br/>reached ONLY by the models service · (host on mac, container on jetson/cloud)"]
         db[("SQLite WAL<br/>sqlite-vec + FTS5 · named volume")]
         store[("Storage<br/>originals + thumbnails")]
@@ -449,10 +476,11 @@ unified memory.
 
 **One implementation, both platforms.** The `models` service is the same code on
 mac and jetson; only its *internals* switch by profile: SigLIP and the nomic
-caption-text embedder run on **CPU** on mac and **CUDA** on jetson, and captioning
-is the same OpenAI `/v1` call to `llama-server` on both (host on mac, container on
-jetson). The service picks these from config; `app`/`worker` and the whole request
-flow are identical across platforms.
+caption-text embedder run on **MPS** on mac and **CUDA** on jetson — always a GPU,
+never the CPU (§3.1) — and captioning is the same OpenAI `/v1` call to
+`llama-server` on both (host on mac, container on jetson). The service picks these
+from config; `app`/`worker` and the whole request flow are identical across
+platforms.
 
 `ivms777-sync` is not part of the deployment. It talks to `app` over HTTP,
 reads one endpoint, and is the only component that ever writes to your disk.
@@ -531,8 +559,9 @@ HTTP.
 **Backends, chosen by profile inside the service (one implementation, both
 platforms):**
 
-- **SigLIP** in a `TorchWorker` child — `embed_device=cpu` on mac, `cuda` on
-  jetson/cloud. Image **bytes** cross the worker pipe; the child does the decode.
+- **SigLIP** in a `TorchWorker` child — `embed_device=mps` on mac, `cuda` on
+  jetson/cloud; never `cpu` (§3.1). Image **bytes** cross the worker pipe; the
+  child does the decode.
 - **Captioning** — an OpenAI `/v1/chat/completions` call to `llama-server`
   (mac/jetson) / vLLM (cloud); the same gemma4-E2B GGUF that answers text also does
   vision on the GPU (§3.1/§4). No in-process caption VLM.
@@ -721,8 +750,10 @@ All model work lives in the one `models` service (§5.1), so residency is an
 (`modelsvc/governor.py`), driven by the `Scheduler` (`modelsvc/scheduler.py`),
 makes the models each op needs resident and **evicts** non-needed, non-pinned
 residents (LRU, oldest first) whenever the `budget_mb` ceiling *or* the measured
-free RAM says they will not fit. Each model registers a `load`/`free` pair and a
-**resident cost** (`IVMS777_MODEL_COST_MB`); that cost must track the model's real
+free RAM says they will not fit. Each unit registers a `load`/`free` pair and a
+**resident cost** — the selected catalog entry's `cost_mb` (§4.1), which
+`IVMS777_MODEL_COST_MB` can override per unit on a board that measures differently;
+that cost must track the model's real
 footprint, because the eviction guard is `free >= cost + headroom` — an
 under-estimate loads a model on top of one that should have been evicted and OOMs
 the box (the gemma "connection refused" bug).
@@ -751,7 +782,7 @@ child) and SigLIP (~3.3 GB) + nomic (~2.1 GB) do **not** fit together, so the go
 **swaps** them across the embed↔caption boundary: SigLIP is evicted to load gemma for a
 caption/chat, and reloaded for the next embed. Those two figures are each child's WHOLE
 footprint — its torch import and CUDA context included — because eviction kills the
-child, and they are what `IVMS777_MODEL_COST_MB` must carry.
+child, and they are what the catalog's `cost_mb` must carry.
 
 **A model is loaded with `device_map=<device>`, NEVER `.to(device)`.** `.to()`
 materialises every weight in host RAM first, and that copy is never released: measured
@@ -775,7 +806,7 @@ release (cache clear + `gc` + `empty_cache` + `ipc_collect`) it still holds **~2
 with the CUDA driver reporting only ~2.4 GB device-free —
 `torch.cuda.memory_reserved()` is ~20 MB at that point, so torch has let go and the
 CUDA context has not. `malloc_trim` plus clearing the cuBLAS workspaces recover ~50 MB
-between them. That residue is exactly the RAM gemma-vision (~3.9 GB measured) needs, so the
+between them. That residue is exactly the RAM `llm_vision` (~3.9 GB measured) needs, so the
 in-process swap did not work: `llama-server` aborted at load or at image decode and
 every caption failed until the container was restarted.
 
@@ -801,7 +832,7 @@ evicts SigLIP + nomic so a single gemma has the GPU to itself. But "within budge
 means `model_cost_mb[name] + headroom_mb <= ram_budget_mb`, and a model that breaks
 that inequality can **never** load, on any amount of free RAM: eviction cannot help,
 so the governor refuses every time. **An over-estimated cost is therefore NOT the
-safe direction** — past a point it is fatal. `gemma-vision` was declared at 5000
+safe direction** — past a point it is fatal. `gemma-vision` (now `llm_vision`) was declared at 5000
 against a 5000 jetson budget and a 512 MB headroom, so `5000 + 512 > 5000` raised
 `InsufficientMemory` on every caption and the entire stage failed on an idle board
 with 5.6 GB free. Every entry in `model_cost_mb` must satisfy that inequality for
@@ -820,9 +851,9 @@ chat UI; the only fix is to **shrink gemma's GPU footprint** so it fits — a sm
 context, a Q8 vision projector (§3.1), smaller weights — **never** a CPU offload. A
 "(no answer)" bubble is a bug, not an outcome.
 
-Implementation detail — the `use()` guard, the retired caption-preemption path, and
-the `/resources` fields — is in
-[`docs/ingest-pipeline.md`](ingest-pipeline.md#in-process-residency--siglip-ensure-loaded).
+Implementation detail — how a sub-backend names the units it needs, the retired
+caption-preemption path, and the `/resources` fields — is in
+[`docs/ingest-pipeline.md`](ingest-pipeline.md#in-process-residency--the-model-conveyor).
 
 ## 9. Retrieval
 
@@ -950,6 +981,21 @@ positive.
 with nothing genuinely like it in the library returns **fewer results, or none** —
 never a full strip of the best of a bad set.
 
+**Two gate profiles — `STRICT` and `LOOSE`.** The strip shows `STRICT`: every gate in
+the top few per cent of its distribution, so a result is there because something real
+matched. When `STRICT` does not fill the strip, a **"Show more"** button offers
+`LOOSE` — the same signals at the same weights, admitted at lower bars. Only gates
+relax; changing weights would reshuffle results that already rank below the strict
+ones and make the two passes incomparable. `LOOSE` still obeys the noise-floor rule
+above, which is what makes "looser" honest rather than invented.
+
+The loose results are **appended, never merged**, so a weak match can never outrank a
+real one, and they exclude everything the strict pass already showed. They are dimmed
+and captioned so the difference is visible. This is where a *moment-only* pair belongs:
+measured on the library, a tire close-up matched a plastic container photographed the
+same minute — the same outing, an unrelated object. Worth offering, not worth putting
+in the default strip.
+
 Each result carries its **top-3 reasons** with a match % (§13), ordered by **what
 actually drove the match** — not by the biggest percentage. `quality: sharp` agrees at
 100 % on almost every pair and drives ~0.01; sorting by percentage put it at the top of
@@ -976,10 +1022,15 @@ flowchart TB
     c --> gate
     gate -->|no| drop["not similar<br/>(where/look/quality only RERANK,<br/>they never qualify)"]
     gate -->|yes| score["evidence = weight × strength<br/>score = 1 − Π(1 − evidence) · noisy-OR<br/>→ true 0–1; weak signals cannot stack"]
-    score --> floor{"score ≥ similar_score_min?"}
+    score --> floor{"score ≥ score_min?"}
     floor -->|no| drop
     floor -->|yes| reasons["top-3 reasons, strongest DRIVER first<br/>+ match % · overlaid on each thumbnail (§13)"]
+    drop -.->|"STRICT strip not full →<br/>'Show more' re-runs with LOOSE gates"| sig
+    reasons --> strip["STRICT strip (k=12)<br/>+ LOOSE tail APPENDED below, dimmed,<br/>minus everything strict already showed"]
 ```
+
+The dotted edge is the only way `LOOSE` is ever reached: the user asks for it, on a
+strip the strict pass could not fill.
 
 ### 9.1 Query planner
 
@@ -1298,6 +1349,10 @@ that the four top-level links swap without re-rendering the nav. The routes:
   by `/settings/models`: one section per model slot (§4.1), the selectable catalog
   entries as radios with the current one checked, each showing its download size,
   RAM cost (flagged when estimated), and either "on disk" or a live download bar.
+  An entry that is **part** on disk says so and offers only the remainder — two
+  slots share a file whenever the caption entry is the planner's weights plus a
+  vision projector, so the same model reads "on disk" in one slot and "absent" in
+  the other, and offering the full size there would overstate it by GB.
   Choosing a different model states what the switch re-runs and for how many
   photos, and only then offers **Switch**. It is an **overlay, not a layer** — it
   pushes no history entry and changes no URL, so §13.1's `[grid, leaf]` invariant is

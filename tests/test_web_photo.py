@@ -208,3 +208,80 @@ def test_similar_layer_shows_both_photos_own_words_before_the_table(client):
     assert head.index("Beach day") < head.index("Park day")  # Base, then This
     # …and the leaf's own block below the table does not repeat them.
     assert body.count("Park day") == 1
+
+
+# --- "Show more" — the loose tail (§9) --------------------------------------
+
+
+def _moment_photo(ctx, content_hash, *, shot_at, caption):
+    """A photo that shares only a MOMENT with the base — no vector, no tags. Its
+    only route into the strip is the loose pass."""
+    return add_photo(
+        ctx.conn, content_hash=content_hash, thumb_key=f"{content_hash[:4]}.jpg",
+        caption=caption, shot_at=shot_at, gps_lat=42.0, gps_lon=42.0,
+    )
+
+
+def test_show_more_is_offered_only_when_the_strict_strip_is_short(client):
+    ctx = client.app.state.context
+    base = _first_id(client)
+    write_vector(ctx.conn, base, FakeEmbedder().embed_texts(["a"])[0])
+    body = client.get(f"/photo/{base}/similar").text
+    assert "Show more" in body
+
+
+def test_show_more_reveals_looser_matches_the_strict_pass_refused(client):
+    ctx = client.app.state.context
+    base = _first_id(client)
+    ctx.conn.execute(
+        "UPDATE photos SET shot_at = ?, gps_lat = 42.0, gps_lon = 42.0 WHERE id = ?",
+        ("2023-12-01T14:00:00", base),
+    )
+    write_vector(ctx.conn, base, FakeEmbedder().embed_texts(["a"])[0])
+    # Same minute, same spot, but nothing else in common — a moment-only pair.
+    nearby = _moment_photo(ctx, "dd" * 32, shot_at="2023-12-01T14:02:00", caption="something else")
+
+    strict = client.get(f"/photo/{base}/similar").text
+    assert f"/thumb/{nearby}" not in strict          # too weak for the default strip
+
+    loose = client.get(f"/photo/{base}/similar?loose=1").text
+    assert f"/thumb/{nearby}" in loose               # …but worth offering
+    assert "same time &amp; place" in loose
+    assert "similar-loose" in loose                  # rendered as visibly weaker
+
+
+def test_the_loose_pass_never_repeats_a_strict_result(client):
+    ctx = client.app.state.context
+    fake = FakeEmbedder()
+    base = _first_id(client)
+    write_vector(ctx.conn, base, fake.embed_texts(["a"])[0])
+    twin = add_photo(ctx.conn, content_hash="ee" * 32, thumb_key="ee.jpg")
+    write_vector(ctx.conn, twin, fake.embed_texts(["a"])[0])   # identical → strict hit
+
+    assert f"/thumb/{twin}" in client.get(f"/photo/{base}/similar").text
+    assert f"/thumb/{twin}" not in client.get(f"/photo/{base}/similar?loose=1").text
+
+
+def test_a_loose_thumbnail_pages_within_the_expanded_set(client):
+    """§13.1 rule 6: prev/next moves within the layer the user can SEE. A loose
+    thumbnail carries `:more`, so its layer is strict + loose, not strict alone."""
+    ctx = client.app.state.context
+    base = _first_id(client)
+    ctx.conn.execute(
+        "UPDATE photos SET shot_at = ?, gps_lat = 42.0, gps_lon = 42.0 WHERE id = ?",
+        ("2023-12-01T14:00:00", base),
+    )
+    write_vector(ctx.conn, base, FakeEmbedder().embed_texts(["a"])[0])
+    nearby = _moment_photo(ctx, "ff" * 32, shot_at="2023-12-01T14:02:00", caption="something else")
+
+    loose = client.get(f"/photo/{base}/similar?loose=1").text
+    assert f'href="/photo/{nearby}?ctx=similar:{base}:more"' in loose
+
+    # The expanded layer resolves — same origin identity, and close still goes UP
+    # to the origin photo exactly like the plain similar layer. This is also the
+    # regression guard for the separator: `+more` decoded to a SPACE in the query
+    # string, so the origin lookup failed and the layer silently fell back to the
+    # whole library — losing the user's place, which §13.1 forbids.
+    body = client.get(f"/photo/{nearby}?ctx=similar:{base}:more").text
+    assert "Similar to" in body
+    assert f'class="photo-close" href="/photo/{base}?ctx=library"' in body

@@ -57,7 +57,7 @@ def test_model_info_comes_from_the_service_metrics_never_do(settings, monkeypatc
 
     class ChattyClient:
         def resources(self, timeout=None):
-            return {"resident": ["gemma-vision"], "active": "captioning",
+            return {"resident": ["llm_vision"], "active": "captioning",
                     "gpu_pct": 999.0, "cpu_c": 999.0}
 
     shown = snapshot(
@@ -70,13 +70,13 @@ def test_model_info_comes_from_the_service_metrics_never_do(settings, monkeypatc
 
 
 def test_resident_keys_render_as_full_model_names():
-    # The bar must name the MODEL that is loaded, not the conveyor's internal key:
-    # "gemma" reads as the planner model, "gemma-vision" as the caption model in its
-    # vision mode (design §3.1/§13).
+    # The bar must name the MODEL that is loaded, not the conveyor's internal unit:
+    # `llm` reads as the planner slot's model, `llm_vision` as the caption slot's in
+    # its vision mode (design §3.1/§4.1/§13).
     from models.resources import display_names
 
     shown = display_names(
-        ["siglip", "gemma"],
+        ["image_embed", "llm"],
         planner_model="gemma4-E2B",
         caption_model="gemma4-E2B",
         embed_model="siglip2-so400m-patch14-384",
@@ -85,7 +85,7 @@ def test_resident_keys_render_as_full_model_names():
     assert shown == ["siglip2-so400m-patch14-384", "gemma4-E2B"]
 
     vision = display_names(
-        ["gemma-vision"],
+        ["llm_vision"],
         planner_model="gemma4-E2B",
         caption_model="gemma4-E2B",
         embed_model="s",

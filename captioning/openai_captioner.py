@@ -22,13 +22,18 @@ class OpenAICaptioner:
     """Captioning over the OpenAI-compatible inference backend (llama-server on
     mac/jetson, vLLM on cloud) — one image request per photo (design §4)."""
 
-    def __init__(self, client, model: str):
+    def __init__(self, client, model: str, *, prompt_key: str | None = None):
         self._client = client
         self.name = model
+        # The name STORED with every caption and sent as the OpenAI `model` field.
         self.caption_model = model
+        # Which prompt template to use (`models/catalog.py`'s `prompt_template`,
+        # design §4.1). Defaults to the model name, which is what it was before
+        # slots existed.
+        self.prompt_key = prompt_key or model
 
     def caption(self, image: bytes) -> CaptionResult:
-        msgs = caption_messages(self.caption_model, encode_image(image))
+        msgs = caption_messages(self.prompt_key, encode_image(image))
         raw = self._client.complete(self.caption_model, msgs, json_schema=CAPTION_SCHEMA)
         obj = json.loads(raw)
         return CaptionResult(obj["caption"], obj["title"], obj["description"])

@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from chat.prefs import set_prefs
 from config import Settings
+from db.settings import set_setting
 from embedding.fakes import FakeEmbedder
 from embedding.store import write_caption_vector, write_vector
 from embedding.vectors import l2_normalize
@@ -62,6 +63,19 @@ def test_stream_emits_tokens_then_done_no_candidate_strip(chat_client):
 
 def test_chat_page_shows_the_model_in_use(chat_client):
     assert 'id="chat-model"' in chat_client.get("/chat").text
+
+
+def test_chat_names_the_selected_planner_slot_not_the_profile_default(chat_client):
+    # The chat header must name the model the `planner` slot HOLDS (§4.1), not the
+    # env/profile default: reading `settings.planner_model` said `gemma4-E2B` while
+    # the resident model was the one picked in the settings popup.
+    conn = chat_client.app.state.context.conn
+    set_setting(conn, 1, "model_slot.planner", "qwen3-vl-8b")
+    assert "qwen3-vl-8b" in chat_client.get("/chat").text
+
+    done = [ln for ln in chat_client.get("/chat/stream?q=beach").text.splitlines()
+            if ln.startswith("data:") and "model" in ln][-1]
+    assert json.loads(done[len("data:"):])["model"] == "qwen3-vl-8b"
 
 
 def test_stream_done_event_reports_model_and_decode_speed(chat_client):

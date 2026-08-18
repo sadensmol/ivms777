@@ -73,9 +73,8 @@ vocab.yaml                                                    (plan 04)
 ivms777_sync/          # stage 2 — separate package, separate entry point (plan 09)
   cli.py               # plan | apply | undo | verify
   client.py / scan.py / plan.py / apply.py / journal.py
-compose.yaml
-compose.mac.yaml       # profile overrides
-compose.jetson.yaml
+compose.yaml           # jetson/cloud only — mac is host-native (design §3.1)
+compose.jetson.yaml    # profile overrides
 compose.cloud.yaml
 tests/
 docs/

@@ -93,8 +93,10 @@ def test_visually_different_photos_from_one_moment_are_similar(conn):
            caption="a birthday cake with candles")
     _photo(conn, 2, shot_at="2023-12-01T14:03:00", lat=42.0, lon=42.0,
            caption="a crowd of people singing")
-    results = similar_photos(conn, owner_id=1, photo_id=1, k=5,
-                             score_min=signals.SCORE_MIN)
+    # Moment-only, so it does not make the STRICT strip — it is what "Show more"
+    # reveals (§9): same outing, but the photos share nothing else.
+    assert similar_photos(conn, owner_id=1, photo_id=1, k=5) == []
+    results = similar_photos(conn, owner_id=1, photo_id=1, k=5, loose=True)
     assert [r["id"] for r in results] == [2]
     assert results[0]["reasons"][0]["text"] == "same time & place"
 
@@ -112,8 +114,10 @@ def test_a_distant_photo_is_not_pulled_in_by_the_moment(conn):
            caption="a birthday cake with candles")
     _photo(conn, 2, shot_at="2024-06-01T09:00:00", lat=10.0, lon=10.0,
            caption="a mountain ridge at dawn")
-    assert similar_photos(conn, owner_id=1, photo_id=1, k=5,
-                          score_min=signals.SCORE_MIN) == []
+    assert similar_photos(conn, owner_id=1, photo_id=1, k=5) == []
+    # Not even the loose pass reaches it — a different day and 5 km away is not a
+    # weaker match, it is no match.
+    assert similar_photos(conn, owner_id=1, photo_id=1, k=5, loose=True) == []
 
 
 def test_the_panel_reports_the_actual_gap(conn):

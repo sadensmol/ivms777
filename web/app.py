@@ -67,7 +67,10 @@ from ingest.jobs import (
 from ingest.pipeline import drain_pass
 from ingest.thumbs import thumb_key
 from ingest.vocab import load_vocab, seed_tags
+from models import catalog as model_catalog
+from models import slots as model_slots
 from models.resources import snapshot
+from search import signals
 from search.dates import date_where
 from search.facets import (
     SIDEBAR_GROUPS,
@@ -140,6 +143,11 @@ def _order_clause(sort: str | None) -> tuple[str, list]:
     return clause, [facet_key]
 
 
+# How many photos the similar strip holds. Anything the STRICT gates did not
+# admit lives behind "Show more" (§9), never mixed in with the real matches.
+SIMILAR_K = 12
+
+
 def create_app(settings: Settings) -> FastAPI:
     app = FastAPI(title="ivms777")
     app.state.context = build_context(settings)
@@ -163,6 +171,17 @@ def create_app(settings: Settings) -> FastAPI:
 
     def context() -> AppContext:
         return app.state.context
+
+    def planner_model() -> str:
+        """The model the `planner` slot holds RIGHT NOW (§4.1).
+
+        `settings.planner_model` is only the env override that feeds the resolver —
+        it is NOT the answer. Reading it directly made the chat header say
+        `gemma4-E2B` (the profile default) while the resident model was the
+        `qwen3-vl-8b` the user had picked in the settings popup.
+        """
+        ctx = context()
+        return model_slots.resolve_key(ctx.conn, ctx.settings, "planner")
 
     # Memories build state. Single-owner (§3.2): one build at a time per process.
     # `inference_override`/`queue_inference`/`await_build` are test seams so the
@@ -334,14 +353,31 @@ def create_app(settings: Settings) -> FastAPI:
     @app.get("/api/resources")
     def resources() -> JSONResponse:
         ctx = context()
-        return JSONResponse(snapshot(
+        client = ctx.settings.build_models_client()
+        selected = model_slots.resolve_keys(ctx.conn, ctx.settings)
+        snap = snapshot(
             ctx.conn,
-            planner_model=ctx.settings.planner_model or "fake",
-            caption_model=ctx.settings.caption_model or "fake",
-            embed_model=ctx.settings.embed_model_name,
-            text_embed_model=ctx.settings.text_embed_model,
-            models_client=ctx.settings.build_models_client(),
-        ))
+            planner_model=selected["planner"],
+            caption_model=selected["caption"],
+            embed_model=selected["image_embed"],
+            text_embed_model=selected["text_embed"],
+            models_client=client,
+        )
+        # The `models` service holds no DB (§4.1): a restart puts it back on the
+        # profile defaults. This poll already runs every ~2 s, so it is where the
+        # user's stored selection is put back — no second polling loop, no lease.
+        _repush_slots(client, snap.get("slots") or {}, selected)
+        return JSONResponse(snap)
+
+    def _repush_slots(client, reported: dict, selected: dict) -> None:
+        if not reported or reported == selected:
+            return
+        if not any(model_catalog.is_switchable(slot, settings.profile) for slot in selected):
+            return
+        try:
+            client.set_slots(selected)
+        except Exception:  # noqa: BLE001 - best effort; the next poll tries again
+            logger.warning("could not push model slots to the models service")
 
     @app.get("/library", response_class=HTMLResponse)
     def library(request: Request):
@@ -353,7 +389,7 @@ def create_app(settings: Settings) -> FastAPI:
             # are removable without re-planning.
             ctx = context()
             client, _ = ctx.settings.build_inference_client()
-            spec = plan(client, ctx.settings.planner_model or "fake", query,
+            spec = plan(client, planner_model(), query,
                         list(vocab.dimensions))
             target = spec_to_params(spec, query=query, dimensions=list(vocab.dimensions))
             return RedirectResponse("/library?" + urlencode(target), status_code=303)
@@ -387,6 +423,147 @@ def create_app(settings: Settings) -> FastAPI:
                 "query": _query_string(params),
             },
         )
+
+    # --- the ⚙ settings popup: model slots (design §4.1, §13) ----------------
+    # It is an OVERLAY, not a route: these render a fragment into a <dialog>, so
+    # nothing here pushes history or changes the URL (§13.1 stays untouched).
+    _SLOT_META = {
+        "image_embed": (
+            "Image embeddings",
+            "Search, zero-shot tags and visual similarity.",
+        ),
+        "text_embed": (
+            "Caption text embeddings",
+            "How close two captions are in meaning (“similar photos”).",
+        ),
+        "caption": ("Captions", "The title and description written for each photo."),
+        "planner": ("Planner & chat", "Reads your question and writes the answer."),
+    }
+
+    def _settings_view(select: str | None) -> dict:
+        ctx = context()
+        selected = model_slots.resolve_keys(ctx.conn, ctx.settings)
+        downloads: dict[tuple[str, str], dict] = {}
+        error = None
+        try:
+            payload = ctx.settings.build_models_client().catalog()
+            downloads = {(e["slot"], e["key"]): e["download"] for e in payload["entries"]}
+        except Exception as exc:  # noqa: BLE001 - the popup still lists the catalog
+            error = f"the models service is unreachable ({type(exc).__name__})"
+        chosen_slot, _, chosen_key = (select or "").partition(":")
+
+        sections = []
+        for slot in model_catalog.SLOTS:
+            title, blurb = _SLOT_META[slot]
+            switchable = model_catalog.is_switchable(slot, ctx.settings.profile)
+            entries = []
+            for entry in model_catalog.entries_for(slot, ctx.settings.profile):
+                download = downloads.get(
+                    (slot, entry.key), {"state": "unknown", "bytes": 0, "total": 0, "error": None}
+                )
+                total = download.get("total") or 0
+                # What is on disk already. A slot's entry can be PART downloaded
+                # because two slots share a file — `caption` and `planner` differ
+                # only by the vision projector — so offering the whole download
+                # would overstate the cost by several GB (§4.1).
+                have_mb = download.get("bytes", 0) / (1024 * 1024)
+                partial = download.get("state") == "absent" and have_mb >= 50
+                entries.append(
+                    {
+                        "key": entry.key,
+                        "display": entry.display,
+                        "note": entry.note,
+                        "size_gb": round(entry.size_mb / 1024, 1),
+                        "have_gb": round(have_mb / 1024, 1) if partial else None,
+                        "left_gb": round(max(entry.size_mb - have_mb, 0) / 1024, 1)
+                        if partial
+                        else None,
+                        "cost_mb": entry.cost_mb,
+                        "cost_measured": entry.cost_measured,
+                        "current": selected[slot] == entry.key,
+                        "selected": switchable and slot == chosen_slot and entry.key == chosen_key,
+                        "download": download,
+                        "pct": int(download.get("bytes", 0) * 100 / total) if total else 0,
+                    }
+                )
+            sections.append(
+                {
+                    "slot": slot,
+                    "title": title,
+                    "blurb": blurb,
+                    "switchable": switchable,
+                    "entries": entries,
+                    "confirm": _switch_confirm(slot, chosen_slot, chosen_key, switchable),
+                }
+            )
+        return {
+            "sections": sections,
+            "select": select or "",
+            "error": error,
+            "polling": any(
+                e["download"].get("state") == "downloading"
+                for section in sections
+                for e in section["entries"]
+            ),
+        }
+
+    def _switch_confirm(slot, chosen_slot, chosen_key, switchable) -> dict | None:
+        """What the switch would cost — shown BEFORE the Switch button is offered."""
+        ctx = context()
+        if not switchable or slot != chosen_slot or not chosen_key:
+            return None
+        try:
+            preview = model_slots.preview(ctx.conn, ctx.settings, slot, chosen_key)
+        except ValueError:
+            return None
+        if not preview.stages and preview.photos_requeued == 0:
+            return {"key": chosen_key, "stages": [], "photos": 0, "vectors_dropped": False}
+        return {
+            "key": chosen_key,
+            "stages": list(preview.stages),
+            "photos": preview.photos_requeued,
+            "vectors_dropped": preview.vectors_dropped,
+        }
+
+    def _settings_response(request: Request, select: str | None) -> HTMLResponse:
+        return templates.TemplateResponse(
+            request, "_settings_models.html", _settings_view(select)
+        )
+
+    @app.get("/settings/models", response_class=HTMLResponse)
+    def settings_models(request: Request, select: str = "") -> HTMLResponse:
+        return _settings_response(request, select)
+
+    @app.post("/settings/models", response_class=HTMLResponse)
+    def switch_model_slot(
+        request: Request, slot: str = Form(...), key: str = Form(...)
+    ) -> HTMLResponse:
+        ctx = context()
+        try:
+            model_slots.switch(ctx.conn, ctx.settings, slot, key)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # The DB is the source of truth; a service that refuses or is down is
+        # re-pushed by the next resources poll, so this never rolls back the switch.
+        try:
+            ctx.settings.build_models_client().set_slots(
+                model_slots.resolve_keys(ctx.conn, ctx.settings)
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("model slots stored but not pushed; the next poll retries")
+        return _settings_response(request, None)
+
+    @app.post("/settings/models/download", response_class=HTMLResponse)
+    def download_model(
+        request: Request, slot: str = Form(...), key: str = Form(...)
+    ) -> HTMLResponse:
+        if not model_catalog.has(slot, key):
+            raise HTTPException(status_code=400, detail=f"unknown model: {slot}/{key}")
+        try:
+            context().settings.build_models_client().download(slot, key)
+        except Exception as exc:  # noqa: BLE001 - shown in the fragment, blocks nothing
+            logger.warning("download of %s/%s could not be started: %s", slot, key, exc)
+        return _settings_response(request, f"{slot}:{key}")
 
     @app.post("/reprocess")
     def reprocess_library(
@@ -478,7 +655,7 @@ def create_app(settings: Settings) -> FastAPI:
         ctx = context()
         if not app.state.memories_building:
             client = app.state.inference_override or ctx.settings.build_inference_client()[0]
-            model = ctx.settings.planner_model or "fake"
+            model = planner_model()
             owner_id = ctx.settings.owner_id
             app.state.memories_building = True
             app.state.memories_progress = {"done": 0, "total": 0}
@@ -591,18 +768,13 @@ def create_app(settings: Settings) -> FastAPI:
         if ctx_param and ctx_param.startswith("similar:"):
             # Drilled into a photo FROM another photo's "similar" strip: this layer
             # IS that origin photo's similar set, and it pages within it (§9, §13).
-            origin = _lookup_photo(ctx.conn, owner, ctx_param.split(":", 1)[1])
+            origin_key, with_loose = _parse_similar_ctx(ctx_param)
+            origin = _lookup_photo(ctx.conn, owner, origin_key)
             if origin is not None:
-                ids = [
-                    r["id"] for r in similar_photos(
-                        ctx.conn, owner, origin["id"], k=12,
-                        min_cosine=ctx.settings.similar_min_cosine,
-                        caption_min=ctx.settings.similar_caption_min,
-                        score_min=ctx.settings.similar_score_min,
-                        dimension_weights=vocab.dimension_weights,
-                        use_captions=ctx.settings.similar_use_captions,
-                    )
-                ]
+                rows = _similar_strip(ctx, origin["id"], loose=False)
+                if with_loose:
+                    rows = rows + _similar_strip(ctx, origin["id"], loose=True)
+                ids = [r["id"] for r in rows]
                 label = origin["ai_title"] or origin["caption"] or f"photo #{origin['id']}"
                 return {
                     "ids": ids, "title": f"Similar to {label}", "description": None,
@@ -684,10 +856,53 @@ def create_app(settings: Settings) -> FastAPI:
             # The origin photo is the ONE extra level above a similar leaf: close
             # returns to it (carrying the library's own state so ITS close still
             # lands on the filtered grid), and closing there goes up to the grid.
-            origin_id = ctx_param.split(":", 1)[1]
+            origin_id, _ = _parse_similar_ctx(ctx_param)
             sep = "&" if library_query else ""
             return f"/photo/{origin_id}?ctx=library{sep}{library_query}"
         return library_url
+
+
+    def _parse_similar_ctx(ctx_param: str) -> tuple[str, bool]:
+        """`similar:<id>` -> (id, False); `similar:<id>:more` -> (id, True).
+
+        The `:more` suffix is set on thumbnails revealed by "Show more", so prev/next
+        pages the set the user can actually SEE and never walks into photos that were
+        never on screen (§13.1 rule 6). Everything else about the layer is identical,
+        so `close` still goes origin → grid.
+
+        A COLON, not a `+`: in a query string `+` decodes to a space, so `similar:67+more`
+        arrived as `similar:67 more`, the photo lookup failed, and the layer silently
+        fell back to the whole library — losing the user's place, which §13.1 forbids.
+        """
+        raw = ctx_param.split(":", 1)[1]
+        return (raw[: -len(":more")], True) if raw.endswith(":more") else (raw, False)
+
+    def _similar_strip(ctx, photo_id: int, *, loose: bool) -> list[dict]:
+        """The similar strip for one photo (§9).
+
+        `loose=False` is the default strip: strict gates, so a result is there because
+        something real matched. `loose=True` returns ONLY the extra photos "Show more"
+        reveals — the loose pass minus everything the strict pass already showed, so
+        the two never overlap and a weak match can never outrank a real one.
+        """
+        strict = similar_photos(
+            ctx.conn, ctx.settings.owner_id, photo_id, k=SIMILAR_K,
+            min_cosine=ctx.settings.similar_min_cosine,
+            caption_min=ctx.settings.similar_caption_min,
+            score_min=ctx.settings.similar_score_min,
+            dimension_weights=vocab.dimension_weights,
+            use_captions=ctx.settings.similar_use_captions,
+        )
+        if not loose:
+            return strict
+        seen = {s["id"] for s in strict}
+        wider = similar_photos(
+            ctx.conn, ctx.settings.owner_id, photo_id, k=SIMILAR_K + signals.LOOSE_LIMIT,
+            dimension_weights=vocab.dimension_weights,
+            use_captions=ctx.settings.similar_use_captions,
+            loose=True,
+        )
+        return [s for s in wider if s["id"] not in seen][: signals.LOOSE_LIMIT]
 
     @app.get("/photo/{photo_id}", response_class=HTMLResponse)
     def photo_detail(request: Request, photo_id: int) -> HTMLResponse:
@@ -779,15 +994,9 @@ def create_app(settings: Settings) -> FastAPI:
         ).fetchone()
         if photo is None:
             raise HTTPException(status_code=404)
-        similar = similar_photos(
-            ctx.conn, ctx.settings.owner_id, photo_id, k=12,
-            min_cosine=ctx.settings.similar_min_cosine,
-            caption_min=ctx.settings.similar_caption_min,
-            score_min=ctx.settings.similar_score_min,
-            dimension_weights=vocab.dimension_weights,
-            use_captions=ctx.settings.similar_use_captions,
-        )
         params = _params(request)
+        loose = params.get("loose") == "1"
+        similar = _similar_strip(ctx, photo_id, loose=loose)
         ctx_param = params.get("ctx")
         _collection, ctx_param, ids = _collection_for_photo(ctx_param, params, photo_id)
         collection_grid = ids if _has_member_collage(ctx_param) else None
@@ -797,7 +1006,12 @@ def create_app(settings: Settings) -> FastAPI:
             members = set(collection_grid)
             similar = [s for s in similar if s["id"] not in members]
         return templates.TemplateResponse(
-            request, "_similar.html", {"photo": photo, "similar": similar},
+            request, "_similar.html",
+            {"photo": photo, "similar": similar, "loose": loose,
+             # Offer "Show more" only when the strict pass did not fill the strip —
+             # a full strip already has more than anyone scrolls.
+             "can_widen": not loose and len(similar) < SIMILAR_K,
+             "ctx_query": urlencode({k: v for k, v in params.items() if k != "loose"})},
         )
 
     def progress_payload() -> dict:
@@ -876,7 +1090,7 @@ def create_app(settings: Settings) -> FastAPI:
             request, "chat.html",
             {
                 "messages": messages,
-                "model": ctx.settings.planner_model or "fake",
+                "model": planner_model(),
                 "prefs": prefs,
             },
         )
@@ -910,7 +1124,7 @@ def create_app(settings: Settings) -> FastAPI:
         ctx = context()
         owner_id = ctx.settings.owner_id
         client, _ = ctx.settings.build_inference_client()
-        model = ctx.settings.planner_model or "fake"
+        model = planner_model()
         session_id = current_session(ctx.conn, owner_id)
 
         # "Thinking" is the wait BEFORE the answer starts — from the request landing

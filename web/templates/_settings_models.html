@@ -1,0 +1,118 @@
+{# The ⚙ popup's body: one section per model slot (design §4.1, §13).
+
+   Rendered into <dialog id="settings"> — an OVERLAY, never a route: no history
+   entry, no URL change, so §13.1's [grid, leaf] invariant is untouched.
+
+   Selecting a radio re-renders THIS fragment with `?select=slot:key`, so the
+   consequence line is computed server-side (one source of truth for what a switch
+   re-runs). Polling only exists while a download is actually in flight. #}
+<div id="settings-body"
+     {% if polling %}hx-get="/settings/models?select={{ select }}"
+     hx-trigger="every 1s"
+     hx-target="#settings-body"
+     hx-swap="outerHTML"{% endif %}>
+
+  <h2 class="settings-title">Models</h2>
+  {% if error %}<p class="settings-error">Download state unavailable — {{ error }}.</p>{% endif %}
+
+  {% for section in sections %}
+    <section class="slot" data-slot="{{ section.slot }}">
+      <h3>{{ section.title }}</h3>
+      <p class="slot-blurb">{{ section.blurb }}</p>
+      {% if not section.switchable %}
+        <p class="slot-locked">Not switchable on this profile — the model is served
+          by the inference container and set in config.</p>
+      {% endif %}
+
+      <ul class="model-list">
+        {% for entry in section.entries %}
+          <li class="model {% if entry.current %}is-current{% endif %}">
+            <label>
+              {% if section.switchable %}
+                <input type="radio"
+                       name="slot-{{ section.slot }}"
+                       value="{{ entry.key }}"
+                       {% if entry.selected or (entry.current and not section.confirm) %}checked{% endif %}
+                       hx-get="/settings/models?select={{ section.slot }}:{{ entry.key }}"
+                       hx-target="#settings-body"
+                       hx-swap="outerHTML">
+              {% endif %}
+              <span class="model-name">{{ entry.display }}</span>
+              {% if entry.current %}<span class="badge badge-current">in use</span>{% endif %}
+            </label>
+
+            <p class="model-meta">
+              {{ entry.size_gb }} GB download ·
+              {{ entry.cost_mb }} MB RAM{% if not entry.cost_measured %}
+                <span class="badge badge-estimate">estimated</span>{% endif %}
+              ·
+              {% if entry.download.state == "ready" %}
+                <span class="state-ready">on disk</span>
+              {% elif entry.download.state == "downloading" %}
+                <progress value="{{ entry.pct }}" max="100"></progress>
+                <span class="state-downloading">{{ entry.pct }}%</span>
+              {% elif entry.download.state == "error" %}
+                <span class="state-error">download failed: {{ entry.download.error }}</span>
+                <button type="button"
+                        hx-post="/settings/models/download"
+                        hx-vals='{"slot": "{{ section.slot }}", "key": "{{ entry.key }}"}'
+                        hx-target="#settings-body"
+                        hx-swap="outerHTML">Retry</button>
+              {% elif entry.download.state == "unknown" %}
+                <span class="state-unknown">state unknown</span>
+              {% else %}
+                <button type="button"
+                        hx-post="/settings/models/download"
+                        hx-vals='{"slot": "{{ section.slot }}", "key": "{{ entry.key }}"}'
+                        hx-target="#settings-body"
+                        hx-swap="outerHTML">Download</button>
+              {% endif %}
+            </p>
+            {# Part of this entry can already be on disk because two slots share a
+               file (caption = planner's weights + the vision projector). Say so,
+               or the button looks like it will re-fetch several GB it already has. #}
+            {% if entry.have_gb %}
+              <p class="model-partial">
+                {{ entry.have_gb }} GB already on disk ·
+                <strong>{{ entry.left_gb }} GB still to fetch</strong>
+              </p>
+            {% endif %}
+            {% if entry.note %}<p class="model-note">{{ entry.note }}</p>{% endif %}
+          </li>
+        {% endfor %}
+      </ul>
+
+      {% if section.confirm %}
+        {% set confirm = section.confirm %}
+        {% set entry = section.entries | selectattr("key", "equalto", confirm.key) | first %}
+        <div class="switch-confirm">
+          {% if confirm.stages %}
+            <p>Switching re-runs <strong>{{ confirm.stages | join(", ") }}</strong>
+              for <strong>{{ confirm.photos }} photos</strong>.
+              {% if section.slot in ("image_embed", "text_embed") %}
+                Search results are incomplete until that finishes.
+              {% endif %}
+              {% if confirm.vectors_dropped %}
+                The stored image vectors are dropped — this model uses a different
+                vector width.
+              {% endif %}
+            </p>
+          {% else %}
+            <p>Switching re-runs nothing — this slot stores no output.</p>
+          {% endif %}
+          <form hx-post="/settings/models" hx-target="#settings-body" hx-swap="outerHTML">
+            <input type="hidden" name="slot" value="{{ section.slot }}">
+            <input type="hidden" name="key" value="{{ confirm.key }}">
+            <button type="submit"
+                    {% if entry and entry.download.state != "ready" %}disabled{% endif %}>
+              Switch
+            </button>
+            {% if entry and entry.download.state != "ready" %}
+              <span class="hint">Download it first.</span>
+            {% endif %}
+          </form>
+        </div>
+      {% endif %}
+    </section>
+  {% endfor %}
+</div>

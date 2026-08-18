@@ -1,5 +1,6 @@
 import math
 import sqlite3
+from dataclasses import replace
 
 from embedding.base import Embedder
 from embedding.store import all_caption_vectors, knn, read_caption_vector, read_vector, read_vectors
@@ -11,12 +12,7 @@ from search.scoring import (
     moment_contribution,
     tag_contribution,
 )
-from search.signals import (
-    CAPTION_GATE,
-    IMAGE_GATE,
-    SIGNAL_OFF,
-    moment_strength,
-)
+from search.signals import LOOSE, SIGNAL_OFF, STRICT, Gates, moment_strength
 from search.signals import dimension_weights as tier_dimension_weights
 
 # "similar" spans the photo's WHOLE character — what it is, where and when it was
@@ -80,7 +76,8 @@ CAPTION_SIGNAL_OFF = SIGNAL_OFF
 
 
 def _tag_similarity(
-    conn: sqlite3.Connection, owner_id: int, photo_id: int, weights: dict[str, float]
+    conn: sqlite3.Connection, owner_id: int, photo_id: int,
+    weights: dict[str, float], gates: Gates = STRICT,
 ) -> dict[int, list[dict]]:
     """Per-shared-tag similarity contributions to every other photo (§9).
 
@@ -125,7 +122,8 @@ def _tag_similarity(
             (tag_id, photo_id, owner_id),
         ):
             contrib = tag_contribution(
-                info["dimension"], info["label"], min(src_score, cand_score), idf, dim_weight
+                info["dimension"], info["label"], min(src_score, cand_score), idf,
+                dim_weight, gates,
             )
             if contrib is not None:
                 hits.setdefault(pid, []).append(contrib)
@@ -162,11 +160,12 @@ def similar_photos(
     owner_id: int,
     photo_id: int,
     k: int,
-    min_cosine: float = IMAGE_GATE,
-    caption_min: float = CAPTION_GATE,
+    min_cosine: float | None = None,
+    caption_min: float | None = None,
     score_min: float | None = None,
     dimension_weights: dict[str, float] | None = None,
     use_captions: bool = True,
+    loose: bool = False,
 ) -> list[dict]:
     """Photos similar to a given one, with the REASON each is similar (§9).
 
@@ -204,18 +203,23 @@ def similar_photos(
     from search.retriever import Query, candidates, refine
 
     weights = dimension_weights or DEFAULT_SIMILAR_DIMENSION_WEIGHTS
-    # A cosine can never exceed 1.0, so an impossible floor silences the caption
-    # signal in `_caption_similarity` (recall) AND `caption_contribution` (scoring)
-    # without either of them growing a flag of its own.
-    caption_min = caption_min if use_captions else CAPTION_SIGNAL_OFF
-    # `score_min` is what stops a photo with nothing genuinely like it from filling
-    # the strip with 12 fillers: below it, a candidate is not "similar", it is just
-    # the best of a bad set (settings `similar_score_min`, §9).
-    query = Query(seed_photo_id=photo_id, k=k, weights=weights, floor=score_min)
-    ids = candidates(conn, None, owner_id, query, caption_min=caption_min)
-    results = refine(
-        conn, None, None, owner_id, query, ids, min_cosine=min_cosine, caption_min=caption_min
-    )
+    gates = LOOSE if loose else STRICT
+    if min_cosine is not None:
+        gates = replace(gates, image=min_cosine)
+    if caption_min is not None:
+        gates = replace(gates, caption=caption_min)
+    if not use_captions:
+        # A cosine can never exceed 1.0, so an impossible gate silences the caption
+        # signal in `_caption_similarity` (recall) AND `caption_contribution`
+        # (scoring) without either of them growing a flag of its own (§9.3).
+        gates = replace(gates, caption=CAPTION_SIGNAL_OFF)
+    # The score floor stops a photo with nothing genuinely like it from filling the
+    # strip with 12 fillers: below it, a candidate is not "similar", it is just the
+    # best of a bad set (settings `similar_score_min`, §9).
+    floor = gates.score_min if score_min is None else score_min
+    query = Query(seed_photo_id=photo_id, k=k, weights=weights, floor=floor, gates=gates)
+    ids = candidates(conn, None, owner_id, query)
+    results = refine(conn, None, None, owner_id, query, ids)
 
     # The core's generic contract has no "cosine" field (search/chat/memory never
     # need it); similar's own contract always has — batch-read the FINAL results'
@@ -243,9 +247,10 @@ def similarity_breakdown(
     origin_id: int,
     current_id: int,
     dimension_weights: dict[str, float] | None = None,
-    min_cosine: float = IMAGE_GATE,
-    caption_min: float = CAPTION_GATE,
+    min_cosine: float | None = None,
+    caption_min: float | None = None,
     use_captions: bool = True,
+    loose: bool = False,
 ) -> list[dict]:
     """Full facet-by-facet explanation of why `current` is similar to `origin`
     (§9, §13). One row per facet that ACTUALLY SCORED — a shared tag, the caption
@@ -259,6 +264,13 @@ def similarity_breakdown(
     Returns [{"param", "origin", "current", "match", "contrib"}].
     """
     weights = dimension_weights or DEFAULT_SIMILAR_DIMENSION_WEIGHTS
+    gates = LOOSE if loose else STRICT
+    if min_cosine is not None:
+        gates = replace(gates, image=min_cosine)
+    if caption_min is not None:
+        gates = replace(gates, caption=caption_min)
+    if not use_captions:
+        gates = replace(gates, caption=CAPTION_SIGNAL_OFF)
     total = conn.execute(
         "SELECT COUNT(*) AS n FROM photos WHERE owner_id = ?", (owner_id,)
     ).fetchone()["n"] or 1
@@ -288,7 +300,7 @@ def similarity_breakdown(
         if idf <= 0.0:
             continue
         agreement = min(os_score, cur_score)
-        contrib = tag_contribution(dim, label, agreement, idf, weight)
+        contrib = tag_contribution(dim, label, agreement, idf, weight, gates)
         if contrib is None:
             continue  # below this dimension's gate — it drove nothing, so show nothing
         rows.append({
@@ -299,15 +311,15 @@ def similarity_breakdown(
 
     # Mirrors `similar_photos`: with the signal off the panel must not claim a row
     # that no longer drives the score (§9.3).
-    o_capvec = read_caption_vector(conn, origin_id) if use_captions else None
-    c_capvec = read_caption_vector(conn, current_id) if use_captions else None
+    o_capvec = read_caption_vector(conn, origin_id)
+    c_capvec = read_caption_vector(conn, current_id)
     if o_capvec is not None and c_capvec is not None:
         cap_cos = max(0.0, sum(a * b for a, b in zip(l2_normalize(o_capvec), l2_normalize(c_capvec))))
         # Below the bar the caption contributes nothing to the score, so the panel
         # must not show a row for it. Above it, the row reports the SAME rescaled
         # strength the score used — never the raw cosine, whose 0.6-ish noise floor
         # would read as a strong match between two unrelated photos.
-        contrib = caption_contribution(cap_cos, caption_min)
+        contrib = caption_contribution(cap_cos, gates.caption)
         if contrib is not None:
             rows.append({"param": "caption (meaning)", "origin": "—", "current": "—",
                          "match": contrib["pct"], "contrib": contrib["evidence"]})
@@ -319,7 +331,7 @@ def similarity_breakdown(
         # score, so the panel must not show it. SigLIP image cosines sit ~0.5–0.65 for
         # ANY two photos, so an ungated row read as "57% visual match" between two
         # unrelated photos — a number that drove nothing.
-        contrib = image_contribution(cos, min_cosine)
+        contrib = image_contribution(cos, gates.image)
         if contrib is not None:
             rows.append({"param": "visual (image)", "origin": "—", "current": "—",
                          "match": contrib["pct"], "contrib": contrib["evidence"]})
@@ -329,7 +341,7 @@ def similarity_breakdown(
     origin_moment, current_moment = read_moment(conn, origin_id), read_moment(conn, current_id)
     if origin_moment is not None and current_moment is not None:
         hours, metres = gap(origin_moment, current_moment)
-        contrib = moment_contribution(moment_strength(hours, metres))
+        contrib = moment_contribution(moment_strength(hours, metres), gates.moment)
         if contrib is not None:
             rows.append({
                 "param": "same time & place", "match": contrib["pct"],

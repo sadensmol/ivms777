@@ -152,3 +152,16 @@ CREATE TABLE IF NOT EXISTS chat_prefs (
   guardrails     INTEGER NOT NULL DEFAULT 0,
   direct_answers INTEGER NOT NULL DEFAULT 1
 );
+
+-- Owner-level settings the UI can change (§4.1). Today: the four model slots,
+-- keys `model_slot.image_embed` / `.text_embed` / `.caption` / `.planner`, each
+-- value a catalog key. A MISSING row means "env override, else profile default" —
+-- a default is never written out, so an untouched install and a fresh library
+-- resolve identically.
+CREATE TABLE IF NOT EXISTS app_settings (
+  owner_id   INTEGER NOT NULL,
+  key        TEXT NOT NULL,
+  value      TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (owner_id, key)
+);

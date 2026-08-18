@@ -4,14 +4,17 @@
 # `llama-server` (Metal) is built and running with the gemma4-E2B GGUF (text +
 # vision), then launches the models service, the worker, and the app as plain host
 # processes against $HOME/.ivms777. SigLIP + the caption-text embedder run on the
-# host inside the models service (CPU by default; set IVMS777_EMBED_DEVICE=mps for
-# Metal on SigLIP); `llama-server` is on the host because Docker Desktop on macOS
-# has no GPU passthrough. app/worker are thin clients and reach the native models
-# service at IVMS777_MODELS_BASE_URL (design §5.1).
+# host inside the models service on the Apple GPU (`embed_device=mps`, the mac
+# profile default) — NOTHING on mac runs on the CPU (design §3.1). `llama-server`
+# is on the host for the same reason: Docker Desktop on macOS has no Metal
+# passthrough, so a containerised model could only fall back to the CPU. app/worker
+# are thin clients and reach the native models service at IVMS777_MODELS_BASE_URL
+# (design §5.1).
 #
 # There is no `make down`: native `up` runs in the foreground and Ctrl-C stops the
 # three app processes (the host llama-server keeps running — `make llama-stop`).
-# The compose.*.yaml files still describe the deployed stack for jetson/cloud.
+# The compose.*.yaml files describe the deployed stack for jetson/cloud ONLY;
+# there is no containerised mac path.
 #
 # First run builds llama.cpp and downloads the gemma GGUF (~2 GB) once, into
 # ~/.llama (NOT the library dir), so `make clean` keeps them and `make up` never

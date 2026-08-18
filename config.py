@@ -16,17 +16,24 @@ Profile = Literal["mac", "jetson", "cloud"]
 # Override per-deploy with IVMS777_CAPTION_MODEL / IVMS777_PLANNER_MODEL.
 PROFILE_DEFAULTS: dict[Profile, dict[str, object]] = {
     "mac": {
+        # EVERYTHING runs host-native on the Apple GPU — `make up` starts the
+        # models service, the worker and the app as plain host processes (design
+        # §3.1). Nothing model-related is containerised on mac, because Docker
+        # Desktop has no Metal passthrough and a container can only fall back to
+        # the CPU, which §3.1 forbids on every profile.
+        #
         # One gemma4-E2B GGUF on a host-native llama-server (Metal), started by
-        # `make llama-mac` on :8080 (design §3.1, plan 16). The models service does
-        # NOT supervise it — it is an EXTERNAL server the service reuses (RemoteLlm),
+        # `make llama-mac` on :8080 (plan 16). The models service does NOT
+        # supervise it — it is an EXTERNAL server the service reuses (RemoteLlm),
         # so `llm_managed` is False; spawning a second llama-server would clash on
-        # :8080. Docker Desktop has no GPU passthrough, hence host-native.
+        # :8080. SigLIP and the caption-text embedder reach the same GPU through
+        # torch's `mps` backend.
         "caption_model": "gemma4-E2B",
         "planner_model": "gemma4-E2B",
-        "embed_device": "cpu",
-        "inference_base_url": "http://host.docker.internal:8080/v1",
+        "embed_device": "mps",
+        "inference_base_url": "http://localhost:8080/v1",
         "ram_budget_mb": 24000,
-        "models_base_url": "http://models:9000",
+        "models_base_url": "http://localhost:9000",
         "gpu_concurrency": 3,
         "llm_managed": False,
         "llm_idle_ttl_s": None,
@@ -80,6 +87,11 @@ class Settings(BaseSettings):
     profile: Profile = "mac"
     data_dir: Path = Path("/data")
 
+    # Slot overrides. Since plan 21 these are **catalog keys** (`models/catalog.py`),
+    # not free-form model names: they are the fallback when nothing is stored in
+    # `app_settings`, and `models/slots.py` ignores a value that is not an entry for
+    # that slot on this profile (so a leftover `qwen2.5vl:7b` on cloud, or an old
+    # Ollama tag, degrades to the profile default instead of failing to boot).
     caption_model: str | None = None
     planner_model: str | None = None
     # Dedicated text embedder for caption semantics (§9). A chat model cannot
@@ -110,17 +122,19 @@ class Settings(BaseSettings):
     # Image cosine. SigLIP image cosines have a HIGH baseline — two RANDOM photos of
     # the reference library score a median 0.558 — so 0.80 (the top 4% of all pairs)
     # is the bar for a genuine look-alike.
-    similar_min_cosine: float = Field(default=signals.IMAGE_GATE, ge=0.0, le=1.0)
+    similar_min_cosine: float = Field(default=signals.STRICT.image, ge=0.0, le=1.0)
     # Caption-embedding cosine. Two RANDOM captions score a median 0.621, so the old
     # 0.60 sat *below* the noise and 64% of all pairs cleared it — that is why a
     # teddy bear matched a girl by a Christmas tree. 0.75 is the top 5%.
-    similar_caption_min: float = Field(default=signals.CAPTION_GATE, ge=0.0, le=1.0)
+    similar_caption_min: float = Field(default=signals.STRICT.caption, ge=0.0, le=1.0)
     # Minimum FINAL score (0–1, a noisy-OR of the evidence) to be shown at all (§9).
     # Without it the strip always returns its full k, so a photo with nothing
     # genuinely like it got 12 fillers instead of an honest "nothing similar enough".
-    # Sized so a lone `moment` at same-hour/same-block (0.30) survives while
-    # same-afternoon/500 m (0.23) needs a second signal to agree.
-    similar_score_min: float = Field(default=signals.SCORE_MIN, ge=0.0, le=1.0)
+    # Measured against the old model over 22 seeds: below this the strip's tail
+    # filled with moment-only pairs (a tire close-up matched a plastic container,
+    # same minute, unrelated object). Those belong behind "Show more" (§9), not in
+    # the default strip.
+    similar_score_min: float = Field(default=signals.STRICT.score_min, ge=0.0, le=1.0)
     # Kill switch for the caption-meaning signal in "similar photos" (§9.3). False
     # drops it from BOTH halves — the candidate union and the scoring contribution —
     # leaving tags + image look-alike. It exists to measure what the caption signal
@@ -128,7 +142,12 @@ class Settings(BaseSettings):
     # nomic text embedder can be dropped from the resident set entirely (§8.1).
     similar_use_captions: bool = True
 
-    embed_model_name: str = "siglip2-so400m-patch14-384"
+    # Env override for the `image_embed` slot — a CATALOG KEY (`siglip2-so400m-384`),
+    # never a bare HF repo id, exactly like `caption_model`/`planner_model` (§4.1).
+    # `None` means "use the profile default". It used to default to the HF id
+    # `siglip2-so400m-patch14-384`, which is not a catalog key: the resolver ignored
+    # it, so the override did nothing while the string still leaked to the UI.
+    embed_model_name: str | None = None
     use_fake_embedder: bool = False
     use_fake_inference: bool = False
 
@@ -163,10 +182,15 @@ class Settings(BaseSettings):
     # Unload gemma after this many idle seconds to free ~2 GB for SigLIP-heavy
     # batches (jetson). None disables idle-unload (mac/cloud). Per-profile default.
     llm_idle_ttl_s: int | None = None
-    # Rough resident cost of each managed model, for the governor's budget math.
-    # gemma is the containerised `llama-server` child: the Q4_K_M weights (~3.0 GB)
-    # + the Q8_0 mmproj (~0.5 GB) + KV/compute buffers + its own CUDA context.
-    # This MUST be accurate in BOTH directions:
+    # Per-UNIT override of the resident cost the governor budgets against. Since
+    # plan 21 the cost comes from the SELECTED catalog entry (`models/catalog.py`,
+    # design §4.1); this map is the board-side escape hatch — set
+    # `IVMS777_MODEL_COST_MB='{"llm_vision": 4500}'` to correct a figure without
+    # editing the catalog. Keys are the four residency units: `image_embed`,
+    # `text_embed`, `llm`, `llm_vision`. Empty by default: the catalog is the
+    # source of truth, and its defaults carry the measurements below.
+    #
+    # A cost MUST be accurate in BOTH directions:
     #   - an UNDER-estimate makes the governor keep SigLIP resident and load gemma
     #     on top → OOM kills the child → captions fail with "connection refused";
     #   - an OVER-estimate does NOT just "evict more, which is safe". Once
@@ -176,39 +200,22 @@ class Settings(BaseSettings):
     #     headroom, so `5000 + 512 > 5000` raised InsufficientMemory on every
     #     single caption; the whole stage failed on an idle board with 5.6 GB
     #     free. `test_every_model_fits_its_profile_budget` now guards that.
-    # Both gemma figures are MEASURED on the board, like siglip/nomic — as the drop
-    # in `psutil.virtual_memory().available`, which is exactly what the governor's
-    # real-free guard reads, across loading each on an otherwise-idle Jetson:
-    #   gemma        3606 MB (peak RAM delta 3374) → declared 3800
-    #   gemma-vision 3936 MB (peak RAM delta 4047) → declared 4300
-    # `llama-server`'s RSS reads ~4967 MB for gemma-vision, but ~1.3 GB of that is
-    # the mmap'd GGUF already counted in page cache — RSS is the wrong unit here.
-    # The ~500 MB gap between the two is the Q8_0 projector, which is what it
-    # should be: the measurements corroborate each other.
-    # `gemma` is the TEXT-only child (chat/planner); `gemma-vision` adds the Q8_0
-    # projector for captioning (design §3.1). Mutually exclusive — never both, so
-    # vision MUST cost more than text-only or the swap logic is describing a
-    # model that does not exist.
-    # siglip/nomic are MEASURED on the board, not guessed — re-measured after the
-    # `device_map` fix (§8.1). Each figure is the CHILD's whole footprint (its torch
-    # import and CUDA context included), which is the right unit because evicting
-    # kills the child:
-    #   siglip 3.26 GB — loads with `device_map`, so no host copy. Was ~5.0 GB against
-    #     a declared 3400 before the fix: exactly the under-estimate this warns about.
-    #   nomic  2.14 GB — still loads with `.to()` (device_map breaks its custom remote
-    #     code), so it PAYS the host copy. Measured at 1.28 GB under device_map, which
-    #     is what it would cost if that ever becomes usable. NOT the "~0.3 GB" older
-    #     docs claim — nomic is the second-most expensive resident on this board.
-    # Since plan 20 each runs in a `TorchWorker` child, so `free` is a process kill
-    # and the eviction genuinely returns that memory to gemma (§8.1).
-    model_cost_mb: dict[str, int] = Field(
-        default_factory=lambda: {
-            "siglip": 3400,
-            "nomic": 2200,
-            "gemma": 3800,
-            "gemma-vision": 4300,
-        }
-    )
+    # The catalog's four default costs are MEASURED on the board — as the drop in
+    # `psutil.virtual_memory().available`, which is exactly what the governor's
+    # real-free guard reads, across loading each on an otherwise-idle Jetson. Each
+    # figure is the CHILD's whole footprint (torch import and CUDA context
+    # included), which is the right unit because evicting kills the child:
+    #   llm (gemma text)   3606 MB (peak RAM delta 3374) → declared 3800
+    #   llm_vision (+proj) 3936 MB (peak RAM delta 4047) → declared 4300
+    #   image_embed        3.26 GB — loads with `device_map`, so no host copy
+    #   text_embed         2.14 GB — nomic keeps `.to()` (device_map breaks its
+    #     remote code) and PAYS the host copy; 1.28 GB if that ever becomes usable
+    # `llama-server`'s RSS reads ~4967 MB for the vision mode, but ~1.3 GB of that
+    # is the mmap'd GGUF already counted in page cache — RSS is the wrong unit. The
+    # ~500 MB gap between the two llm modes is the Q8_0 projector, exactly as it
+    # should be: the measurements corroborate each other. Vision MUST cost more than
+    # text-only or the swap logic describes a model that does not exist.
+    model_cost_mb: dict[str, int] = Field(default_factory=dict)
     # Path to the `llama-server` binary the models service spawns when it SUPERVISES
     # gemma (jetson: llm_managed=True). None → resolve `llama-server` from PATH. On
     # mac gemma runs as an EXTERNAL host server (make llama-mac), so this is unused.
@@ -225,7 +232,8 @@ class Settings(BaseSettings):
     # offload, §3.1), and its CLIP tensor buffer is what OOM-aborted llama-server at
     # F16. Q8 costs negligible caption quality and is the single biggest GPU-RAM
     # saving on the 8 GB jetson. Override with IVMS777_MMPROJ_NAME.
-    mmproj_name: str = "mmproj-gemma-4-E2B-it-Q8_0.gguf"
+    # None → use the projector the selected `caption` catalog entry names (§4.1).
+    mmproj_name: str | None = None
     # GPU layers for the supervised `llama-server` (`-ngl`). None → omit the flag so
     # llama.cpp AUTO-FITS as many layers as free GPU RAM allows and offloads the rest
     # to CPU — the jetson safety net: gemma (~5 GB) can exceed the ~4.3 GB free, and
@@ -257,7 +265,21 @@ class Settings(BaseSettings):
     def originals_dir(self) -> Path:
         return self.data_dir / "originals"
 
-    def build_embedder(self):
+    def embed_model_key(self, conn=None) -> str:
+        """The name to record against a vector this process produces — the catalog
+        key the `image_embed` slot holds right now (§4.1), or `"fake"` when the
+        fake embedder is wired in (its vectors come from no model at all).
+
+        Pass `conn` for the user's STORED choice; without it this is the env
+        override → profile default, all a connection-less caller can know.
+        """
+        if self.use_fake_embedder:
+            return "fake"
+        from models import slots
+
+        return slots.resolve_key(conn, self, "image_embed")
+
+    def build_embedder(self, conn=None):
         """Return (embedder, model_name).
 
         Defaults to `RemoteEmbedder`, an HTTP shim over the `models` service
@@ -266,14 +288,24 @@ class Settings(BaseSettings):
         in-process `FakeEmbedder` instead. Imports are local so importing
         `config` never pulls in `httpx`/torch until a caller actually builds
         an embedder; this module itself never imports torch.
+
+        `model_name` is the catalog key the `image_embed` slot holds RIGHT NOW
+        (§4.1) — it is what the embed stage stamps on `photos.embedding_model`.
+        Pass `conn` to see the user's STORED choice; without it the answer is
+        the env override → profile default, which is all a connection-less
+        caller can know. Reading `embed_model_name` directly is NOT the answer:
+        it is only the env override that feeds the resolver, so the photo page
+        claimed `siglip2-so400m-patch14-384` for every photo no matter which
+        model was selected.
         """
+        key = self.embed_model_key(conn)
         if self.use_fake_embedder:
             from embedding.fakes import FakeEmbedder
 
-            return FakeEmbedder(), "fake"
+            return FakeEmbedder(), key
         from inference.remote_embedder import RemoteEmbedder
 
-        return RemoteEmbedder(self.build_models_client(), self.embed_model_name), self.embed_model_name
+        return RemoteEmbedder(self.build_models_client(), key), key
 
     @property
     def caption_embed_model(self) -> str:
