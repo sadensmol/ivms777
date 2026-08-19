@@ -402,6 +402,24 @@ legacy one, and the next drain pass relabels it to the current slot rather than
 re-embedding a library to correct a string — the vectors were always the slot's,
 since only the `models` service ever picks the model (§5.1).
 
+**No model name is ever snapshotted — every one is read from the slot at the moment
+it is used.** The rule above is not about one column; it holds for every name that is
+stored, sent, or shown:
+
+- `photos.caption_model` is the **resolved** `caption` key, reported by the service
+  with the caption it produced, and the same entry's `prompt_template` is what
+  builds that request — so a switched-in model is never given another model's prompt.
+- the caption-vector stage (§9) embeds under the resolved `text_embed` key, whose
+  family picks the task prefix — a stale name prefixes documents for an encoder that
+  is not loaded, which silently degrades every caption vector.
+- the resource bar (§13) and the chat header name the resolved `planner` key.
+
+The `models` service is where this is easiest to get wrong: it builds its
+sub-backends once, at boot, on the profile defaults, and `app` pushes the stored
+selection only afterwards. So each sub-backend holds a **provider** of its slot entry
+and re-reads it per request; a captured entry means every caption is stamped
+`gemma4-E2B` and prompted as gemma no matter what the user selected.
+
 The `models` service holds no database, so it cannot read the choice itself: it
 starts on the profile defaults and reports **which model each slot currently holds**
 (on `GET /resources` and `GET /models`, alongside a `generation` counter that moves

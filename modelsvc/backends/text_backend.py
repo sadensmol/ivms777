@@ -14,7 +14,7 @@ of `embedding.text_embedder` is lazy (inside `text_embed`), so this module stays
 torch-free at import.
 """
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 
 class TextBackend:
@@ -23,14 +23,17 @@ class TextBackend:
         client,
         *,
         text_worker=None,
-        model_name: str | None = None,
+        model_name: Callable[[], str] | None = None,
     ) -> None:
         self._client = client
         # A PROVIDER of the text embedder's `TorchWorker` (plan 20), or None on cloud
         # (real /embeddings backend). A provider, not the worker itself: switching the
         # `text_embed` slot builds a new child (design §4.1).
         self._text_worker = text_worker
-        # The text model llama-server/vLLM keeps resident — for the resource bar (§13).
+        # A PROVIDER of the text model llama-server/vLLM keeps resident — for the
+        # resource bar (§13). A provider, not a name: switching the `planner` slot
+        # restarts the child on a different GGUF (design §4.1), and a name captured at
+        # build time would keep reporting the profile default forever.
         self._model_name = model_name
 
     def text_complete(
@@ -66,9 +69,11 @@ class TextBackend:
     def resident_models(self) -> list[str]:
         """Text model the backend holds resident, for the resource bar (§13).
         llama-server / vLLM keep their one model loaded for the process's whole life
-        and expose no Ollama-style `/api/ps`, so report the configured `model_name`
-        directly. Falls back to a client `loaded_models()` (if any), then `[]`."""
-        if self._model_name:
-            return [self._model_name]
+        and expose no Ollama-style `/api/ps`, so report the slot's CURRENT
+        `model_name`. Falls back to a client `loaded_models()` (if any), then `[]`."""
+        if self._model_name is not None:
+            name = self._model_name()
+            if name:
+                return [name]
         fn = getattr(self._client, "loaded_models", None)
         return fn() if fn is not None else []

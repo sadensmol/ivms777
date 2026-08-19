@@ -86,6 +86,29 @@ def test_a_pass_repairs_a_legacy_embedding_model_stamp(ctx):
     ).fetchone()["embedding_model"] == "fake"
 
 
+def test_the_caption_vector_pass_names_the_selected_text_embedder(ctx, monkeypatch):
+    # The §9 caption vectors must be embedded under the name of the model the
+    # `text_embed` slot holds (§4.1), not `settings.text_embed_model` — that is only
+    # the env fallback, and its family decides the task prefix
+    # (`embedding/caption_text.py`), so a stale name prefixes documents for a model
+    # the service is not running.
+    from db.settings import set_setting
+    from ingest import pipeline
+
+    pid = _uploaded_photo(ctx)
+    ctx.conn.execute("UPDATE photos SET caption = 'a cat on a sofa' WHERE id = ?", (pid,))
+    set_setting(ctx.conn, ctx.settings.owner_id, "model_slot.text_embed", "qwen3-embed-0.6b")
+    named: list[str] = []
+    monkeypatch.setattr(
+        pipeline, "backfill_caption_vectors",
+        lambda conn, client, model, **kw: (named.append(model), 0)[1],
+    )
+
+    drain_pass(ctx, load_vocab(VOCAB_PATH))
+
+    assert named == ["qwen3-embed-0.6b"]  # the STORED slot, not the env fallback
+
+
 def test_idle_pass_never_builds_an_embedder(ctx, monkeypatch):
     # No photos at all → nothing pending in embed/taxonomy/caption → drain_pass must
     # not build an embedder / models client (which would reach the `models` service

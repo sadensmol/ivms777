@@ -29,7 +29,35 @@ def test_build_backend_real_path_wires_text_and_shares_one_inference_client(tmp_
     assert isinstance(backend, CompositeBackend)
     assert backend._text is not None
     assert backend._caption is not None
-    assert backend._caption._captioner._client is backend._text._client
+    assert backend._caption._captioner()._client is backend._text._client
+
+
+def test_caption_backend_follows_a_slot_switch(tmp_path):
+    # The captioner must be read from the LIVE `caption` slot, never snapshotted at
+    # build time: the service boots on the profile defaults and `app` pushes the
+    # user's stored selection afterwards (§4.1). A snapshot stamps every caption
+    # with the default model's name and sends the default model's prompt template.
+    backend = build_backend(Settings(data_dir=tmp_path, profile="mac"))
+    before = backend._caption._captioner()
+    assert before.caption_model == "gemma4-E2B"
+
+    backend.set_slots({"caption": "qwen3-vl-4b"})
+
+    after = backend._caption._captioner()
+    assert after.caption_model == "qwen3-vl-4b"
+    assert after.prompt_key == "qwen3-vl"
+    assert after._client is before._client  # still ONE gateway client (§5.1)
+
+
+def test_text_backend_reports_the_planner_slot_after_a_switch(tmp_path):
+    # Same for the resource bar's text model (§13): it names what llama-server holds
+    # right now, not what the profile defaulted to at boot.
+    backend = build_backend(Settings(data_dir=tmp_path, profile="mac"))
+    assert backend._text.resident_models() == ["gemma4-E2B"]
+
+    backend.set_slots({"planner": "qwen3-4b-2507"})
+
+    assert backend._text.resident_models() == ["qwen3-4b-2507"]
 
 
 def test_build_backend_wires_conveyor_on_jetson(tmp_path):
@@ -126,7 +154,9 @@ def test_text_embed_uses_the_worker_when_wired():
     from modelsvc.backends.text_backend import TextBackend
 
     worker = _RecordingWorker()
-    backend = TextBackend(_StubClient(), text_worker=lambda: worker, model_name="gemma4-E2B")
+    backend = TextBackend(
+        _StubClient(), text_worker=lambda: worker, model_name=lambda: "gemma4-E2B"
+    )
     assert backend.text_embed("nomic-1.5", ["a caption"]) == [[0.5]]
     assert worker.calls == [("embed_texts", (["a caption"],))]
 
@@ -135,7 +165,7 @@ def test_text_embed_falls_back_to_the_client_without_a_worker():
     from modelsvc.backends.text_backend import TextBackend
 
     client = _StubClient()
-    backend = TextBackend(client, model_name="qwen")
+    backend = TextBackend(client, model_name=lambda: "qwen")
     backend.text_embed("text-embed-3", ["a caption"])
     assert client.embedded == ("text-embed-3", ["a caption"])
 

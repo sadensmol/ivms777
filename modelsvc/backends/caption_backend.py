@@ -7,18 +7,26 @@ so there is nothing to load, evict, or preempt here. It is NOT a residency
 concern: SigLIP is the only heavy in-process model left (design §8.1).
 """
 
+from collections.abc import Callable
+
 from captioning.base import Captioner
 
 
 class CaptionBackend:
-    def __init__(self, captioner: Captioner) -> None:
+    def __init__(self, captioner: Callable[[], Captioner]) -> None:
+        # A PROVIDER of the captioner, not a captioner: the `caption` slot is
+        # switchable, and every caption must be produced — and STAMPED — by the model
+        # the slot holds RIGHT NOW (design §4.1). A captioner captured at build time
+        # is the profile default forever, so a switched-in model got the default's
+        # prompt template and every photo was stamped with the default's name.
         self._captioner = captioner
 
     def caption(self, image: bytes) -> dict:
-        result = self._captioner.caption(image)
+        captioner = self._captioner()
+        result = captioner.caption(image)
         return {
             "caption": result.caption,
             "title": result.title,
             "description": result.description,
-            "model": self._captioner.caption_model,
+            "model": captioner.caption_model,
         }

@@ -21,6 +21,7 @@ from db.connection import connect
 from embedding.caption_text import embed_caption_texts
 from embedding.vectors import l2_normalize
 from ingest.vocab import load_vocab
+from models import slots as model_slots
 from search.planner import plan, spec_to_params
 from search.rerank import rerank
 from search.retriever import Query, _hard_filter, candidates
@@ -29,10 +30,10 @@ FLOORS = [round(0.2 + 0.05 * i, 2) for i in range(9)]  # 0.20 .. 0.60
 VOCAB_PATH = Path(__file__).resolve().parent.parent / "vocab.yaml"
 
 
-def _candidates(conn, embedder, client, settings, dimensions, question):
+def _candidates(conn, embedder, client, settings, dimensions, question, planner):
     """The retriever's core candidates + hard facet/date filter, minus rerank
     (mirrors chat.agent.retrieve — plan 12 task 5)."""
-    spec = plan(client, settings.planner_model or "fake", question, dimensions)
+    spec = plan(client, planner, question, dimensions)
     hard_filters = spec_to_params(spec, query=question, dimensions=dimensions)
     query = Query(text=spec.semantic or question, hard_filters=hard_filters,
                   soft_tags=spec.tags, k=200)
@@ -43,8 +44,12 @@ def _candidates(conn, embedder, client, settings, dimensions, question):
 def main(dev_path: str) -> None:
     settings = get_settings()
     conn = connect(settings.db_path)
-    embedder, _ = settings.build_embedder()
+    embedder, _ = settings.build_embedder(conn)
     client, _ = settings.build_inference_client()
+    # Every model name here is the one its SLOT holds right now (§4.1) — the bakeoff
+    # must score the models the library actually ran, not the profile defaults.
+    planner = model_slots.resolve_key(conn, settings, "planner")
+    caption_embed = settings.caption_embed_model_key(conn)
     dimensions = list(load_vocab(VOCAB_PATH).dimensions)
     dev: dict[str, list[int]] = json.loads(Path(dev_path).read_text())
 
@@ -53,10 +58,12 @@ def main(dev_path: str) -> None:
         tp = fp = fn = 0
         for question, gold_list in dev.items():
             gold = set(gold_list)
-            candidates = _candidates(conn, embedder, client, settings, dimensions, question)
+            candidates = _candidates(
+                conn, embedder, client, settings, dimensions, question, planner
+            )
             # Query embedded by the same dedicated text embedder that wrote caption_vec (§4/§9).
             query_vec = l2_normalize(
-                embed_caption_texts(client, settings.caption_embed_model, [question], is_query=True)[0]
+                embed_caption_texts(client, caption_embed, [question], is_query=True)[0]
             )
             got = {pid for pid, _ in rerank(conn, query_vec, candidates, floor=floor)}
             tp += len(got & gold)

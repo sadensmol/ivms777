@@ -67,12 +67,15 @@ def build_backend(settings) -> ModelBackend:
         None if settings.profile == "cloud" else (lambda: manager.worker("text_embed"))
     )
     embed = SiglipBackend(lambda: manager.worker("image_embed"))
-    caption = build_caption_backend(settings, inf, entry=manager.entry("caption"))
+    # PROVIDERS, not snapshots: `app` pushes the user's stored slots after this runs
+    # (the service has no DB), and every switch after that must be visible here —
+    # otherwise the caption stamp and the resource bar keep naming the boot defaults.
+    caption = build_caption_backend(settings, inf, entry=lambda: manager.entry("caption"))
     return CompositeBackend(
         embed=embed,
         caption=caption,
         text=TextBackend(
-            inf, text_worker=text_worker, model_name=manager.entry("planner").key
+            inf, text_worker=text_worker, model_name=lambda: manager.entry("planner").key
         ),
         registry=registry,
         governor=governor,
@@ -92,10 +95,12 @@ def build_caption_backend(settings, inf=None, *, entry=None) -> CaptionBackend:
     `inf` is the shared inference client `build_backend` also hands to
     `TextBackend` — the captioner reuses it instead of opening a second client.
     Falls back to building its own when called standalone (e.g. from tests) with
-    no `inf` given. `entry` is the selected `caption` catalog entry (§4.1): its key
-    is the model name stored with every caption, its `prompt_template` selects the
-    prompt. `use_fake_inference` swaps in a `FakeInferenceClient`. Imports are local
-    so importing this module never pulls in the HTTP client until a caller actually
+    no `inf` given. `entry` is a PROVIDER of the selected `caption` catalog entry,
+    read on EVERY caption because the slot is switchable (§4.1): its key is the model
+    name stored with every caption, its `prompt_template` selects the prompt. It
+    defaults to the profile default, fixed — the standalone caller has no slots.
+    `use_fake_inference` swaps in a `FakeInferenceClient`. Imports are local so
+    importing this module never pulls in the HTTP client until a caller actually
     needs it.
     """
     from captioning.openai_captioner import OpenAICaptioner
@@ -103,7 +108,8 @@ def build_caption_backend(settings, inf=None, *, entry=None) -> CaptionBackend:
     if settings.use_fake_inference:
         from inference.fakes import FakeInferenceClient
 
-        return CaptionBackend(OpenAICaptioner(FakeInferenceClient([]), "fake"))
+        fake = OpenAICaptioner(FakeInferenceClient([]), "fake")
+        return CaptionBackend(lambda: fake)
     if inf is None:
         from inference.client import OpenAICompatClient
 
@@ -111,7 +117,21 @@ def build_caption_backend(settings, inf=None, *, entry=None) -> CaptionBackend:
     if entry is None:
         from models import catalog
 
-        entry = catalog.get("caption", catalog.default_key("caption", settings.profile))
-    return CaptionBackend(
-        OpenAICaptioner(inf, entry.key, prompt_key=entry.prompt_template)
-    )
+        default = catalog.get("caption", catalog.default_key("caption", settings.profile))
+
+        def entry():
+            return default
+
+    # One captioner per model, built on first use and kept: it is a thin wrapper over
+    # the shared client, so switching back must not rebuild what it already had.
+    built: dict[str, OpenAICaptioner] = {}
+
+    def captioner() -> OpenAICaptioner:
+        selected = entry()
+        if selected.key not in built:
+            built[selected.key] = OpenAICaptioner(
+                inf, selected.key, prompt_key=selected.prompt_template
+            )
+        return built[selected.key]
+
+    return CaptionBackend(captioner)

@@ -25,7 +25,8 @@ class FakeCaptioner:
 
 
 def test_caption_backend_returns_the_dict_with_the_model_key():
-    backend = CaptionBackend(FakeCaptioner())
+    captioner = FakeCaptioner()
+    backend = CaptionBackend(lambda: captioner)
 
     result = backend.caption(b"image-bytes")
 
@@ -39,7 +40,7 @@ def test_caption_backend_returns_the_dict_with_the_model_key():
 
 def test_caption_backend_calls_the_captioner_each_time():
     captioner = FakeCaptioner()
-    backend = CaptionBackend(captioner)
+    backend = CaptionBackend(lambda: captioner)
 
     backend.caption(b"one")
     backend.caption(b"two")
@@ -47,23 +48,53 @@ def test_caption_backend_calls_the_captioner_each_time():
     assert captioner.calls == 2
 
 
+def test_caption_backend_re_reads_the_provider_on_every_caption():
+    # The `caption` slot is switchable (§4.1): a caption after a switch must come
+    # from — and be stamped with — the model the slot holds now.
+    selected = [FakeCaptioner()]
+    backend = CaptionBackend(lambda: selected[0])
+    assert backend.caption(b"one")["model"] == "fake-cap"
+
+    switched = FakeCaptioner()
+    switched.caption_model = "other-vlm"
+    selected[0] = switched
+
+    assert backend.caption(b"two")["model"] == "other-vlm"
+
+
 def test_build_caption_backend_selects_openai_captioner_for_mac(tmp_path):
     s = Settings(profile="mac", data_dir=tmp_path, use_fake_embedder=True)
     backend = build_caption_backend(s)
     assert isinstance(backend, CaptionBackend)
-    assert isinstance(backend._captioner, OpenAICaptioner)
-    assert backend._captioner.caption_model == s.caption_model
+    assert isinstance(backend._captioner(), OpenAICaptioner)
+    assert backend._captioner().caption_model == s.caption_model
 
 
 def test_build_caption_backend_selects_openai_captioner_for_jetson(tmp_path):
     s = Settings(profile="jetson", data_dir=tmp_path, use_fake_embedder=True)
     backend = build_caption_backend(s)
-    assert isinstance(backend._captioner, OpenAICaptioner)
-    assert backend._captioner.caption_model == s.caption_model
+    assert isinstance(backend._captioner(), OpenAICaptioner)
+    assert backend._captioner().caption_model == s.caption_model
+
+
+def test_build_caption_backend_follows_the_entry_provider(tmp_path):
+    # `build_backend` passes the LIVE `caption` slot entry (§4.1), so the captioner
+    # — its name AND its prompt template — must track it, not the first value seen.
+    from models import catalog
+
+    s = Settings(profile="mac", data_dir=tmp_path, use_fake_embedder=True)
+    selected = [catalog.get("caption", "gemma4-E2B")]
+    backend = build_caption_backend(s, entry=lambda: selected[0])
+    assert backend._captioner().caption_model == "gemma4-E2B"
+
+    selected[0] = catalog.get("caption", "qwen3-vl-4b")
+
+    assert backend._captioner().caption_model == "qwen3-vl-4b"
+    assert backend._captioner().prompt_key == "qwen3-vl"
 
 
 def test_build_caption_backend_fake_path_uses_fake_client(tmp_path):
     s = Settings(profile="jetson", data_dir=tmp_path, use_fake_embedder=True, use_fake_inference=True)
     backend = build_caption_backend(s)
-    assert isinstance(backend._captioner, OpenAICaptioner)
-    assert backend._captioner.caption_model == "fake"
+    assert isinstance(backend._captioner(), OpenAICaptioner)
+    assert backend._captioner().caption_model == "fake"

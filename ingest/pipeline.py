@@ -121,6 +121,9 @@ def drain_pass(context, vocab, should_preempt=lambda: False) -> None:
     if stage_counts(conn, "caption_embed")["pending"]:
         try:
             client, _ = settings.build_inference_client()
-            backfill_caption_vectors(conn, client, settings.caption_embed_model)
+            # `conn` so the captions are embedded under the model the user actually
+            # selected, not the env override / profile default (§4.1) — the name
+            # picks the task prefix, so a stale one silently degrades the vectors.
+            backfill_caption_vectors(conn, client, settings.caption_embed_model_key(conn))
         except Exception:  # never crash the pass on the §9 enhancement
             logger.exception("caption-vector embed deferred this pass")

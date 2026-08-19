@@ -307,13 +307,24 @@ class Settings(BaseSettings):
 
         return RemoteEmbedder(self.build_models_client(), key), key
 
-    @property
-    def caption_embed_model(self) -> str:
-        """Dedicated text embedder for caption meaning (§9) — `nomic-embed-text-v1.5`
-        by default, loaded in-process in the `models` service (design §4/§5.1). NOT
-        the planner (a chat model can't embed) and NOT SigLIP (no text↔text
-        separation). See `text_embed_model`."""
-        return self.text_embed_model
+    def caption_embed_model_key(self, conn=None) -> str:
+        """The name to embed caption text under — the catalog key the `text_embed`
+        slot holds right now (§4.1).
+
+        Dedicated text embedder for caption meaning (§9), loaded in-process in the
+        `models` service (design §4/§5.1): NOT the planner (a chat model can't embed)
+        and NOT SigLIP (no text↔text separation). The name is not cosmetic — its
+        family picks the task prefix (`embedding/caption_text.py`), so naming a model
+        the service is not running prefixes every caption for the wrong encoder.
+
+        Pass `conn` for the user's STORED choice; without it this is the env override
+        → profile default, all a connection-less caller can know. Reading
+        `text_embed_model` directly is NOT the answer, exactly as with
+        `embed_model_key`.
+        """
+        from models import slots
+
+        return slots.resolve_key(conn, self, "text_embed")
 
     def build_inference_client(self):
         """Return (client, caption_model).
@@ -325,6 +336,12 @@ class Settings(BaseSettings):
         `FakeInferenceClient` instead. Imports are local so importing `config`
         never pulls in `httpx`/torch until a caller actually builds a client;
         this module itself never imports `OpenAICompatClient`.
+
+        The second element is the ENV OVERRIDE / profile default only, and every
+        caller discards it. It is NOT the model any request runs on and must never be
+        stored or shown as one (§4.1): captioning is named by the `models` service
+        (it owns the `caption` slot), and a text call is named by
+        `slots.resolve_key(conn, settings, "planner")`.
         """
         if self.use_fake_inference:
             from inference.fakes import FakeInferenceClient
