@@ -1,0 +1,577 @@
+/* The fullscreen memory feed (design §11.1). Self-contained: the player shares no
+   layout with the app shell, so it deliberately does not load app.css. */
+* { box-sizing: border-box; }
+
+.feed-body {
+  margin: 0;
+  height: 100vh;
+  overflow: hidden;
+  background: #000;
+  color: #fff;
+  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+/* One canvas. Camera moves, transitions, grading, vignette and grain are all one
+   fragment shader (web/static/feed-gl.js) — none of it is CSS. */
+.feed-stage { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+
+/* WebGL2 is required. Every browser this app targets has it, but say so rather than
+   showing a black rectangle. */
+.feed-body.no-webgl .feed-stage { display: none; }
+.feed-body.no-webgl .feed-start-desc::after {
+  content: " — this browser has no WebGL2, so the film cannot play.";
+}
+
+.feed-text {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 8vh;
+  margin: 0;
+  padding: 0 8vw;
+  text-align: center;
+  font-size: clamp(1.1rem, 3vw, 2rem);
+  text-shadow: 0 2px 24px rgba(0, 0, 0, 0.9);
+  opacity: 0;
+  transform: translateY(1.5rem);
+  pointer-events: none;
+}
+.feed-text.is-in {
+  transition: opacity 1s ease, transform 1s ease;
+  opacity: 1;
+  transform: translateY(0);
+}
+/* While the start card is up — before the first play, and whenever paused — the
+   caption sits directly behind the memory's title and competes with it. Higher
+   specificity than `.feed-text.is-in` so it wins wherever it applies. */
+.feed-body:not(.is-playing) .feed-text.is-in { opacity: 0; }
+
+.feed-start {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+  border: 0;
+  background: rgba(0, 0, 0, 0.55);
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.feed-start.is-hidden { opacity: 0; pointer-events: none; transition: opacity 0.6s ease; }
+/* Belt and braces for the same thing: once the overlay is on its way out, nothing
+   inside it may become visible again, whatever else changes during the fade. */
+.feed-start.is-hidden > * { visibility: hidden; }
+.feed-start-title { font-size: clamp(1.6rem, 5vw, 3.2rem); font-weight: 600; }
+.feed-start-desc { max-width: 46ch; opacity: 0.8; text-align: center; }
+.feed-start-play { margin-top: 1rem; font-size: 1.3rem; opacity: 0.9; }
+
+.feed-close {
+  position: fixed;
+  top: 1rem;
+  right: 1rem;
+  z-index: 10;
+  width: 2.5rem;
+  height: 2.5rem;
+  border: 0;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.5);
+  color: #fff;
+  font-size: 1.4rem;
+  cursor: pointer;
+  transition: opacity 0.4s ease;
+}
+.feed-body.is-playing .feed-close { opacity: 0.25; }
+.feed-close:hover, .feed-close:focus { opacity: 1; }
+
+.feed-prepare {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+  height: 100vh;
+  padding: 2rem;
+  text-align: center;
+}
+.feed-prepare button {
+  padding: 0.7rem 1.6rem;
+  border: 1px solid #555;
+  border-radius: 0.4rem;
+  background: #1b1b1b;
+  color: #fff;
+  font: inherit;
+  cursor: pointer;
+}
+.feed-note { max-width: 44ch; opacity: 0.6; font-size: 0.9rem; }
+
+/* The language selector, mirroring the close button on the other side. */
+.feed-lang {
+  position: fixed;
+  top: 1rem;
+  left: 1rem;
+  z-index: 10;
+  display: flex;
+  gap: 0.4rem;
+  margin: 0;
+}
+.feed-lang button {
+  padding: 0.25rem 0.7rem;
+  border: 1px solid #444;
+  border-radius: 1rem;
+  background: rgba(0, 0, 0, 0.5);
+  color: #fff;
+  font: inherit;
+  font-size: 0.85rem;
+  cursor: pointer;
+  opacity: 0.55;
+  transition: opacity 0.4s ease;
+}
+.feed-lang button.is-current { opacity: 1; border-color: #999; }
+
+/* Regenerate sits opposite the language pills, left of the close button. */
+.feed-regen {
+  position: fixed;
+  top: 1rem;
+  right: 4rem;
+  z-index: 10;
+  margin: 0;
+}
+.feed-regen button {
+  padding: 0.25rem 0.7rem;
+  border: 1px solid #444;
+  border-radius: 1rem;
+  background: rgba(0, 0, 0, 0.5);
+  color: #fff;
+  font: inherit;
+  font-size: 0.85rem;
+  cursor: pointer;
+  opacity: 0.55;
+  transition: opacity 0.4s ease;
+}
+.feed-regen button:hover { opacity: 1; }
+.feed-body.is-playing .feed-regen { opacity: 0.12; }
+.feed-body.is-playing .feed-lang { opacity: 0.15; }
+.feed-lang:hover { opacity: 1 !important; }
+
+/* Only the CAPTION's slide-in is dropped here. The CAMERA is deliberately NOT gated
+   on this: freezing it turned the film into a slideshow for anyone with macOS "Reduce
+   Motion" on, and the film is the feature, not decoration around one. */
+@media (prefers-reduced-motion: reduce) {
+  .feed-text.is-in { transition: opacity 0.4s ease; transform: none; }
+}
+
+/* The prepare progress bar. A film takes minutes — most of it inside one MusicGen
+   call — so a static sentence is indistinguishable from a hung process. */
+.feed-progress { width: min(30rem, 76vw); }
+.feed-bar {
+  height: 3px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.15);
+  overflow: hidden;
+}
+.feed-bar span {
+  display: block;
+  height: 100%;
+  background: #fff;
+  transition: width 1s linear;   /* the poll is every 1 s; glide across the gap */
+}
+/* NOT `.feed-stage` — that is the canvas (`position: fixed; inset: 0`), and reusing
+   the name stretched this label fullscreen and made it invisible. */
+.feed-step {
+  margin: 0.8rem 0 0;
+  font-size: 1rem;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  opacity: 0.85;
+}
+.feed-progress { text-align: center; }
+.feed-cancel {
+  margin-top: 1rem;
+  padding: 0.35rem 1rem;
+  border: 1px solid #555;
+  border-radius: 1rem;
+  background: transparent;
+  color: #fff;
+  font: inherit;
+  font-size: 0.85rem;
+  opacity: 0.6;
+  cursor: pointer;
+}
+.feed-cancel:hover { opacity: 1; }
+
+/* Shown when Regenerate was refused because another film is being made. */
+.feed-busy {
+  position: fixed;
+  top: 4rem;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 11;
+  margin: 0;
+  padding: 0.5rem 1rem;
+  border-radius: 0.4rem;
+  background: rgba(120, 60, 20, 0.85);
+  font-size: 0.9rem;
+  max-width: 80vw;
+  text-align: center;
+}
+
+/* What a film is missing, and why — shown on the title card so a silent film
+   explains itself rather than looking broken. */
+.feed-missing {
+  position: fixed;
+  left: 50%;
+  bottom: 3rem;
+  transform: translateX(-50%);
+  z-index: 11;
+  margin: 0;
+  max-width: 70vw;
+  text-align: center;
+  font-size: 0.85rem;
+  opacity: 0.55;
+}
+.feed-body.is-playing .feed-missing { display: none; }
+
+/* Why the last prepare produced no film. Narration is mandatory (§11.1), so this is a
+   real failure to act on, not the "what is missing" note a ready film carries. */
+.feed-failed {
+  max-width: 44ch;
+  margin: 0;
+  padding: 0.6rem 1rem;
+  border-radius: 0.4rem;
+  background: rgba(140, 40, 40, 0.85);
+  font-size: 0.9rem;
+}
+
+/* --- the waiting room ------------------------------------------------------------
+   Preparing a film takes minutes. These are the memory's own photographs, scattered,
+   rotated and drifting behind the progress bar, so the wait shows you what is being
+   made instead of a bar on a black page.
+
+   Every position and angle is derived from `--i` (the photo's index) with modular
+   arithmetic — no JS, no random, and the layout is therefore stable across a reload
+   instead of jumping every time the page polls. */
+.feed-scatter {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+.feed-scatter-shot {
+  position: absolute;
+  width: clamp(6rem, 13vw, 13rem);
+  aspect-ratio: 4 / 3;
+  object-fit: cover;
+  border-radius: 0.35rem;
+  /* A white border and a drop shadow: these read as PRINTS on a table, which is what
+     a memory is, rather than as a broken grid. */
+  border: 0.4rem solid rgba(255, 255, 255, 0.9);
+  box-shadow: 0 1.2rem 2.5rem rgba(0, 0, 0, 0.55);
+  opacity: 0;
+  /* `left`, `top`, `transform` and `animation-delay` are set INLINE by the template:
+     they are derived from each photo's index, and computing them here would need CSS
+     `mod()`, which is far newer than this app's baseline. */
+  animation: feed-drift 13s ease-in-out infinite;
+}
+/* The viewer's own words, tumbling in among the prints while the film is made. Same
+   drift as a photograph, so they read as part of the same pile rather than as UI. */
+.feed-scatter-note {
+  position: absolute;
+  margin: 0;
+  padding: 0.55rem 0.95rem;
+  max-width: min(26ch, 30vw);
+  border-radius: 1rem 1rem 1rem 0.25rem;
+  background: rgba(20, 40, 70, 0.88);
+  border: 1px solid rgba(140, 190, 255, 0.4);
+  box-shadow: 0 1rem 2rem rgba(0, 0, 0, 0.5);
+  color: #eaf2ff;
+  font-size: 0.85rem;
+  line-height: 1.35;
+  text-align: left;
+  opacity: 0;
+  animation: feed-drift 13s ease-in-out infinite;
+}
+
+@keyframes feed-drift {
+  0%   { opacity: 0; }
+  12%  { opacity: 0.85; }
+  70%  { opacity: 0.85; }
+  100% { opacity: 0; }
+}
+/* The card and the bar sit ABOVE the scatter, and get a scrim so the text stays
+   readable whatever photograph happens to drift under it. */
+.feed-prepare {
+  position: relative;
+  z-index: 1;
+  background: radial-gradient(ellipse at center,
+              rgba(0, 0, 0, 0.85) 0%, rgba(0, 0, 0, 0.7) 45%, rgba(0, 0, 0, 0.35) 100%);
+}
+/* Motion here IS decoration, not the feature, so this one honours the OS setting: the
+   photographs still appear and still say what is being prepared, they simply hold
+   still. */
+@media (prefers-reduced-motion: reduce) {
+  .feed-scatter-shot,
+  .feed-scatter-note { animation: none; opacity: 0.7; }
+}
+
+/* Download sits with Regenerate, left of the close button. It shares their quiet
+   styling because it is a tool, not the point of the page. */
+.feed-download {
+  position: fixed;
+  top: 1rem;
+  right: 11.5rem;
+  z-index: 10;
+  padding: 0.25rem 0.7rem;
+  border: 1px solid #444;
+  border-radius: 1rem;
+  background: rgba(0, 0, 0, 0.5);
+  color: #fff;
+  font: inherit;
+  font-size: 0.85rem;
+  cursor: pointer;
+  opacity: 0.55;
+  transition: opacity 0.4s ease;
+}
+.feed-download:hover { opacity: 1; }
+.feed-body.is-playing .feed-download { opacity: 0.12; }
+/* WHILE RECORDING it must stay readable and stay clickable — it is also the stop
+   button, and a control that fades out mid-export is a control that looks broken. */
+.feed-body.is-exporting .feed-download {
+  opacity: 1;
+  border-color: #c33;
+  background: rgba(140, 40, 40, 0.85);
+}
+
+/* --- the viewer's notes (design §11.3) --------------------------------------------
+   DOM, never canvas. `canvas.captureStream()` records the canvas alone, so everything
+   here is absent from a downloaded film by construction — these are working notes for
+   the person making the memory, not for whoever receives it. */
+/* A right-hand column, where the editing panel sits — so a note appears in the place
+   you wrote it, and never over the middle of the photograph. */
+.feed-bubbles {
+  position: fixed;
+  right: 1rem;
+  bottom: 0;
+  width: min(26rem, 46vw);
+  height: 100vh;
+  z-index: 9;
+  pointer-events: none;
+  overflow: hidden;
+}
+/* Each one rises from the bottom at the second it was written and fades out near the
+   top — so a note reads as belonging to that moment of the film. */
+/* Position and opacity are set from the FILM CLOCK every frame (web/static/feed-gl.js),
+   never by a keyframe. That is what puts a note at the centre of the screen at exactly
+   its own timestamp, keeps two of them from overlapping, and freezes them where they
+   are the moment the film is paused — none of which a CSS animation can do. */
+.feed-bubble {
+  position: absolute;
+  top: 0;
+  right: 0;
+  margin: 0;
+  padding: 0.5rem 0.9rem;
+  max-width: 100%;
+  border-radius: 1rem 1rem 0.2rem 1rem;
+  background: rgba(20, 40, 70, 0.82);
+  border: 1px solid rgba(140, 190, 255, 0.35);
+  color: #eaf2ff;
+  font-size: 0.9rem;
+  line-height: 1.35;
+  text-align: left;
+  will-change: transform;
+}
+
+/* The paused state of the film. Stopping to say something IS the interaction, so
+   there is no separate mode to enter.
+   Above the bubbles (z-index 9) deliberately: a note frozen mid-flight behind the
+   editor is context, but it must never sit over the thing being typed into. */
+.feed-notes {
+  position: fixed;
+  right: 1rem;
+  bottom: 1rem;
+  z-index: 12;
+  width: min(26rem, 90vw);
+  max-height: 70vh;
+  overflow-y: auto;
+  padding: 1rem;
+  border-radius: 0.6rem;
+  background: rgba(12, 12, 14, 0.94);
+  border: 1px solid #333;
+}
+.feed-notes[hidden] { display: none; }
+/* The sheet's handle: always visible, and the whole thing folds into it. */
+.feed-notes-title {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+.feed-notes-count {
+  padding: 0.05rem 0.45rem;
+  border-radius: 0.8rem;
+  background: rgba(140, 190, 255, 0.18);
+  color: #9cf;
+  font-size: 0.72rem;
+  font-weight: 500;
+}
+.feed-notes-chevron { margin-left: auto; opacity: 0.6; transition: transform 0.25s ease; }
+.feed-notes-body {
+  /* Slides down out of the way rather than disappearing, so it is obvious where it
+     went and how to get it back. */
+  overflow: hidden;
+  max-height: 60vh;
+  transition: max-height 0.28s ease, opacity 0.2s ease;
+}
+.feed-notes.is-collapsed .feed-notes-body {
+  max-height: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+.feed-notes.is-collapsed { max-height: none; overflow: visible; }
+.feed-notes.is-collapsed .feed-notes-chevron { transform: rotate(-180deg); }
+.feed-notes-body > *:first-child { margin-top: 0.8rem; }
+.feed-notes-list { list-style: none; margin: 0.8rem 0 0.9rem; padding: 0; }
+.feed-notes-list li {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 0.4rem;
+  align-items: start;
+  margin-bottom: 0.5rem;
+}
+/* The stamp and the delete cross keep to the field's first line, so a long note grows
+   downward without dragging them into the middle of it. */
+.feed-notes-list .feed-note-at,
+.feed-notes-list .feed-note-remove { margin-top: 0.35rem; }
+.feed-note-at {
+  padding: 0.15rem 0.45rem;
+  border: 1px solid #444;
+  border-radius: 0.8rem;
+  background: transparent;
+  color: #9cf;
+  font: inherit;
+  font-size: 0.78rem;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+.feed-note-remove {
+  border: 0;
+  background: transparent;
+  color: #c66;
+  font-size: 1.1rem;
+  line-height: 1;
+  cursor: pointer;
+}
+.feed-notes textarea {
+  width: 100%;
+  padding: 0.4rem 0.5rem;
+  border: 1px solid #3a3a3a;
+  border-radius: 0.35rem;
+  background: #161616;
+  color: #fff;
+  font: inherit;
+  font-size: 0.85rem;
+  /* No box of its own to scroll: the field is sized to its text in JS, and the PANEL
+     takes the scrollbar when there are more notes than fit. A note is two sentences
+     you want to read at a glance, not a little window onto them. */
+  resize: none;
+  overflow: hidden;
+  min-height: 2.1rem;
+}
+.feed-notes-new { display: grid; gap: 0.4rem; }
+.feed-notes-at { font-size: 0.78rem; opacity: 0.7; font-variant-numeric: tabular-nums; }
+.feed-notes-new button {
+  justify-self: start;
+  padding: 0.35rem 1rem;
+  border: 1px solid #555;
+  border-radius: 0.35rem;
+  background: #1b1b1b;
+  color: #fff;
+  font: inherit;
+  cursor: pointer;
+}
+/* No reduced-motion override: there is no CSS animation left to override, and the one
+   that used to be here held `opacity: 0` for a bubble's whole life on any machine with
+   the OS setting on. A note nobody can read is not a gentler note. */
+
+/* The bracket legend (§11.3). Collapsed by default: it is reference material, and the
+   panel's job is to get a thought written down before it is forgotten. */
+.feed-legend { margin: 0 0 0.9rem; font-size: 0.78rem; }
+.feed-legend summary { cursor: pointer; opacity: 0.75; }
+.feed-legend summary:hover { opacity: 1; }
+.feed-legend-lead { margin: 0.6rem 0; opacity: 0.7; line-height: 1.5; }
+.feed-legend-row { margin: 0.6rem 0; line-height: 1.9; }
+.feed-legend-row strong { text-transform: capitalize; }
+.feed-legend-row span { opacity: 0.6; }
+.feed-legend code {
+  display: inline-block;
+  margin: 0 0.25rem 0.2rem 0;
+  padding: 0.05rem 0.35rem;
+  border-radius: 0.25rem;
+  background: rgba(255, 255, 255, 0.09);
+  font-size: 0.75rem;
+}
+
+/* PAUSED is a different state from NOT STARTED. Not-started shows the memory's title
+   and description over a dark scrim; paused shows the frame you stopped on, because
+   that frame is what you paused to look at — and, half the time, to annotate. */
+.feed-start-resume { display: none; font-size: 1.1rem; opacity: 0.85; }
+.feed-body.is-paused .feed-start {
+  background: rgba(0, 0, 0, 0.18);
+  justify-content: flex-start;
+  padding-top: 2.5rem;
+}
+.feed-body.is-paused .feed-start-title,
+.feed-body.is-paused .feed-start-desc,
+.feed-body.is-paused .feed-start-play { display: none; }
+.feed-body.is-paused .feed-start-resume {
+  display: block;
+  padding: 0.4rem 1rem;
+  border-radius: 1.4rem;
+  background: rgba(0, 0, 0, 0.55);
+}
+
+/* A note changes nothing until the film is REGENERATED, and nothing else on the page
+   says so. A note written and then forgotten is worse than one never written — the
+   viewer believes they have been heard. So the control announces itself until it is
+   used (design §11.3). */
+.feed-regen button.is-stale {
+  opacity: 1;
+  border-color: #7ab8ff;
+  background: rgba(30, 80, 140, 0.9);
+  animation: feed-nudge 2.2s ease-in-out infinite;
+}
+/* It stays lit even while the film plays, where the controls normally fade right
+   back — that is exactly when it would otherwise be missed. */
+.feed-body.is-playing .feed-regen:has(button.is-stale) { opacity: 1; }
+@keyframes feed-nudge {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(122, 184, 255, 0.55); }
+  50%      { box-shadow: 0 0 0 0.5rem rgba(122, 184, 255, 0); }
+}
+/* Pulsing is a nudge, not the message: the colour alone still carries it. */
+@media (prefers-reduced-motion: reduce) {
+  .feed-regen button.is-stale { animation: none; }
+}
+
+/* WHILE A FILM IS BEING MADE, only two controls mean anything: close, and cancel. The
+   language pills would silently switch you to a film that is not being built; the
+   notes panel invites edits that this run has already read and cannot act on. So the
+   screen shows the scattered photographs, the progress, and nothing else to press
+   (design §11.1). */
+.feed-body.is-building .feed-lang,
+.feed-body.is-building .feed-regen,
+.feed-body.is-building .feed-download,
+.feed-body.is-building .feed-notes,
+.feed-body.is-building .feed-bubbles { display: none; }
+

@@ -11,6 +11,10 @@ class Memory:
     description: str
     photo_ids: list[int]   # cover first
     signature: str
+    # event = a time/place-bounded happening, theme = a thread across time (§11).
+    # Stage 2 gives the file to the event and makes a theme a description-only
+    # folder (§12), so the kind has to survive the round-trip through `params`.
+    kind: str = "event"
 
 
 def current_signature(conn: sqlite3.Connection, owner_id: int) -> str:
@@ -58,7 +62,7 @@ def replace_memories(conn: sqlite3.Connection, owner_id: int, memories: list[Mem
                 "INSERT INTO groups(owner_id, kind, name, description, params, status, created_at)"
                 f" VALUES (?, 'memory', ?, ?, ?, 'accepted', {NOW_SQL})",
                 (owner_id, memory.title, memory.description,
-                 json.dumps({"signature": memory.signature})),
+                 json.dumps({"signature": memory.signature, "kind": memory.kind})),
             )
             group_id = int(cursor.lastrowid)
             conn.execute(
@@ -73,6 +77,51 @@ def replace_memories(conn: sqlite3.Connection, owner_id: int, memories: list[Mem
     except Exception:
         conn.execute("ROLLBACK")
         raise
+
+
+def rewrite_memory(conn: sqlite3.Connection, group_id: int, memory: Memory) -> None:
+    """Replace ONE memory's title, description and photo order, in place.
+
+    In place matters. `replace_memories` drops every memory and inserts fresh rows, so
+    it takes the group ids with it — and `memory_notes` cascades on those (§11.3). The
+    viewer's own words about a memory must survive it being retold; they are the input
+    to the next telling.
+
+    What does NOT survive is the film: the memory it narrated no longer exists in that
+    shape, so every stored presentation for this group is dropped and must be prepared
+    again (§11.1).
+    """
+    conn.execute(
+        "UPDATE groups SET name = ?, description = ? WHERE id = ? AND kind = 'memory'",
+        (memory.title, memory.description, group_id),
+    )
+    conn.execute("DELETE FROM group_photos WHERE group_id = ?", (group_id,))
+    conn.executemany(
+        "INSERT INTO group_photos(group_id, photo_id, rank) VALUES (?, ?, ?)",
+        [(group_id, pid, rank) for rank, pid in enumerate(memory.photo_ids)],
+    )
+    conn.execute("DELETE FROM memory_presentations WHERE group_id = ?", (group_id,))
+    _reindex_memory(conn, group_id, memory)
+
+
+def _reindex_memory(conn: sqlite3.Connection, group_id: int, memory: Memory) -> None:
+    """Keep the FTS row in step with the retold memory, so chat can still find it."""
+    conn.execute("DELETE FROM memory_fts WHERE rowid = ?", (group_id,))
+    conn.execute(
+        "INSERT INTO memory_fts(rowid, name, description) VALUES (?, ?, ?)",
+        (group_id, memory.title, memory.description),
+    )
+
+
+def photo_ids_for_group(conn: sqlite3.Connection, group_id: int) -> list[int]:
+    """This memory's photographs, in its own stored order."""
+    return [
+        int(row["photo_id"])
+        for row in conn.execute(
+            "SELECT photo_id FROM group_photos WHERE group_id = ? ORDER BY rank",
+            (group_id,),
+        )
+    ]
 
 
 def album_key_for_group(
@@ -114,6 +163,30 @@ def read_memories(conn: sqlite3.Connection, owner_id: int) -> list[Memory]:
                 (row["id"],),
             )
         ]
-        signature = json.loads(row["params"] or "{}").get("signature", "")
-        memories.append(Memory(row["name"], row["description"], photo_ids, signature))
+        params = json.loads(row["params"] or "{}")
+        memories.append(Memory(row["name"], row["description"], photo_ids,
+                               params.get("signature", ""),
+                               params.get("kind", "event")))
     return memories
+
+
+def group_id_for_album_key(
+    conn: sqlite3.Connection, owner_id: int, key: str
+) -> int | None:
+    """The memory `group_id` behind an Organize album key (`memory-<index>`) — the
+    inverse of `album_key_for_group`, and it lives beside it for the same reason: the
+    ordering (size desc, then id) MUST match `read_memories`, and ONE file owns it.
+    The feed resolves `/feed/memory-3` to a row through this (§11.1).
+
+    None when the key names no memory of this owner."""
+    rows = conn.execute(
+        "SELECT g.id,"
+        " (SELECT count(*) FROM group_photos gp WHERE gp.group_id = g.id) AS n"
+        " FROM groups g WHERE g.owner_id = ? AND g.kind = 'memory'"
+        " ORDER BY n DESC, g.id",
+        (owner_id,),
+    ).fetchall()
+    for index, row in enumerate(rows):
+        if f"memory-{index}" == key:
+            return int(row["id"])
+    return None

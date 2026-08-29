@@ -38,7 +38,13 @@ PROFILE_DEFAULTS: dict[Profile, dict[str, object]] = {
         "llm_managed": False,
         "llm_idle_ttl_s": None,
         "llm_ngl": 99,
-        "llm_ctx": 4096,
+        # mac is not memory-bound: measured on a 32 GB machine, llama-server is 4.11 GiB
+        # resident at -c 4096 and 4.28 GiB at -c 32768 — gemma's sliding-window attention
+        # keeps the KV cache small, so the whole increase costs ~0.17 GiB. 4096 was the
+        # ceiling that made a 40-shot memory unnarratable: its story prompt is ~6 300
+        # tokens and llama-server rejected the call outright. `make up` starts the host
+        # server with `-c $(LLAMA_CTX)` and exports the same number here.
+        "llm_ctx": 32768,
     },
     "jetson": {
         # One gemma4-E2B GGUF on a containerised sm_87 CUDA llama-server, text +
@@ -94,6 +100,13 @@ class Settings(BaseSettings):
     # Ollama tag, degrades to the profile default instead of failing to boot).
     caption_model: str | None = None
     planner_model: str | None = None
+    # The feed's narration + soundtrack slots (§4.1, §11.1). Catalog keys, exactly
+    # like the other slot overrides, and `off` is a real key. Deliberately NOT in
+    # PROFILE_DEFAULTS: None means "use the catalog default for this profile", which
+    # is what makes `music` off on jetson and on everywhere else without a second
+    # place to keep that in step.
+    voice_model: str | None = None
+    music_model: str | None = None
     # Dedicated text embedder for caption semantics (§9). A chat model cannot
     # embed (no embedding head), and SigLIP's text tower has no text↔text
     # separation (design §4), so this is a purpose-built text embedder —
@@ -264,6 +277,12 @@ class Settings(BaseSettings):
     @property
     def originals_dir(self) -> Path:
         return self.data_dir / "originals"
+
+    @property
+    def audio_dir(self) -> Path:
+        """Generated feed audio (§11.1) — derived and content-addressed, like thumbs.
+        Never a source folder: nothing here is ever read from the user's disk."""
+        return self.data_dir / "audio"
 
     def embed_model_key(self, conn=None) -> str:
         """The name to record against a vector this process produces — the catalog

@@ -1,3 +1,4 @@
+import html
 import json
 import logging
 import re
@@ -21,10 +22,11 @@ from fastapi.templating import Jinja2Templates
 
 from albums.by_date import DEFAULT_GRAIN, GRAIN_LABELS, ByDateOrganizer
 from albums.memories import MemoriesOrganizer
-from albums.memories_build import build_memories
+from albums.memories_build import build_memories, rebuild_memory
 from albums.memory_store import (
     album_key_for_group,
     current_signature,
+    group_id_for_album_key,
     stored_signature,
 )
 from albums.registry import ORGANIZERS, get_organizer
@@ -49,6 +51,12 @@ from chat.history import (
 )
 from chat.prefs import get_prefs, set_prefs
 from config import Settings
+from feed.build import Cancelled, NarrationFailed, build_presentation
+from feed.directives import legend as directive_legend
+from feed.language import DISPLAY as LANGUAGE_DISPLAY
+from feed.language import LANGUAGES, get_language
+from feed.notes import add_note, delete_note, read_notes
+from feed.store import read_presentation
 from inference.prompts import (
     GUARDRAIL_REFUSAL,
     agentic_answer_messages,
@@ -203,6 +211,30 @@ def create_app(settings: Settings) -> FastAPI:
 
     app.state.queue_inference = queue_inference
     app.state.await_build = await_build
+
+    # Feed prepare state (§11.1). One at a time per process, exactly like the
+    # memories rebuild — it is the same kind of long, model-bound background work.
+    # `feed_building` holds the album key being prepared, or None.
+    app.state.feed_building = None
+    app.state.feed_build_thread = None
+    # `{"stage": str, "fraction": float}` for the bar, and a flag the Cancel button
+    # sets — the job checks it between stages (§11.1).
+    app.state.feed_progress = {}
+    # A monotonic id for the running build. Cancel BUMPS it, which both stops the
+    # thread at its next stage AND tells that thread it is stale, so a slow orphan
+    # finishing a 10-minute music call can never overwrite a newer build's state.
+    # A single boolean could not do that: the next build reset it to False and the
+    # orphan then saved on top.
+    app.state.feed_run = 0
+    # At most ONE film waits behind the running one; a second Regenerate replaces it.
+    app.state.feed_queued = None
+
+    def await_feed_build() -> None:
+        thread = app.state.feed_build_thread
+        if thread is not None:
+            thread.join()
+
+    app.state.await_feed_build = await_feed_build
 
     def drain_now() -> None:
         """Run one ingest pass for whatever has arrived — single-process runs only.
@@ -438,6 +470,11 @@ def create_app(settings: Settings) -> FastAPI:
         ),
         "caption": ("Captions", "The title and description written for each photo."),
         "planner": ("Planner & chat", "Reads your question and writes the answer."),
+
+        "music": (
+            "Memory soundtrack",
+            "The background music generated for a memory feed — off plays silent.",
+        ),
     }
 
     def _settings_view(select: str | None) -> dict:
@@ -453,7 +490,9 @@ def create_app(settings: Settings) -> FastAPI:
         chosen_slot, _, chosen_key = (select or "").partition(":")
 
         sections = []
-        for slot in model_catalog.SLOTS:
+        # `voice` is deliberately absent: which voice narrates a film follows from its
+        # language and the memory's mood (§11.1), so there is nothing to choose.
+        for slot in (s for s in model_catalog.SLOTS if s not in model_catalog.AUTOMATIC_SLOTS):
             title, blurb = _SLOT_META[slot]
             switchable = model_catalog.is_switchable(slot, ctx.settings.profile)
             entries = []
@@ -625,11 +664,26 @@ def create_app(settings: Settings) -> FastAPI:
         memories_stale = is_memories and (
             stored_signature(ctx.conn, owner_id) != current_signature(ctx.conn, owner_id)
         )
+        # What the viewer has said about each memory, keyed by album so the card can
+        # show it (§11.3). Notes are the one thing on a memory that came from the
+        # PERSON rather than from the pipeline — hiding them in the player would mean
+        # you can only find them by playing the film again.
+        notes_by_key: dict[str, list] = {}
+        if is_memories:
+            for album in albums:
+                group_id = group_id_for_album_key(ctx.conn, owner_id, album.key)
+                if group_id is not None:
+                    found = read_notes(ctx.conn, group_id)
+                    if found:
+                        notes_by_key[album.key] = found
         response = templates.TemplateResponse(
             request,
             "organize.html",
             {
                 "organizers": [(o.name, o.label) for o in ORGANIZERS.values()],
+                "notes_by_key": notes_by_key,
+                # A memory is being retold: no second one may start while it runs.
+                "retelling": app.state.memories_building,
                 "active": organizer.name,
                 "grains": GRAIN_LABELS if is_date else [],
                 "active_grain": active_grain if is_date else None,
@@ -694,6 +748,355 @@ def create_app(settings: Settings) -> FastAPI:
             f"Building memories… {prog['done']}/{total} ({pct}%)</span>"
         )
 
+    # --- the memory film (§11.1). A LEAF under the memory grid (§13.1). ---------
+    def _language(lang: str | None) -> str:
+        """The requested language, else the owner's stored choice.
+
+        An unknown value degrades to the stored one rather than 404-ing: a stale
+        bookmark must still play something."""
+        ctx = context()
+        if lang in LANGUAGES:
+            return lang
+        return get_language(ctx.conn, ctx.settings.owner_id)
+
+    def _memory_group(key: str) -> int:
+        ctx = context()
+        group_id = group_id_for_album_key(ctx.conn, ctx.settings.owner_id, key)
+        if group_id is None:
+            raise HTTPException(status_code=404)
+        return group_id
+
+    @app.get("/feed/{key}", response_class=HTMLResponse)
+    def feed(
+        request: Request, key: str, lang: str | None = None, busy: str | None = None
+    ) -> HTMLResponse:
+        ctx = context()
+        language = _language(lang)
+        group_id = _memory_group(key)
+        row = ctx.conn.execute(
+            "SELECT name, COALESCE(description, '') AS description FROM groups WHERE id = ?",
+            (group_id,),
+        ).fetchone()
+        presentation = read_presentation(ctx.conn, group_id, language)
+        # The memory's own photographs, for the waiting screen: a film takes minutes,
+        # most of it inside one MusicGen call, and a bar over an empty page is a long
+        # time to look at nothing. Scattering the actual pictures makes the wait part
+        # of the film rather than a gap before it (§11.1).
+        notes = read_notes(ctx.conn, group_id)
+        preview = [
+            int(row["photo_id"])
+            for row in ctx.conn.execute(
+                "SELECT gp.photo_id FROM group_photos gp JOIN photos p"
+                " ON p.id = gp.photo_id WHERE gp.group_id = ? AND p.thumb_key IS NOT NULL"
+                " ORDER BY gp.rank LIMIT 14",
+                (group_id,),
+            )
+        ]
+        # Pressing Regenerate must LOOK like it did something: the moment a build for
+        # this film is running or queued, the page shows progress and stops showing
+        # the old film, even though the old row still exists until the new one
+        # replaces it.
+        building = app.state.feed_building == (key, language)
+        queued = app.state.feed_queued == (key, language)
+        return templates.TemplateResponse(
+            request,
+            "feed.html",
+            {
+                "key": key,
+                "title": row["name"],
+                "description": row["description"],
+                "language": language,
+                "languages": [(code, LANGUAGE_DISPLAY[code]) for code in LANGUAGES],
+                # §13.1 rule 4: close is history.back(); this is only the deep-link
+                # fallback for a feed opened cold from a pasted URL.
+                "origin_url": "/organize?by=memories",
+                "preview": preview,
+                # What the viewer has already told us about this memory. Shown on the
+                # page so the notes are visible where they were made, and fed into the
+                # next generation (§11.3).
+                "notes": notes,
+                # Built from the SAME vocabulary the pipeline parses, so the legend can
+                # never advertise a word that is ignored (§11.3).
+                "legend": directive_legend(),
+                # Serialised for the player, which floats them up at their own moment
+                # in the film. `tojson` would escape into an HTML context; this is
+                # inside a <script type="application/json"> block, so the only thing
+                # that must not appear raw is a closing tag.
+                "notes_json": json.dumps(
+                    [{"id": n.id, "at": n.at_seconds, "stamp": n.stamp, "text": n.text}
+                     for n in notes],
+                    # A note may be in any language (§11.3); escaping it to \uXXXX would
+                    # make the page unreadable and the tests lie about what it contains.
+                    ensure_ascii=False,
+                ).replace("</", "<\\/"),
+                # A film with no voice is not a film (§11.1). That holds for STORED
+                # rows too, not just for new builds: rows written before narration
+                # became mandatory are silent, and some carry an English script under a
+                # Russian film. They are offered for re-preparing rather than played.
+                "ready": (presentation is not None and presentation.status == "ready"
+                          and presentation.narration_key is not None
+                          and not building and not queued),
+                "has_music": bool(presentation and presentation.music_key),
+                "has_narration": bool(presentation and presentation.narration_key),
+                # Keyed by (key, language) so preparing English does not make Russian
+                # look busy — each language is its own film (§11.1).
+                "building": building or queued,
+                # Set when Regenerate was refused because another film is being made.
+                "busy": busy,
+                # What a READY film is missing and why (no music), so a silent film
+                # explains itself instead of looking broken.
+                "missing": (presentation.error
+                            if presentation and presentation.status == "ready" else None),
+                # Why the last run produced no film at all. Shown on the prepare card,
+                # immediately, so a failure is never mistaken for "not prepared yet".
+                "failed": (
+                    _stale_reason(presentation)
+                    if presentation and not building and not queued else None
+                ),
+            },
+        )
+
+    def _stale_reason(presentation) -> str | None:
+        """Why this film is not being played, or None when it is fine.
+
+        Two cases reach here: a run that genuinely failed, and a row from before
+        narration became mandatory — silent, and sometimes carrying an English script
+        under a Russian film. Both are dead ends the user can only fix by preparing
+        again, so both say so.
+        """
+        if presentation.status == "running":
+            return ("The last run was interrupted before it finished — the app "
+                    "restarted, or it was stopped. Nothing was saved. Prepare it again.")
+        if presentation.status == "failed":
+            return presentation.error
+        if presentation.narration_key is None:
+            return ("This film was made before narration became required, so it has no "
+                    "voice. Prepare it again to get one.")
+        return None
+
+    @app.post("/feed/{key}/note")
+    def feed_note(
+        key: str, at: float = Form(default=0.0), text: str = Form(default="")
+    ) -> JSONResponse:
+        """Record what the viewer said, at the second of the film they said it.
+
+        The one thing generation cannot know is what the day MEANT to the person who
+        lived it (§11.3). Posted from the paused player, so it answers JSON rather
+        than redirecting — the film must not lose its place to save a note.
+        """
+        ctx = context()
+        note = add_note(ctx.conn, _memory_group(key), at, text)
+        if note is None:
+            return JSONResponse({"saved": False}, status_code=400)
+        return JSONResponse({"saved": True, "id": note.id, "at": note.at_seconds,
+                             "stamp": note.stamp, "text": note.text})
+
+    @app.post("/feed/{key}/note/{note_id}")
+    def feed_note_edit(
+        key: str, note_id: int, at: float = Form(default=0.0), text: str = Form(default="")
+    ) -> JSONResponse:
+        """Rewrite a note in place, keeping its position on the timeline.
+
+        Editing is delete-then-add rather than an UPDATE so the text goes through the
+        same trimming and capping as a new note, and an edit to nothing removes it.
+        """
+        ctx = context()
+        group_id = _memory_group(key)
+        existing = read_notes(ctx.conn, group_id)
+        match = next((n for n in existing if n.id == note_id), None)
+        if match is None:
+            raise HTTPException(status_code=404)
+        delete_note(ctx.conn, group_id, note_id)
+        note = add_note(ctx.conn, group_id, at or match.at_seconds, text)
+        if note is None:
+            return JSONResponse({"saved": False, "deleted": True})
+        return JSONResponse({"saved": True, "id": note.id, "at": note.at_seconds,
+                             "stamp": note.stamp, "text": note.text})
+
+    @app.post("/feed/{key}/note/{note_id}/delete")
+    def feed_note_delete(key: str, note_id: int) -> RedirectResponse:
+        ctx = context()
+        delete_note(ctx.conn, _memory_group(key), note_id)
+        return RedirectResponse(f"/feed/{key}", status_code=303)
+
+    @app.post("/feed/{key}/rebuild")
+    def feed_rebuild(key: str) -> RedirectResponse:
+        """Retell THIS memory: a new title, description and photo order (§11).
+
+        Distinct from Regenerate, which remakes the FILM from the memory as it stands.
+        This remakes the memory itself — the thing the film is made of — and is the only
+        way its photo order changes (§11.1). One memory, not the whole library: a full
+        rebuild re-clusters everything and a memory you liked can come back split.
+        """
+        ctx = context()
+        group_id = _memory_group(key)
+        if app.state.memories_building:
+            return RedirectResponse("/organize?by=memories", status_code=303)
+        client = app.state.inference_override or ctx.settings.build_inference_client()[0]
+        model = planner_model()
+        owner_id = ctx.settings.owner_id
+        app.state.memories_building = True
+        app.state.memories_progress = {"done": 0, "total": 1}
+
+        def run() -> None:
+            # ctx.conn is thread-local (§5), so this daemon thread uses its own.
+            try:
+                rebuild_memory(ctx.conn, client, model, owner_id, group_id,
+                               use_captions=ctx.settings.similar_use_captions)
+            except Exception:  # a failed retelling must leave the old memory standing
+                logger.exception("rebuilding memory %s failed", key)
+            finally:
+                app.state.memories_progress = {"done": 1, "total": 1}
+                app.state.memories_building = False
+
+        thread = threading.Thread(target=run, daemon=True)
+        app.state.memories_build_thread = thread
+        thread.start()
+        # Back to the memory grid, which is where the button lives: the memory is what
+        # changed, and its films are gone until it is prepared again.
+        return RedirectResponse("/organize?by=memories", status_code=303)
+
+    @app.get("/feed/{key}/timeline.json")
+    def feed_timeline(key: str, lang: str | None = None) -> JSONResponse:
+        presentation = read_presentation(context().conn, _memory_group(key), _language(lang))
+        if presentation is None:
+            raise HTTPException(status_code=404)
+        return JSONResponse(presentation.timeline)
+
+    @app.get("/feed/{key}/audio/{kind}")
+    def feed_audio(key: str, kind: str, lang: str | None = None) -> Response:
+        ctx = context()
+        presentation = read_presentation(ctx.conn, _memory_group(key), _language(lang))
+        if presentation is None or kind not in ("music", "narration"):
+            raise HTTPException(status_code=404)
+        blob = presentation.music_key if kind == "music" else presentation.narration_key
+        if not blob or not ctx.audio.exists(blob):
+            raise HTTPException(status_code=404)
+        return Response(ctx.audio.read(blob), media_type="audio/wav")
+
+    @app.post("/feed/{key}/prepare")
+    def feed_prepare(key: str, lang: str = Form(default="")) -> RedirectResponse:
+        language = _language(lang)
+        _memory_group(key)          # 404 early rather than inside the thread
+        if app.state.feed_building is None:
+            _start_film(key, language)
+            return RedirectResponse(f"/feed/{key}?lang={language}", status_code=303)
+        # One film at a time per process (§3.2). Rather than a dead end — "wait, or go
+        # cancel it somewhere else" — cancel the running one and QUEUE this one: the
+        # finishing thread starts it. One click, and the limit is still one at a time.
+        busy_key, busy_language = app.state.feed_building
+        app.state.feed_queued = (key, language)
+        app.state.feed_run += 1        # stop the running one; ours is queued
+        return RedirectResponse(
+            f"/feed/{key}?lang={language}&busy={busy_key}:{busy_language}",
+            status_code=303,
+        )
+
+    def _start_film(key: str, language: str) -> None:
+        """Begin one film on a daemon thread, and hand off to a queued one on the way
+        out so a Regenerate pressed during a build is honoured without the request
+        ever blocking."""
+        ctx = context()
+        group_id = _memory_group(key)
+        client = ctx.settings.build_models_client()
+        owner_id = ctx.settings.owner_id
+        model = planner_model()
+        app.state.feed_run += 1
+        run_id = app.state.feed_run
+        app.state.feed_building = (key, language)
+        app.state.feed_progress = {"stage": "starting", "fraction": 0.0}
+
+        def on_progress(stage: str, fraction: float) -> None:
+            if app.state.feed_run == run_id:
+                app.state.feed_progress = {"stage": stage, "fraction": fraction}
+
+        def run() -> None:
+            # ctx.conn is thread-local (§5), so this daemon thread opens its own
+            # connection. Generation goes through the models service conveyor.
+            try:
+                build_presentation(ctx.conn, client, ctx.audio, owner_id, group_id,
+                                   language=language, planner_model=model,
+                                   progress=on_progress,
+                                   cancelled=lambda: app.state.feed_run != run_id)
+            except Cancelled:
+                logger.info("film for %s (%s) cancelled", key, language)
+            except NarrationFailed as exc:
+                # Already recorded as a `failed` row with this reason — the page reads
+                # it from there, so nothing more is needed than not crashing.
+                logger.error("film for %s (%s) failed: %s", key, language, exc)
+            except Exception:  # a failed film must never kill the app
+                logger.exception("preparing the film for %s (%s) failed", key, language)
+            finally:
+                # A stale orphan must not touch state a newer build owns...
+                if app.state.feed_run == run_id:
+                    app.state.feed_building = None
+                    app.state.feed_progress = {}
+                # ...but it IS the thread that just released the GPU, so it hands off
+                # to anything queued either way. Cancel leaves nothing queued; a
+                # Regenerate-while-busy queues itself and starts here.
+                queued = app.state.feed_queued
+                app.state.feed_queued = None
+                if queued is not None:
+                    _start_film(*queued)
+
+        thread = threading.Thread(target=run, daemon=True)
+        app.state.feed_build_thread = thread
+        thread.start()
+
+    @app.get("/feed/{key}/prepare/progress", response_class=HTMLResponse)
+    def feed_progress(key: str, lang: str | None = None) -> HTMLResponse:
+        # Polled by HTMX while the job runs. It reports the STAGE and a percentage,
+        # because "composing the music" is minutes long and a static sentence is
+        # indistinguishable from a hung process (§11.1).
+        language = _language(lang)
+        if (app.state.feed_building != (key, language)
+                and app.state.feed_queued != (key, language)):
+            return HTMLResponse("", headers={"HX-Refresh": "true"})
+        # Queued behind another film: say so and keep polling, rather than reloading
+        # the page in a loop until our turn comes.
+        if app.state.feed_queued == (key, language):
+            other = app.state.feed_building
+            waiting = html.escape(f"{other[0]}:{other[1]}") if other else "another film"
+            return HTMLResponse(
+                f'<div class="feed-progress" hx-get="/feed/{html.escape(key, quote=True)}'
+                f'/prepare/progress?lang={html.escape(language, quote=True)}"'
+                f' hx-trigger="every 1s" hx-swap="outerHTML">'
+                f'<div class="feed-bar"><span style="width: 0%"></span></div>'
+                f'<p class="feed-step">waiting for {waiting} to stop…</p></div>'
+            )
+        state = app.state.feed_progress or {}
+        # Escaped, and `percent` is coerced to an int, because this fragment is built
+        # by hand rather than rendered through Jinja's autoescaping. `key` only gets
+        # here when it matches `feed_building` — which `_memory_group` validated — but
+        # that is a guard in another function, and this must not depend on it.
+        safe_key = html.escape(key, quote=True)
+        stage = html.escape(str(state.get("stage", "starting")))
+        percent = max(0, min(100, int(100 * float(state.get("fraction", 0.0)))))
+        return HTMLResponse(
+            f'<div class="feed-progress" hx-get="/feed/{safe_key}/prepare/progress'
+            f'?lang={html.escape(language, quote=True)}"'
+            f' hx-trigger="every 1s" hx-swap="outerHTML">'
+            f'<div class="feed-bar"><span style="width: {percent}%"></span></div>'
+            f'<p class="feed-step">{stage} · {percent}%</p>'
+            f'<form method="post" action="/feed/{safe_key}/cancel">'
+            f'<input type="hidden" name="lang" value="{html.escape(language, quote=True)}">'
+            f'<button class="feed-cancel" type="submit">Cancel</button></form></div>'
+        )
+
+    @app.post("/feed/{key}/cancel")
+    def feed_cancel(key: str, lang: str = Form(default="")) -> RedirectResponse:
+        # Release the USER immediately. The worker thread cannot be interrupted inside
+        # a multi-minute model call, so cancelling used to appear to do nothing until
+        # that call returned. Bumping the run id both makes the thread stop at its next
+        # stage AND marks it stale, so whatever it was making is discarded rather than
+        # saved. The UI is free at once; the GPU finishes its current call in the
+        # background and throws the result away.
+        app.state.feed_run += 1
+        app.state.feed_building = None
+        app.state.feed_progress = {}
+        app.state.feed_queued = None
+        return RedirectResponse(f"/feed/{key}?lang={_language(lang)}", status_code=303)
+
     @app.get("/thumb/{photo_id}")
     def thumb(photo_id: int, size: str = "grid") -> Response:
         ctx = context()
@@ -752,7 +1155,13 @@ def create_app(settings: Settings) -> FastAPI:
                 for album in get_organizer(by).organize(ctx.conn, owner, grain or None):
                     if album.key == key:
                         return {"ids": album.photo_ids, "title": album.title,
-                                "description": album.description}
+                                "description": album.description,
+                                # A memory carries what the VIEWER said about it
+                                # (§11.3), so a photo opened inside one shows it under
+                                # the memory's own title. Empty for every other kind of
+                                # album — only a memory can be played and annotated.
+                                "notes": _memory_notes(ctx.conn, owner, key)
+                                if by == MemoriesOrganizer.name else []}
             # The album is gone (e.g. memories rebuilt) — fall back to the library.
         if ctx_param and ctx_param.startswith("chat-memory:"):
             # A memory shown IN chat, drilled into: the grid IS that memory, so it
@@ -763,7 +1172,8 @@ def create_app(settings: Settings) -> FastAPI:
             for album in get_organizer(MemoriesOrganizer.name).organize(ctx.conn, owner):
                 if album.key == key:
                     return {"ids": album.photo_ids, "title": album.title,
-                            "description": album.description}
+                            "description": album.description,
+                            "notes": _memory_notes(ctx.conn, owner, key)}
             # The memory is gone (rebuilt) — fall back to the library.
         if ctx_param and ctx_param.startswith("similar:"):
             # Drilled into a photo FROM another photo's "similar" strip: this layer
@@ -800,6 +1210,12 @@ def create_app(settings: Settings) -> FastAPI:
             "title": f"Search: {query}" if query else "Library",
             "description": None,
         }
+
+    def _memory_notes(conn, owner_id: int, key: str) -> list:
+        """The viewer's notes on one memory, by album key. Empty when it is not a
+        memory or has none — the caller renders nothing in that case."""
+        group_id = group_id_for_album_key(conn, owner_id, key)
+        return read_notes(conn, group_id) if group_id is not None else []
 
     def _collection_for_photo(
         ctx_param: str | None, params: dict[str, str], photo_id: int

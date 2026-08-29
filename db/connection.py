@@ -4,7 +4,7 @@ from pathlib import Path
 import sqlite_vec
 
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 13
 
 
 class SchemaTooOldError(RuntimeError):
@@ -50,6 +50,7 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("photos", "caption_vec", "BLOB"),
     ("groups", "description", "TEXT"),
     ("chat_messages", "elapsed_ms", "INTEGER"),
+    ("memory_presentations", "decisions_json", "TEXT"),
 )
 
 
@@ -63,10 +64,21 @@ def migrate(conn: sqlite3.Connection) -> None:
         )
     # Both steps are idempotent, so migrate always converges the schema regardless
     # of the stamped version: create any missing tables, add any missing columns.
+    _rebuild_presentations_for_language(conn)
     conn.executescript(SCHEMA_PATH.read_text())
     _ensure_columns(conn)
     _backfill_memory_fts(conn)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+
+def _rebuild_presentations_for_language(conn: sqlite3.Connection) -> None:
+    """Plan 24 keys presentations by `(group_id, language)`; plan 23 keyed them by
+    `group_id` alone. `CREATE TABLE IF NOT EXISTS` cannot change a primary key, so the
+    old shape is DROPPED rather than migrated — a presentation is derived data and is
+    cheaply regenerated, unlike the memories it hangs off (which are untouched)."""
+    columns = {r["name"] for r in conn.execute("PRAGMA table_info(memory_presentations)")}
+    if columns and "language" not in columns:
+        conn.execute("DROP TABLE memory_presentations")
 
 
 def _backfill_memory_fts(conn: sqlite3.Connection) -> None:

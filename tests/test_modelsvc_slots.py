@@ -69,10 +69,12 @@ def _manager(tmp_path, profile="jetson", **kw):
     return manager, registry, built, settings
 
 
-def test_apply_registers_the_four_units(tmp_path):
+def test_apply_registers_a_unit_per_slot(tmp_path):
     manager, registry, _, _ = _manager(tmp_path)
     manager.apply(catalog.DEFAULTS["jetson"])
-    assert set(registry._specs) == {"image_embed", "text_embed", "llm", "llm_vision"}
+    assert set(registry._specs) == {
+        "image_embed", "text_embed", "llm", "llm_vision", "voice", "music",
+    }
 
 
 def test_costs_come_from_the_catalog_entry(tmp_path):
@@ -182,7 +184,9 @@ def test_cloud_registers_no_text_embed_unit(tmp_path):
 
 
 def test_state_reports_slots_and_generation(tmp_path):
-    manager, _, _, _ = _manager(tmp_path)
+    # On the mac PROFILE: its defaults name mac-only models (musicgen-medium, §4.1),
+    # and `apply` rightly refuses a model the running profile does not offer.
+    manager, _, _, _ = _manager(tmp_path, profile="mac")
     manager.apply(catalog.DEFAULTS["mac"])
     state = manager.state()
     assert state["slots"] == catalog.DEFAULTS["mac"]
@@ -207,3 +211,47 @@ def test_alive_probe_follows_the_live_worker(tmp_path):
     assert registry._specs["image_embed"].alive() is True
     built["workers"][-1].stop()
     assert registry._specs["image_embed"].alive() is False
+
+
+def test_voice_and_music_register_torch_units(tmp_path):
+    manager, registry, _, _ = _manager(tmp_path)
+    manager.apply(catalog.DEFAULTS["jetson"])
+    assert manager.has_unit("voice") and manager.has_unit("music")
+    assert registry.cost_mb("voice") == catalog.get("voice", "kokoro-82m").cost_mb
+    assert registry.cost_mb("music") == catalog.get("music", "musicgen-small").cost_mb
+
+
+def test_the_audio_units_are_built_from_the_audio_package(tmp_path):
+    # The children must be resolved BY NAME through TorchWorker so the models parent
+    # process never imports torch (CLAUDE.md, §5.1).
+    manager, registry, built, _ = _manager(tmp_path)
+    manager.apply(catalog.DEFAULTS["jetson"])
+    registry.ensure("voice")
+    registry.ensure("music")
+    targets = {w.target for w in built["workers"]}
+    assert "audio.kokoro_voice:KokoroVoice" in targets
+    assert "audio.musicgen:MusicGen" in targets
+
+
+
+
+
+
+def test_the_language_picks_the_voice_model(tmp_path):
+    # The user never chooses a voice: asking for Russian swaps the unit to a model
+    # that speaks Russian (§11.1).
+    manager, _, _, _ = _manager(tmp_path)
+    manager.apply(catalog.DEFAULTS["jetson"])
+    assert manager.entry("voice").key == "kokoro-82m"
+
+    assert manager.ensure_voice_for("ru") is True
+    assert manager.entry("voice").key == "silero-v4-ru"
+
+    assert manager.ensure_voice_for("en") is True
+    assert manager.entry("voice").key == "kokoro-82m"
+
+
+def test_a_language_nothing_speaks_is_refused(tmp_path):
+    manager, _, _, _ = _manager(tmp_path)
+    manager.apply(catalog.DEFAULTS["jetson"])
+    assert manager.ensure_voice_for("klingon") is False

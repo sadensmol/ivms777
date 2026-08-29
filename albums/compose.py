@@ -33,9 +33,17 @@ _SYSTEM_PROMPT = (
     "ONE short well-known touch about a town that is named.\n"
     "Reply with ONLY one JSON object. For more context first: "
     '{"action":"expand","tool":"similar|facets|nearby","photo_id":<id>}.\n'
-    "OTHERWISE ANSWER WITH ALL FOUR KEYS, none ever missing:\n"
+    "OTHERWISE ANSWER WITH ALL FIVE KEYS, none ever missing:\n"
     '{"action":"answer","keep":true,"title":"short, warm, names the town",'
-    '"description":"the 2-3 sentences","drop_photo_ids":[]}\n'
+    '"description":"the 2-3 sentences","drop_photo_ids":[],"order":[<photo ids>]}\n'
+    "order is THE ORDER THIS MEMORY IS TOLD IN, and it is decided here and nowhere "
+    "else: the album shows the photos in it, and every film made of this memory "
+    "follows it. List every photo id you are keeping, exactly once. Put pictures of "
+    "the same thing NEXT TO EACH OTHER — the same person, the same room, the same "
+    "moment — so they read as one beat rather than scattered through the day. Then "
+    "order those groups the way you would tell it: where it starts, what happened, "
+    "how it ended. Chronological is a reasonable default, not a rule. Write the "
+    "description FOR that order.\n"
     "drop_photo_ids holds only the odd photo that does not belong — plain numbers, "
     "usually none, NEVER all of them. Photos from the same town belong together "
     "even across several days unless they are truly unrelated; when in doubt, keep. "
@@ -100,8 +108,35 @@ def compose_memory(
         description = (turn.get("description") or "").strip()
         if len(kept) < 2 or not title or not description:
             return None
-        return Memory(title, description, kept, signature)
+        return Memory(title, description, _ordered(turn.get("order"), kept), signature)
     return None
+
+
+def _ordered(raw, kept: list[int]) -> list[int]:
+    """The photo ids in the order the memory is TOLD in.
+
+    This is decided once, here, and then never again: the album shows the photos in
+    this order and every film of this memory follows it, until the memory itself is
+    rebuilt (design §11, §11.1). A story pass free to re-sequence per film gave the
+    same memory a different shape on every regeneration.
+
+    Repaired rather than trusted — ids that were dropped or invented are ignored, and
+    anything the agent forgot is appended in its original order, so the memory can
+    never silently lose a photograph it decided to keep.
+    """
+    allowed = set(kept)
+    seen: set[int] = set()
+    order: list[int] = []
+    for value in raw if isinstance(raw, list) else []:
+        try:
+            pid = int(value)
+        except (TypeError, ValueError):
+            continue
+        if pid in allowed and pid not in seen:
+            seen.add(pid)
+            order.append(pid)
+    order.extend(pid for pid in kept if pid not in seen)
+    return order
 
 
 def _summarise(

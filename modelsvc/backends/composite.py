@@ -16,6 +16,7 @@ from collections.abc import Iterator
 
 from models import catalog
 from modelsvc.activity import Activity
+from modelsvc.backends.base import SlotOff
 from modelsvc.scheduler import Priority
 from modelsvc.slots import LLM_UNITS, catalog_payload
 
@@ -27,6 +28,8 @@ class CompositeBackend:
         embed,
         caption=None,
         text=None,
+        voice=None,
+        music=None,
         registry=None,
         governor=None,
         scheduler=None,
@@ -38,6 +41,8 @@ class CompositeBackend:
         self._embed = embed
         self._caption = caption
         self._text = text
+        self._voice = voice
+        self._music = music
         self._registry = registry
         self._governor = governor
         self._scheduler = scheduler
@@ -92,6 +97,42 @@ class CompositeBackend:
         return self._run(["llm_vision"], Priority.BATCH, "captioning",
                          lambda: self._caption.caption(image))
 
+    # --- feed audio (voice / music units, batch) ---
+    def _unit_available(self, unit: str) -> bool:
+        # `SlotManager` registers NO residency unit for an `off` entry (§4.1), so
+        # asking the scheduler for it would KeyError deep in the governor. Check
+        # first and answer with the honest reason instead.
+        return self._slots is None or self._slots.has_unit(unit)
+
+    def speak(self, text: str, language: str = "en", voice: str | None = None,
+              segments: list[str] | None = None,
+              voices: list[str | None] | None = None) -> dict:
+        if self._voice is None:
+            raise SlotOff("voice")
+        # The LANGUAGE picks the model, not the user: a film asks to be narrated in
+        # Russian and the manager swaps the voice unit to one that speaks Russian.
+        # Only `off`, or no voice covering the language at all, is a refusal.
+        if self._slots is not None:
+            if not self._slots.ensure_voice_for(language):
+                raise SlotOff(f"no voice available for {language}")
+        elif not self._unit_available("voice"):
+            raise SlotOff("voice")
+        return self._run(["voice"], Priority.BATCH, "narrating",
+                         lambda: self._voice.speak(text, voice, segments, voices))
+
+    def music(
+        self, prompt: str = "", seconds: float = 30.0, seed: int | None = None,
+        sections: list[dict] | None = None, temperature: float | None = None,
+        guidance: float | None = None,
+    ) -> dict:
+        if self._music is None or not self._unit_available("music"):
+            raise SlotOff("music")
+        return self._run(["music"], Priority.BATCH, "composing",
+                         lambda: self._music.music(prompt, seconds, seed,
+                                                   sections=sections,
+                                                   temperature=temperature,
+                                                   guidance=guidance))
+
     # --- text generation (llm) ---
     def text_complete(
         self,
@@ -124,6 +165,13 @@ class CompositeBackend:
                 yield from self._text.text_stream(model, messages)
 
         return stream()
+
+    def text_context(self) -> int | None:
+        # Metadata, not generation: it reads the server's `/props` and holds no slot,
+        # so it never queues behind a film being written.
+        if self._text is None:
+            raise NotImplementedError("text backend not wired")
+        return self._text.text_context()
 
     def text_embed(self, model: str, texts: list[str]) -> list[list[float]]:
         if self._text is None:

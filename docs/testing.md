@@ -21,13 +21,25 @@ how that design is verified.
 - Upload is tested end to end through `TestClient`: probe returns only unknown
   hashes, a body whose bytes do not match the declared hash is rejected, the
   same file sent twice creates one `photos` row and two `photo_sources` rows.
-- Layouts are pure functions and test as such — a `PhotoView` in, a path out —
-  including collision suffixes, undated photos, and characters illegal on
-  Windows.
-- `ivms777_sync` tests build a real directory tree in `tmp_path` and run
-  `plan` and `apply` against a manifest fixture, then assert the tree matches
-  the expected layout exactly. Every such test also runs `undo` and asserts the
-  tree is byte-identical to how it started.
-- Failure injection covers the paths that can lose data: a crash between
-  journal write and rename, a target that already exists, a file modified
-  between plan and apply, and a cross-filesystem move whose copy is truncated.
+- Plan building is a pure function and tests as such — albums in, a plan document
+  out — per organizer, including folder-name sanitizing, duplicate album titles,
+  collision suffixes, `_unsorted/`, and the memory rules (event owns the file,
+  theme folders carry only `description.txt` + `photos.txt`).
+- The memory film tests entirely offline. Its **signals** and **director** are pure
+  functions — rows in, an `Edit` out — so every craft rule (motion axis from
+  orientation, burst detection, hero holds, chapter dips, the grade, the pacing curve)
+  is asserted directly with no model. The **story pass** is tested against a stub
+  client, including the case where the model returns junk and the film must still
+  play. `FakeBackend.speak`/`music` return
+  **real, parseable WAV bytes**, so `duration_seconds` measures a true length and the
+  "stretch the slideshow to outlast the narration" rule is tested for real. A slot
+  set to `off` is covered too: the prepare job must still produce a playable feed
+  when the voice, the music, or both answer 503. Neither `kokoro` nor `diffusers` is
+  installed by a plain `uv sync`, so no test imports `audio/` — those two children
+  are exercised only on a machine with the `models` extra.
+- `ivms777_sync` tests build a real directory tree in `tmp_path` and run `apply`
+  against a plan fixture, then assert the tree matches the plan exactly. Every such
+  test also runs `undo` and asserts the tree is byte-identical to how it started.
+- Failure injection covers the paths that can lose data: a crash between journal
+  write and rename, a target that already exists, a file modified between the walk
+  and the move, and a cross-filesystem move whose copy is truncated.

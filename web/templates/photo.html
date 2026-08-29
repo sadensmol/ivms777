@@ -41,6 +41,20 @@
         {% if collection.description %}
           <p class="photo-collection-desc">{{ collection.description }}</p>
         {% endif %}
+        {% if collection.notes %}
+          {# What the viewer said while watching this memory's film (§11.3). It sits
+             under the memory's OWN title, above the photograph's words, because it
+             describes the memory rather than this picture — and it is the one thing
+             here that came from the person rather than from the pipeline. #}
+          <details class="photo-collection-notes">
+            <summary>{{ collection.notes|length }} note{{ '' if collection.notes|length == 1 else 's' }} for the film</summary>
+            <ul>
+              {% for note in collection.notes %}
+                <li><span class="note-at">{{ note.stamp }}</span> {{ note.text }}</li>
+              {% endfor %}
+            </ul>
+          </details>
+        {% endif %}
         {% if comparing %}
           {# What is being compared, in the photos' OWN words, right above the
              table that scores them — same Base | This order as its columns. #}

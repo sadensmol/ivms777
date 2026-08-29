@@ -10,6 +10,17 @@ from collections.abc import Iterator
 import httpx
 
 
+def _audio(body: dict) -> dict:
+    """Decode a `/speak` or `/music` response: the wire carries base64, every caller
+    wants bytes to write straight to storage."""
+    return {
+        "audio": base64.b64decode(body["audio"]),
+        "sample_rate": body["sample_rate"],
+        "model": body["model"],
+        "segments": body.get("segments", []),
+    }
+
+
 class ModelsClient:
     def __init__(self, base_url: str, transport: httpx.BaseTransport | None = None) -> None:
         self._client = httpx.Client(base_url=base_url.rstrip("/"), transport=transport)
@@ -38,6 +49,49 @@ class ModelsClient:
         response = self._client.post("/caption", json=payload, timeout=timeout)
         response.raise_for_status()
         return response.json()
+
+    def speak(
+        self, text: str, language: str = "en", voice: str | None = None,
+        segments: list[str] | None = None,
+        voices: list[str | None] | None = None, *, timeout: float = 300.0,
+    ) -> dict:
+        """One narration clip (design §11.1). `audio` comes back as raw WAV bytes.
+
+        The timeout is generous on purpose: this is a BATCH call on a board that may
+        first have to evict gemma and load the voice model (§8.1).
+        """
+        payload = {"text": text, "language": language, "voice": voice,
+                   "segments": segments, "voices": voices}
+        response = self._client.post("/speak", json=payload, timeout=timeout)
+        response.raise_for_status()
+        return _audio(response.json())
+
+    def music(
+        self,
+        prompt: str = "",
+        seconds: float = 30.0,
+        seed: int | None = None,
+        *,
+        sections: list[dict] | None = None,
+        temperature: float | None = None,
+        guidance: float | None = None,
+        timeout: float = 1800.0,
+    ) -> dict:
+        """The film's score (design §11.1). `audio` comes back as raw WAV bytes.
+
+        `sections` is the whole score — each one continues the previous, so the reply is
+        a single piece whose `segments` say where each section landed.
+
+        1800 s: MusicGen is autoregressive and measured at ~4.9x realtime on this mac,
+        so a three-minute score is fifteen minutes of GPU time, and it may queue behind
+        an in-flight caption.
+        """
+        payload = {"prompt": prompt, "seconds": seconds, "seed": seed,
+                   "sections": sections, "temperature": temperature,
+                   "guidance": guidance}
+        response = self._client.post("/music", json=payload, timeout=timeout)
+        response.raise_for_status()
+        return _audio(response.json())
 
     def text_complete(
         self,
@@ -74,6 +128,18 @@ class ModelsClient:
                 if data == "[DONE]":
                     break
                 yield json.loads(data)["token"]
+
+    def text_context(self, *, timeout: float = 5.0) -> int | None:
+        """Tokens the text model's server accepts (§5.1). `None` when it cannot say.
+
+        Read from the RUNNING server, so a caller assembling a large prompt (the story
+        pass, §11.1) cuts it to what will be accepted instead of losing the whole call
+        to a rejection.
+        """
+        response = self._client.get("/text/context", timeout=timeout)
+        response.raise_for_status()
+        value = response.json().get("context")
+        return int(value) if value else None
 
     def text_embed(
         self, model: str, texts: list[str], *, timeout: float = 60.0

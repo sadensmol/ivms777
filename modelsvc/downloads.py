@@ -29,7 +29,7 @@ import threading
 from collections.abc import Callable
 from pathlib import Path
 
-from models.catalog import GgufSource, HfSource, ModelEntry
+from models.catalog import GgufSource, HfSource, ModelEntry, UrlSource
 
 Progress = Callable[[int, int], None]
 
@@ -175,6 +175,8 @@ class Downloads:
     @staticmethod
     def _source_id(entry: ModelEntry) -> str:
         source = entry.source
+        if isinstance(source, UrlSource):
+            return f"url:{source.url}"
         if isinstance(source, GgufSource):
             return f"gguf:{source.repo}/{source.file}+{source.mmproj_file or ''}"
         if isinstance(source, HfSource):
@@ -194,6 +196,8 @@ class Downloads:
     # --- state ---------------------------------------------------------------
     def is_present(self, entry: ModelEntry) -> bool:
         source = entry.source
+        if isinstance(source, UrlSource):
+            return (self._dir / source.file).exists()
         if isinstance(source, GgufSource):
             return all(dest.exists() for _, dest in self._files(entry))
         if isinstance(source, HfSource):
@@ -209,6 +213,9 @@ class Downloads:
         the popup offer the REMAINDER instead of the whole multi-GB download (§13).
         """
         source = entry.source
+        if isinstance(source, UrlSource):
+            dest = self._dir / source.file
+            return dest.stat().st_size if dest.exists() else 0
         if isinstance(source, GgufSource):
             return sum(dest.stat().st_size for _, dest in self._files(entry) if dest.exists())
         if isinstance(source, HfSource):
@@ -270,6 +277,10 @@ class Downloads:
                     if dest.exists():
                         continue
                     self._http_fetch(url, dest, progress)
+            elif isinstance(source, UrlSource):
+                # One plain file on someone else's host — the same streaming fetcher
+                # the GGUF path uses, so it also gets the atomic `.part` rename.
+                self._http_fetch(source.url, self._dir / source.file, progress)
             else:
                 self._hf_fetch(source.repo, progress)
             error = None

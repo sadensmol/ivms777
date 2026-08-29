@@ -121,3 +121,22 @@ processed photos participate, **rebuild after captioning/embedding completes**.
 The `groups`/`group_photos` tables — reserved and unused in the earlier design — now
 back Memories. They remain available for a future "save this album" action on the
 live organizers.
+
+## Playing a memory
+
+A stored memory can be **played** as a fullscreen feed — Ken Burns photo motion, an
+animated caption overlay, a generated soundtrack and an optional generated narration.
+The mechanics live in design §11.1; what matters here is how it relates to a build:
+
+- **Presentations are prepared per memory AND per language, on demand — never in
+  bulk.** A memories
+  rebuild composes tens of memories; generating audio for all of them would be an
+  hour of GPU time for slideshows nobody asked to watch. The Play control prepares
+  the one memory the user opened.
+- **A rebuild invalidates every presentation, by cascade.** `memory_presentations`
+  is keyed on `group_id` with `ON DELETE CASCADE`, and `replace_memories` deletes
+  the old groups — so no presentation can survive into a memory it was not made for.
+  The generated WAVs are pruned on the next prepare run.
+- **Playback needs no model.** Only preparation does, and only the `voice` and
+  `music` slots (§4.1) — either of which may be `off`, leaving a feed that is still
+  perfectly watchable.

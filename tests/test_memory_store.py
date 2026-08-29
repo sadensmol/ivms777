@@ -111,3 +111,13 @@ def test_stored_signature_reflects_the_built_set(conn):
     assert stored_signature(conn, 1) is None
     replace_memories(conn, 1, [Memory("M", "d.", [1], "sig-42")])
     assert stored_signature(conn, 1) == "sig-42"
+
+
+def test_memory_kind_defaults_to_event_and_round_trips(conn):
+    _photo(conn, 1); _photo(conn, 2)
+    replace_memories(conn, 1, [
+        Memory("A day at Borjomi", "…", [1, 2], "sig"),
+        Memory("Waterfalls", "…", [1], "sig", kind="theme"),
+    ])
+    kinds = {m.title: m.kind for m in read_memories(conn, 1)}
+    assert kinds == {"A day at Borjomi": "event", "Waterfalls": "theme"}

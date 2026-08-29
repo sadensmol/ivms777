@@ -36,6 +36,13 @@ models = [
     # Measured on the Jetson: `.to(device)` costs 5128 MB RSS, `device_map` 2940 MB —
     # the 2.2 GB difference is a host copy that is never freed (design §8.1).
     "accelerate>=1.0",
+    # Feed audio (design §11.1). Models-service-only, exactly like torch itself, and
+    # NOT installed by a plain `uv sync` — so no test may import `audio/`.
+    # `kokoro` is the Apache-2.0 TTS (it needs the `espeak-ng` SYSTEM package for its
+    # G2P). MusicGen needs nothing beyond `transformers`, which is already here — it
+    # replaced Stable Audio Open, whose SDE sampler drives `torchsde` into
+    # non-terminating recursion on this torch/Python stack (see audio/musicgen.py).
+    "kokoro>=0.9.2",
 ]
 
 [dependency-groups]
@@ -52,7 +59,7 @@ build-backend = "hatchling.build"
 # Flat layout: the source lives at the repo root (no package folder), so ship
 # each top-level package plus the config module explicitly.
 [tool.hatch.build.targets.wheel]
-only-include = ["config.py", "albums", "captioning", "chat", "db", "embedding", "inference", "ingest", "models", "modelsvc", "search", "storage", "web"]
+only-include = ["config.py", "albums", "audio", "captioning", "chat", "db", "embedding", "feed", "inference", "ingest", "models", "modelsvc", "organize", "search", "storage", "web"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -4,10 +4,11 @@ torch, no transformers, no Ollama. Task 1 of the models-service refactor."""
 import base64
 import json
 
+import pytest
 from fastapi.testclient import TestClient
 
 from modelsvc.app import create_models_app
-from modelsvc.backends.fake import FakeBackend
+from modelsvc.backends.fake import FAKE_CONTEXT, FakeBackend
 
 _IMAGE_B64 = base64.b64encode(b"not-really-a-jpeg").decode()
 
@@ -142,3 +143,96 @@ def test_text_stream_streams_tokens_as_sse():
 
     assert tokens == ["Hello", " from", " the fake backend."]
     assert lines[-1] == "data: [DONE]"
+
+
+def test_speak_returns_base64_wav_and_the_model_name():
+    with _client() as tc:
+        resp = tc.post("/speak", json={"text": "Beach day."})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert base64.b64decode(body["audio"])[:4] == b"RIFF"
+    assert body["sample_rate"] == 24000
+    assert body["model"] == "fake-voice"
+
+
+def test_music_honours_the_requested_length():
+    from storage.wav import duration_seconds
+
+    with _client() as tc:
+        resp = tc.post("/music", json={"prompt": "warm guitar", "seconds": 3})
+    body = resp.json()
+    assert duration_seconds(base64.b64decode(body["audio"])) == pytest.approx(3.0, abs=0.1)
+    assert body["sample_rate"] == 44100
+
+
+def test_music_is_clamped_to_the_models_ceiling():
+    from storage.wav import duration_seconds
+
+    with _client() as tc:
+        resp = tc.post("/music", json={"prompt": "warm guitar", "seconds": 600})
+    assert duration_seconds(base64.b64decode(resp.json()["audio"])) <= 47.0
+
+
+
+def test_speak_defaults_to_english():
+    with _client() as tc:
+        assert tc.post("/speak", json={"text": "hello"}).status_code == 200
+
+
+def test_the_language_picks_the_voice_without_the_user_choosing():
+    # Kokoro cannot speak Russian, but asking for Russian must JUST WORK: the service
+    # swaps the voice unit to one that can (§11.1). Making the user pick a model in
+    # settings for a language is not a design, it is a bug.
+    with _client() as tc:
+        assert tc.post("/speak", json={"text": "привет", "language": "ru"}).status_code == 200
+        assert tc.post("/speak", json={"text": "hello", "language": "en"}).status_code == 200
+
+
+
+
+def test_music_always_has_a_model_to_use():
+    # "No music" was an option; it is not any more (§11.1), so /music never 503s for
+    # want of a model.
+    with _client() as tc:
+        assert tc.post("/music", json={"prompt": "x", "seconds": 3}).status_code == 200
+
+
+def test_speak_always_has_a_voice_to_use():
+    # "No narration" was an option; it is not any more (§11.1). Both languages just
+    # work, because the language picks the model.
+    with _client() as tc:
+        assert tc.post("/speak", json={"text": "hi", "language": "en"}).status_code == 200
+        assert tc.post("/speak", json={"text": "привет", "language": "ru"}).status_code == 200
+
+
+def test_text_context_reports_what_the_server_accepts():
+    # The story pass budgets its prompt against this (§11.1), so it is served.
+    with _client() as tc:
+        resp = tc.get("/text/context")
+    assert resp.status_code == 200
+    assert resp.json()["context"] == FAKE_CONTEXT
+
+
+# --- the score (§11.1) --------------------------------------------------------------
+
+
+def test_music_accepts_a_whole_score_and_says_where_each_section_landed():
+    with _client() as tc:
+        resp = tc.post("/music", json={"sections": [{"brief": "solo piano", "seconds": 4},
+                                                    {"brief": "brass", "seconds": 6}]})
+    assert resp.status_code == 200
+    segments = resp.json()["segments"]
+    assert len(segments) == 2
+    assert segments[0]["end"] == segments[1]["start"]      # one piece, not two clips
+
+
+def test_music_still_takes_a_single_prompt():
+    with _client() as tc:
+        resp = tc.post("/music", json={"prompt": "warm ambient", "seconds": 4})
+    assert resp.status_code == 200
+    assert len(resp.json()["segments"]) == 1
+
+
+def test_music_with_neither_a_prompt_nor_sections_is_refused():
+    with _client() as tc:
+        assert tc.post("/music", json={"seconds": 4}).status_code == 422

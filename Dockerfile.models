@@ -10,9 +10,10 @@ FROM python:3.12-slim
 # path). libjpeg62-turbo/zlib1g: Pillow runtime. libsndfile1: transformers 5.x
 # eagerly imports `soundfile` from its processing utils, which dlopen()s
 # libsndfile even for a vision-only model like SigLIP; without it
-# `AutoProcessor` import crashes.
+# `AutoProcessor` import crashes. espeak-ng: kokoro's G2P shells out to it for
+# the feed narration (§11.1).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      libheif1 libjpeg62-turbo zlib1g libsndfile1 \
+      libheif1 libjpeg62-turbo zlib1g libsndfile1 espeak-ng \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
@@ -39,6 +40,11 @@ COPY captioning ./captioning
 COPY inference ./inference
 COPY models/__init__.py models/catalog.py models/slots.py ./models/
 COPY search/__init__.py search/signals.py ./search/
+#   audio/             — the feed's TTS + music children (§11.1), torch-owning
+#   storage/wav.py     — WAV encode/measure; numpy + stdlib, the one module `audio`
+#                        and `feed` share across the one-model-process line (§5.1)
+COPY audio ./audio
+COPY storage/__init__.py storage/wav.py ./storage/
 
 ENV PYTHONUNBUFFERED=1 IVMS777_DATA_DIR=/data
 EXPOSE 9000

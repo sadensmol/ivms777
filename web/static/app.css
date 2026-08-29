@@ -372,3 +372,82 @@ img.cite { height: 40px; width: 40px; object-fit: cover; border-radius: 4px;
   /* Settings: full-width sheet rather than a centred card. */
   .settings-dialog { width: 96vw; padding: 1rem; }
 }
+
+/* ▶ Play on a memory card — opens the fullscreen feed (design §11.1). */
+.album-play {
+  display: inline-block;
+  margin-top: 0.4rem;
+  font-size: 0.9rem;
+  text-decoration: none;
+}
+
+/* What the viewer said about a memory, on its Organize card (design §11.3). Styled as
+   quiet annotation rather than as content: it belongs to the memory, but the mosaic
+   and the description are still what the card is for. */
+.album-notes {
+  margin: 0.6rem 0 0;
+  padding: 0.6rem 0 0;
+  border-top: 1px solid rgba(128, 128, 128, 0.25);
+  font-size: 0.82rem;
+}
+.album-notes summary { cursor: pointer; opacity: 0.6; }
+.album-notes summary:hover { opacity: 1; }
+.album-notes ul { list-style: none; margin: 0.5rem 0 0; padding: 0; }
+.album-notes li {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.45rem;
+  margin-bottom: 0.3rem;
+  line-height: 1.4;
+}
+.album-notes a {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.7;
+  text-decoration: none;
+}
+.album-notes a:hover { opacity: 1; text-decoration: underline; }
+.album-notes span { opacity: 0.85; }
+
+/* The viewer's notes on the memory a photo was opened inside (design §11.3). Quiet,
+   and clearly annotation rather than the photograph's own words. */
+.photo-collection-notes {
+  margin: 0.5rem 0 0;
+  padding: 0;
+  font-size: 0.85rem;
+}
+.photo-collection-notes summary { cursor: pointer; opacity: 0.6; }
+.photo-collection-notes summary:hover { opacity: 1; }
+.photo-collection-notes ul { list-style: none; margin: 0.4rem 0 0; padding: 0; }
+.photo-collection-notes li {
+  margin-bottom: 0.25rem;
+  line-height: 1.45;
+  opacity: 0.85;
+}
+.photo-collection-notes .note-at {
+  display: inline-block;
+  margin-right: 0.35rem;
+  padding: 0.02rem 0.35rem;
+  border-radius: 0.7rem;
+  background: rgba(140, 190, 255, 0.16);
+  color: #9cf;
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+}
+
+/* "Rebuild" on a memory card — retell THIS memory (design §11): a new description and
+   a better order for its photographs. Quiet, because it is the heavier of the two
+   rebuilds and should not be reached for by accident. */
+.album-retell { display: inline-block; margin-left: 0.5rem; }
+.album-retell button {
+  padding: 0.2rem 0.6rem;
+  border: 1px solid rgba(128, 128, 128, 0.4);
+  border-radius: 1rem;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 0.8rem;
+  opacity: 0.6;
+  cursor: pointer;
+}
+.album-retell button:hover:not(:disabled) { opacity: 1; }
+.album-retell button:disabled { opacity: 0.3; cursor: default; }

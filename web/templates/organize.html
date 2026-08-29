@@ -43,6 +43,10 @@
   <div class="albums">
     {% for album in albums %}
       {% set ctx = 'ctx=album:' + active + ':' + (active_grain or '') + ':' + album.key %}
+      {# Only a memory can be PLAYED (§11.1): the live organizers are views over the
+         library, with no story to narrate and nothing stored to prepare. #}
+      {% set play_url = ('/feed/' + album.key) if active == 'memories' else None %}
+      {% set notes = (notes_by_key or {}).get(album.key) %}
       {% include "_album_card.html" %}
     {% endfor %}
   </div>

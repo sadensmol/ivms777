@@ -93,3 +93,85 @@ def test_registry_exposes_the_live_organizers_and_defaults_to_date(conn):
     assert get_organizer(None).name == "date"
     assert get_organizer("place").name == "place"
     assert get_organizer("nonsense").name == "date"
+
+
+def test_memory_albums_carry_their_kind(conn):
+    from albums.memories import MemoriesOrganizer
+    from albums.memory_store import Memory, replace_memories
+    _photo(conn, 1)
+    replace_memories(conn, 1, [Memory("Waterfalls", "…", [1], "sig", kind="theme")])
+    album = MemoriesOrganizer().organize(conn, 1)[0]
+    assert album.meta["memory_kind"] == "theme"
+
+
+def test_the_memory_agent_decides_the_order_photos_are_told_in():
+    # Decided ONCE, when the memory is built: the album shows this order and every film
+    # of the memory follows it, until the memory is rebuilt (§11).
+    from albums.compose import _ordered
+
+    assert _ordered([3, 1, 2], [1, 2, 3]) == [3, 1, 2]
+
+
+def test_the_order_can_never_lose_or_invent_a_photograph():
+    # Repaired rather than trusted: a memory that silently drops one of its own photos
+    # is a bug the user can see and cannot explain.
+    from albums.compose import _ordered
+
+    assert _ordered([9, 3], [1, 2, 3]) == [3, 1, 2]      # 9 invented, 1 and 2 forgotten
+    assert _ordered(None, [1, 2, 3]) == [1, 2, 3]
+    assert _ordered([2, 2, 2], [1, 2, 3]) == [2, 1, 3]   # duplicates collapse
+    assert sorted(_ordered([3], [1, 2, 3])) == [1, 2, 3]
+
+
+def test_the_prompt_asks_for_the_order_and_says_who_owns_it():
+    from albums.compose import _SYSTEM_PROMPT
+
+    assert '"order"' in _SYSTEM_PROMPT
+    assert "decided here and nowhere" in _SYSTEM_PROMPT
+    assert "NEXT TO EACH OTHER" in _SYSTEM_PROMPT     # group related pictures
+    assert "FOR that order" in _SYSTEM_PROMPT         # the description follows it
+
+
+def test_rewriting_a_memory_keeps_its_identity_and_reorders_its_photos(conn):
+    # In place, so `memory_notes` — which cascade on the group id — survive a retelling
+    # (§11.3). `replace_memories` would take them with it.
+    from albums.memory_store import (
+        Memory,
+        photo_ids_for_group,
+        replace_memories,
+        rewrite_memory,
+    )
+    from tests.factories import add_photo
+
+    for pid in (1, 2, 3):
+        add_photo(conn, photo_id=pid, content_hash=f"h{pid}", thumb_key=f"{pid}.jpg")
+    replace_memories(conn, 1, [Memory("Old", "Old words.", [1, 2, 3], "sig")])
+    gid = conn.execute("SELECT id FROM groups WHERE kind='memory'").fetchone()["id"]
+    conn.execute("INSERT INTO memory_notes(group_id, at_seconds, text, created_at)"
+                 " VALUES (?, 1.0, 'mine', 'now')", (gid,))
+
+    rewrite_memory(conn, gid, Memory("New", "New words.", [3, 1, 2], "sig"))
+
+    assert conn.execute("SELECT id FROM groups WHERE kind='memory'").fetchone()["id"] == gid
+    row = conn.execute("SELECT name, description FROM groups WHERE id = ?", (gid,)).fetchone()
+    assert row["name"] == "New" and row["description"] == "New words."
+    assert photo_ids_for_group(conn, gid) == [3, 1, 2]
+    assert conn.execute("SELECT COUNT(*) c FROM memory_notes").fetchone()["c"] == 1
+
+
+def test_retelling_leaves_every_other_memory_alone(conn):
+    from albums.memory_store import Memory, photo_ids_for_group, replace_memories, rewrite_memory
+    from tests.factories import add_photo
+
+    for pid in (1, 2, 3, 4):
+        add_photo(conn, photo_id=pid, content_hash=f"h{pid}", thumb_key=f"{pid}.jpg")
+    replace_memories(conn, 1, [Memory("A", "a", [1, 2], "sig"),
+                               Memory("B", "b", [3, 4], "sig")])
+    rows = conn.execute("SELECT id, name FROM groups WHERE kind='memory' ORDER BY id").fetchall()
+    first, second = rows[0]["id"], rows[1]["id"]
+
+    rewrite_memory(conn, first, Memory("A retold", "a2", [2, 1], "sig"))
+
+    assert photo_ids_for_group(conn, first) == [2, 1]
+    assert photo_ids_for_group(conn, second) == [3, 4]
+    assert conn.execute("SELECT name FROM groups WHERE id = ?", (second,)).fetchone()["name"] == "B"

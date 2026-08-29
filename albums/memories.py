@@ -22,7 +22,7 @@ class MemoriesOrganizer:
                     description=memory.description,
                     photo_ids=memory.photo_ids,
                     cover_id=memory.photo_ids[0],
-                    meta={"kind": "memory"},
+                    meta={"kind": "memory", "memory_kind": memory.kind},
                 )
             )
         return albums

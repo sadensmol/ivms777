@@ -14,14 +14,15 @@ and lets you search, filter, find similar photos, browse suggested groups, and
 ask questions about the collection in plain language.
 
 **Stage 2 — reorganize, on your machine.** When the collection is fully
-processed, `ivms777-sync` — a small standalone CLI that runs on the machine
-holding the photos — downloads the collection state and applies it to disk: it
-sorts files into a chosen folder layout, renames them consistently, and sweeps
-redundant copies aside. It plans first and shows you every operation before it
-touches anything.
+processed, Organize turns the principle on screen into a downloadable **plan
+document**, and `ivms777-sync` — a small standalone CLI that runs on the machine
+holding the photos — applies it: it creates one folder per album inside your own
+folder, moves each file into the folder its album chose, writes each album's
+description alongside, and sweeps redundant copies aside. Filenames never change.
+It shows you every operation and asks before it touches anything.
 
-The two stages share nothing but a manifest. The cloud never reaches into your
-filesystem; the CLI never needs your library uploaded a second time.
+The two stages share nothing but that plan document. The cloud never reaches into
+your filesystem; the CLI never needs your library uploaded a second time.
 
 All inference runs on hardware you control. Photos never go to a third-party
 API.
@@ -136,7 +137,16 @@ The projector is the **Q8_0** build — `mmproj-gemma-4-E2B-it-Q8_0.gguf` (531 M
 OOM-aborted `llama-server`: its CLIP tensor buffer (589 MiB) was the allocation that
 failed. The weights still come from `unsloth/…`, so the projector has its own repo
 var (`LLAMA_MMPROJ_REPO`). A small KV context (`IVMS777_LLM_CTX`, jetson 2048) keeps
-the rest down. If a pinned all-GPU load still does not fit, `llama-server` aborts at
+the rest down. **mac is not memory-bound and does not pay that price: it serves
+`-c 32768`** (`make up` passes `LLAMA_CTX` and exports the same number to `app`/
+`worker`). Measured on a 32 GB machine, llama-server is 4.11 GiB resident at 4096 and
+4.28 GiB at 32768 — gemma's sliding window keeps the KV cache small, so the whole
+increase costs ~0.17 GiB. 4096 was not a saving, it was a ceiling: a 40-shot memory's
+story prompt is ~6 300 tokens, llama-server **rejects** (never truncates) an
+over-long request, and the film failed for want of narration. `make llama-mac` reads
+the running server's `/props` and RESTARTS it when its context is not the wanted one —
+a `-c` change is the one thing that does not hot-reload, and a stale server looks
+exactly like a broken feature. If a pinned all-GPU load still does not fit, `llama-server` aborts at
 model load (`failed to fit params to free device memory … abort`) — that is a **hard,
 surfaced error** (`app` streams an error turn to the chat UI), and the only fix is
 to **shrink the GPU footprint** (smaller KV context, Q8 projector, smaller model
@@ -266,9 +276,13 @@ boundary needs no holes, and the same deployment serves a user who is nowhere
 near it.
 
 **Why not have the browser reorganize files directly.** The File System Access
-API can write to a user-picked directory, but only on Chromium desktop — Firefox
-has no directory picker, Safari is read-only, and mobile has neither. Stage 2 is
-a CLI instead, which works on every OS and has no browser to disagree with.
+API can write to a user-picked directory (`showDirectoryPicker()` plus
+`FileSystemFileHandle.move()`), but only on Chromium desktop — Firefox has no
+directory picker, Safari is read-only, and mobile has neither. It is also
+**secure-context only**, so on the normal LAN address `http://<jetson>:8000` the
+whole API is `undefined` — the same wall `crypto.subtle` hits above, and a fatal
+one here because there is no pure-JS fallback for writing to a disk. Stage 2 is a
+CLI instead (§12), which works on every OS and has no browser to disagree with.
 
 ### 3.2c The upload folder list, and deleting a folder
 
@@ -335,11 +349,10 @@ default, not code.
 
 ### 4.1 Model slots — the catalog, and switching a model while the app runs
 
-The four models above are not hardcoded: they are the **defaults of four slots**,
-and the user picks a different model per slot from the settings popup (§13) while
-the app is running. A slot is the unit everything else names — the registry, the
-governor's budget, the scheduler's "needs" list, and the ingest stages a switch
-invalidates.
+The models above are not hardcoded: they are the **defaults of six slots**, and the
+user picks a different model per slot from the settings popup (§13) while the app is
+running. A slot is the unit everything else names — the registry, the governor's
+budget, the scheduler's "needs" list, and the ingest stages a switch invalidates.
 
 | Slot | Default | Role | Switching invalidates |
 |---|---|---|---|
@@ -347,6 +360,26 @@ invalidates.
 | `text_embed` | `nomic-embed-text-v1.5` | caption-meaning vectors (§9) | `caption_embed` |
 | `caption` | `gemma4-E2B` GGUF (vision) | the caption sentence | `caption` → `caption_embed` |
 | `planner` | `gemma4-E2B` GGUF (text) | query planner + chat | nothing (no stored output) |
+| `voice` | Kokoro-82M (en) · Silero v4_ru (ru) | the narration read over a memory film (§11.1) | nothing (no stored output) |
+| `music` | MusicGen **medium** on mac · small on jetson/cloud | the score generated per memory film (§11.1) | nothing (no stored output) |
+
+**`off` is a real catalog entry, not a missing one.** `voice` and `music` are the two
+**optional** slots, so the catalog carries an `off` entry (`source=NoSource()`,
+`cost_mb=0`) for each. Selecting it unregisters the residency unit entirely, so the
+governor never budgets for it and the settings popup shows it as always "on disk".
+The feed then degrades honestly for MUSIC only: no music means the film plays silent.
+**Narration is not optional** — a film whose voice cannot be produced FAILS (§11.1)
+rather than playing mute. `music` is `off` **by default on jetson**
+— its resident cost is an estimate, and an unmeasured ~3 GB child on a board with
+~4.3 GB free must be opted into, never defaulted on (§8.1).
+
+**A voice entry declares which languages it can speak.** `voice` is the one slot whose
+usable set depends on something outside the slot — the film's language (§11.1). So a
+`voice` entry carries `languages` (`("en",)` for Kokoro, `("ru",)` for Silero),
+`POST /speak` takes the language, and it answers **503** when the selected voice cannot
+speak it. Kokoro ships nine languages upstream but **not Russian**, which is exactly
+why a second entry exists rather than a bigger one — and why the settings popup states
+each voice's languages.
 
 `caption` and `planner` are **separately selectable but share one `llama-server`
 child** — one process, one port. If they resolve to different GGUFs the child
@@ -358,7 +391,9 @@ keeps that restart to the projector alone.
 entry per selectable model, carrying everything every consumer needs so nothing
 downstream has to know model names:
 
-- `source` — the Hugging Face repo id, or the GGUF repo + file (+ mmproj file).
+- `source` — the Hugging Face repo id, the GGUF repo + file (+ mmproj file), or
+  `NoSource()` for the `off` entry of an optional slot (nothing to fetch, nothing
+  to load, always "on disk").
 - `cost_mb` — the resident cost the governor budgets against (§8.1), and whether
   that figure is **measured on this board or an estimate**. An estimate is shown
   as unverified in the UI, because an over-estimate can make a model unloadable
@@ -442,24 +477,27 @@ source of truth").
 flowchart TB
     subgraph machine["Your machine"]
         disk[("Photos on disk<br/>sources — the app never writes here")]
-        browser["Browser<br/>/upload · /library · /photo · /organize · /chat"]
-        sync["ivms777-sync CLI<br/>plan · apply · undo · verify"]
+        browser["Browser<br/>/upload · /library · /photo · /organize · /feed · /chat"]
+        sync["ivms777-sync CLI<br/>apply · undo · verify<br/>reads the downloaded plan document"]
     end
 
     subgraph gpu["The GPU box · docker compose (jetson/cloud) · host processes (mac)"]
-        app["app · FastAPI + Jinja + HTMX<br/>UI · read queries · upload receipt · /api/manifest<br/>NO models, NO torch — a thin client of the models service"]
-        worker["worker · ingest pipeline (primary writer)<br/>facets · thumbs · taxonomy · caption · memories · deletions<br/>NO models, NO torch — a thin client of the models service"]
-        models["models · THE ONE INFERENCE GATEWAY (§5.1)<br/>the only process that imports torch/transformers AND the only client of the inference server<br/>hosts the image/text embedder in KILLABLE TorchWorker children (parent imports no torch) on the GPU — mps (mac) / cuda (jetson, cloud), NEVER cpu (§3.1) · memory governor swaps embedder↔LLM under budget (§8.1)<br/>owns the model slots + downloads (§4.1)<br/>HTTP: /embed/image · /embed/text · /embed/spec · /tag · /caption · /plan · /chat · /resources · /models/*"]
+        app["app · FastAPI + Jinja + HTMX<br/>UI · read queries · upload receipt · /api/plan (stage-2 plan document)<br/>NO models, NO torch — a thin client of the models service"]
+        worker["worker · ingest pipeline (primary writer)<br/>facets · thumbs · taxonomy · caption · memories · feed audio · deletions<br/>NO models, NO torch — a thin client of the models service"]
+        models["models · THE ONE INFERENCE GATEWAY (§5.1)<br/>the only process that imports torch/transformers AND the only client of the inference server<br/>hosts the image/text embedder in KILLABLE TorchWorker children (parent imports no torch) on the GPU — mps (mac) / cuda (jetson, cloud), NEVER cpu (§3.1) · memory governor swaps embedder↔LLM under budget (§8.1)<br/>owns the model slots + downloads (§4.1)<br/>HTTP: /embed/image · /embed/text · /embed/spec · /tag · /caption · /speak · /music · /plan · /chat · /resources · /models/*"]
         infer["inference · llama.cpp llama-server (mac/jetson) | vLLM (cloud)<br/>ONE gemma4-E2B GGUF — text (planner/chat) AND vision (caption), on the GPU<br/>reached ONLY by the models service · (host on mac, container on jetson/cloud)"]
         db[("SQLite WAL<br/>sqlite-vec + FTS5 · named volume")]
-        store[("Storage<br/>originals + thumbnails")]
+        store[("Storage<br/>originals + thumbnails + feed audio")]
     end
 
     disk -.->|user selects| browser
     browser -->|"upload: probe hashes + send new bytes"| app
     browser -->|"read UI · SSE chat"| app
-    sync -->|"GET /api/manifest"| app
-    sync -->|"plan / apply — the ONLY writer to disk"| disk
+    browser -->|"fullscreen memory film: Edit JSON + generated audio · WebGL (NO model)"| app
+    browser -->|"Organize → confirm → download ivms777-plan.json"| app
+    sync -->|"verify: GET /api/plan"| app
+    disk -.->|"you save the plan into the folder"| sync
+    sync -->|"apply / undo — the ONLY writer to disk"| disk
 
     app <-->|"reads · small short writes"| db
     worker <-->|"owns writes"| db
@@ -476,7 +514,7 @@ flowchart TB
     class db,store,disk,hf store;
 ```
 
-`app` serves the UI, read queries, upload receipt, and the manifest endpoint.
+`app` serves the UI, read queries, upload receipt, and the stage-2 plan endpoint.
 `worker` owns the ingest pipeline and is the primary writer. Both open the same
 SQLite file in WAL mode with a busy timeout — SQLite permits one writer at a
 time, and `app`'s writes are small and short (recording a received upload,
@@ -500,8 +538,9 @@ never the CPU (§3.1) — and captioning is the same OpenAI `/v1` call to
 from config; `app`/`worker` and the whole request flow are identical across
 platforms.
 
-`ivms777-sync` is not part of the deployment. It talks to `app` over HTTP,
-reads one endpoint, and is the only component that ever writes to your disk.
+`ivms777-sync` is not part of the deployment. It executes a plan document the
+browser downloaded — `apply` needs no network at all, and only `verify` calls
+`app` — and it is the only component that ever writes to your disk.
 
 Vector search uses `sqlite-vec`, which ships prebuilt wheels for arm64 and
 x86_64, so the same code works on Mac, Jetson, and cloud. At 5,000 photos a
@@ -552,7 +591,36 @@ HTTP.
 - `POST /caption` — a caption sentence (title/description) for one image (OpenAI
   `/v1` call to `llama-server` with the image as an `image_url`, §4). It returns
   **no tags** — tags are SigLIP-only (§7).
+- `POST /speak` — `{text, language, voice}` → `{audio (base64 WAV), sample_rate,
+  model}`: one narration clip for a memory film (§11.1), from the `voice` residency
+  unit. `Priority.BATCH` — a film is prepared offline and must never preempt a search
+  or a chat turn. **503** when the `voice` slot holds `off`, **or** when no offered
+  voice lists `language` in its catalog `languages` (§4.1). Any other synthesis failure
+  is a **500 carrying the model's own message**, because that reason is shown to the
+  user: a film with no speech is a FAILED film (§11.1), so the error has to be
+  readable, never swallowed into "no voice".
+- `POST /music` — `{sections | prompt, seconds, seed, temperature, guidance}` →
+  `{audio (base64 WAV), sample_rate, model, segments}`: the whole SCORE for a memory
+  film in one call (§11.1). `sections` is `[{brief, seconds}]` in running order, and
+  each one is generated as a **continuation** of the previous one's tail, so the reply
+  is a single piece that changes rather than several clips; `segments` says where each
+  section actually landed, because a token count never divides exactly into the seconds
+  asked for. `prompt` is the one-section form. `temperature`/`guidance` are the
+  decoding controls — left unset they are MusicGen's own defaults, which is one setting
+  for every memory. Old shape, kept for reference: `{prompt, seconds, seed}` → `{audio,
+  sample_rate, model}` — one clip, looped by the player, which is what made every film
+  sound the same. Served from the `music` residency unit
+  (MusicGen small, 32 kHz mono, generated autoregressively — the caller's `seconds` is
+  clamped to a 30 s COST cap, not a model limit). `Priority.BATCH`. **503** when the
+  `music` slot holds `off`.
+  A 503 from either is not a failure: it is the documented "the user turned this
+  off" answer, and the feed is still prepared without that track.
 - `POST /plan`, `POST /chat` — text generation (query planner, chat answers).
+- `GET /text/context` — how many tokens the text server accepts, read from the
+  RUNNING server (llama.cpp `/props`), falling back to the configured `llm_ctx` when
+  it cannot be asked. Callers that assemble a large prompt cut it to fit (§11.1);
+  the setting alone will not do, because it disagrees with the server exactly when it
+  matters — after a `-c` change and before a restart.
 - `POST /text/embed` — caption-meaning text embeddings (§9) from the **dedicated
   text embedder `nomic-embed-text-v1.5`**, in its own worker child (`TextBackend`,
   `embedding/text_embedder.py`) — NOT `/embed/text` (that is SigLIP, image↔text
@@ -620,13 +688,21 @@ The library is one SQLite file. **The full DDL — every table and index, the
   each with a `score` (0..1) and a `source`, so the UI can show why a tag is present.
 - **`jobs`** — one row per (photo, stage): the resumable ingest queue (§8).
 - **`app_settings`** — one key/value row per owner-level setting the UI can
-  change. It holds the four model-slot choices (§4.1); an absent key means "use
+  change. It holds the six model-slot choices (§4.1) and **`feed_language`** — `en`
+  (default) or `ru`, the language a film is written and narrated in (§11.1); an absent key means "use
   the env override, else the profile default", so a fresh library and an untouched
   install behave identically. `photo_vec`'s declared width follows the selected
   `image_embed` model's `dim` — a switch to a different width **drops and recreates
   the vec0 table** rather than migrating it (§4.1).
 - **`groups` / `group_photos`** — a many-to-many junction backing Memories, so a
   photo may belong to any number of memories (§11).
+- **`memory_presentations`** — one row per memory **per language** that has been
+  prepared as a film (§11.1), keyed `(group_id, language)`: the `Edit` JSON, the
+  storage keys of the two generated WAVs, and the library signature it was built
+  against. `group_id` cascades from `groups`, so §11's atomic memory swap drops every
+  stale presentation in every language for free — a recycled group id can never
+  inherit a previous memory's film. A presentation is stale exactly when its stored
+  signature no longer matches the library's.
 - **`uploads`**, **`chat_sessions` / `chat_messages`** — the folder list (§3.2c) and
   the persisted chat transcript (§10).
 
@@ -757,8 +833,8 @@ The design decisions that matter:
 - **Reprocess & self-heal.** Originals are kept, so any stage can be re-run — per
   library range or per photo — without re-uploading, and self-healing backfills
   queue any missing derived state each drain.
-- **The manifest gate.** `/api/manifest` marks the library `complete` only when no
-  job is pending/running; `ivms777-sync` refuses an incomplete manifest without
+- **The plan gate.** `/api/plan` marks the library `complete` only when no job is
+  pending/running; `ivms777-sync` refuses an incomplete plan without
   `--allow-incomplete` (§12).
 
 ### 8.1 In-process residency — the memory governor (swap under budget)
@@ -777,13 +853,28 @@ under-estimate loads a model on top of one that should have been evicted and OOM
 the box (the gemma "connection refused" bug).
 
 **Residents are named by slot, not by model** (§4.1), so switching a model never
-renames anything the governor, the scheduler or a "needs" list mentions. The four
-residency units are `image_embed`, `text_embed`, `llm` and `llm_vision`; the last
-two are the `planner` and `caption` slots' two spawn modes of one `llama-server`
-child on one port, so they are **mutually exclusive**: making either resident frees
-the other (§3.1). A text chat never loads the vision half. `cost_mb` comes from the
-selected catalog entry, not from a fixed per-name table, so a heavier model brings
-its own budget figure with it.
+renames anything the governor, the scheduler or a "needs" list mentions. The
+residency units are `image_embed`, `text_embed`, `llm`, `llm_vision`, `voice` and
+`music`; `llm` and `llm_vision` are the `planner` and `caption` slots' two spawn
+modes of one `llama-server` child on one port, so they are **mutually exclusive**:
+making either resident frees the other (§3.1). A text chat never loads the vision
+half. `cost_mb` comes from the selected catalog entry, not from a fixed per-name
+table, so a heavier model brings its own budget figure with it.
+
+**A slot set to `off` has no residency unit at all** (§4.1). `voice` and `music` are
+optional, and "off" is not a zero-cost unit — it is an **absent** one: `SlotManager`
+unregisters it, so the governor cannot be asked to load a model that does not exist,
+and switching back re-registers it.
+
+**The feed's two models are batch-only and short-lived.** `voice` and `music` are
+needed only while a memory feed is being *prepared* (§11.1), never while one plays —
+the player is plain HTML and loads no model at all. Both are `TorchWorker` children
+on the GPU and both are ordinary governor units, so on the jetson they swap against
+gemma exactly as SigLIP does. Neither cost is measured yet: `music` (MusicGen small,
+~2600 MB by estimate) is therefore **`off` by default on jetson**, and both
+figures must be measured on the board the way this section requires — the drop in
+`psutil.virtual_memory().available` across a load — and pinned with
+`IVMS777_MODEL_COST_MB='{"music": <measured>}'` before they are trusted next to gemma.
 
 **Residency is a claim about the world, not a note to self.** gemma lives in a
 separate process that can die without asking us — `llama-server` aborts (SIGABRT) the
@@ -1317,28 +1408,669 @@ background thread, one at a time; the tab flags **stale** when the library signa
 captioning/embedding completes. Rebuild details, and the superseded heuristic seeder,
 are in [`docs/memories.md`](memories.md#cost-and-rebuild).
 
-## 12. Stage 2 — the local sync tool
+**Organize is also the entry to stage 2.** Whatever principle is on screen can be
+turned into folders on your own disk: **Organize files…** previews the tree that
+principle would create, asks whether to reorganize that way, and downloads a plan
+document the local CLI executes (§12). The organizer *is* the layout — nothing else
+is configured. Overlapping memories are resolved at that boundary only, in the plan:
+the event owns the file, themes become description-only folders. The app itself keeps
+the overlap.
+
+### 11.1 Playing a memory — the film
+
+A memory is a story, so it is **played as a short film**, not paged as a slideshow.
+`/feed/{key}` is a fullscreen presentation of one memory: the camera moves through
+each photo, shots dissolve and cut into one another on a deliberate rhythm, a
+generated atmospheric track plays under it, and a generated voice reads a script
+written for that memory — in English or Russian.
+
+**Generation is offline; playback loads no model.** This is the governing rule, and
+it is what keeps the film viable on the 8 GB board. A background job prepares the
+artifacts once per memory **per language**; the player is plain WebGL over the
+thumbnails that already exist.
+
+**One timeline, not three things playing at once.** Picture, score and voice are the
+same clock. Every shot carries an **absolute `at`**, the player looks the current shot
+up by the audio element's own `currentTime`, and a cut is placed on a **detected
+downbeat** while a title card is placed on the **exact narration sentence** that says
+it. A duration-chain drifts against audio within seconds, and a drifting cut is the
+whole difference between a film and a slideshow with a soundtrack near it.
+
+**Five stages, and two of them use a model.**
+
+1. **Signals** (`feed/signals.py`) — read what the library already knows about each
+   photo: orientation from `width`/`height`, the top-scoring label per tag dimension
+   (`vibe`, `palette`, `light`, `quality`, `subject`, …), `place_city`, `shot_at`,
+   and its SigLIP vector. Pure SQL.
+2. **Direct** (`feed/director.py`) — turn those signals into an **`Edit`**: for each
+   shot a duration, a **camera move** (scale + translation, eased), the **transition**
+   into it, a **colour grade**, and whether it is a **hero** shot. Deterministic, no
+   model, so the same memory always cuts the same way. The rules:
+   - **the camera only ever pushes**, never pans, and never reverses between shots.
+     An earlier version alternated direction and swept sideways along the photo's long
+     edge; together those made the film rock like a boat for its whole runtime. The
+     variation is in HOW MUCH a shot moves, never in which way. The one exception is
+     the **opening shot, which pulls back** — a reveal is how a film starts, and a
+     single bookend is not an oscillation;
+   - a **burst** — consecutive shots inside 90 s whose image cosine clears
+     `STRICT.image` (0.80, §9) — collapses into a fast montage of hard cuts, because
+     six near-identical frames are one moment, not six;
+   - a **hero** shot (`quality=sharp` high, `subject=person` present) is held longer
+     on a slow push-in;
+   - a **chapter beat** — a time gap over three hours, or a change of `place_city` —
+     is a dip to black;
+   - `palette` + `light` pick the **grade**;
+   - pacing opens slow, tightens through the middle, and closes slow.
+3. **Story** (`feed/story.py`) — ONE model call, for the things taste owns: the
+   narration script, the sparse title cards, and the music prompt. It is shown the
+   **same rich briefs the conductor gets** — every taxonomy dimension, the place, the
+   hour, the camera — plus a **digest of the memory as a whole** (`signals.digest`):
+   how many photographs, over what span, where, and the dominant occasion, mood,
+   weather and light. It was previously shown only the bare vision sentence, so it
+   wrote about pictures instead of about an evening; the labels are what turn "several
+   individuals in front of illuminated structures" into "a snowy holiday night in
+   Tbilisi". Written **directly in the target language**, so it is also the translation — the shot lines
+   are never the raw `ai_title`, which is object labelling ("Spray Bottle in Hand")
+   and reads as such.
+4. **Audio** — narration (`POST /speak`) and the score (`POST /music`), both `BATCH`.
+   **Narration is MANDATORY and music is not.** A film is a story being told; with no
+   voice there is no film, only a slideshow. So a narration that cannot be written in
+   the film's language, or cannot be spoken, **fails the whole prepare**: the row is
+   stored `status='failed'` with the reason, the page shows that reason instead of a
+   player, and nothing half-made is presented as ready. Music failing is still only a
+   silent film.
+
+   **The voice reports WHERE each sentence lands.** `POST /speak` returns `segments`
+   — `[{text, start, end}]` — because only the voice child knows how long a sentence
+   took to say, and the conductor cannot put a picture under a sentence it cannot
+   locate. Silero gets them free from the length-limit chunking below; kokoro already
+   yields per sentence.
+
+   **The narration decides the runtime.** The film is as long as the voice plus a
+   three-second tail, not as long as a sum of nominal shot holds. It used to be the
+   other way round, which is exactly how the voice ended up finishing halfway through
+   the pictures. The conductor's plan is then **clamped to that runtime** — the last
+   shot lands exactly on it — because a model asked to fill sixty seconds will happily
+   return ninety, and a film that outlives its own audio finishes in silence, which
+   reads as a hang.
+
+   **The script is sized to the PHOTOGRAPHS** (`story.narration_words`): about 14-22
+   words per shot, floored at 55 and capped at 400. A fixed 200-400 words over a
+   three-photo memory is a minute of speech across three pictures — a forty-second hold
+   on one still, which is not a long take, it is a stall.
+
+   **A run that is INTERRUPTED says so.** A prepare runs on a daemon thread; if the
+process goes away underneath it — a code reload, a restart, a crash — nothing is written
+and the page simply shows the Prepare button again, which is indistinguishable from
+never having clicked it. So a `running` row is written when the run starts, and a
+`running` row with no live thread is reported as "the last run was interrupted". It is
+only written when there is nothing to lose: an interrupted **Regenerate** leaves the
+previous film playable.
+
+**A stored film with no `narration_key` is never played.** Rows written before
+   narration became mandatory are silent, and some carry an English script under a
+   Russian film; the page offers to prepare them again and says why, rather than
+   playing one.
+
+   **Long narration is split before it reaches the voice.** The script is 200-400
+   words, and Silero v4_ru refuses anything past roughly a thousand symbols
+   (`Model couldn't generate your text, probably it's too long`) — which silently cost
+   every Russian film its voice. The Silero child therefore cuts the script at sentence
+   boundaries into pieces well under that ceiling and concatenates the clips itself, so
+   one WAV still crosses the boundary. Kokoro already chunks per sentence internally.
+
+5. **Conduct** (`feed/conductor.py`) — the SECOND model call, and the one that makes
+   the film one thing. It is briefed with everything the machine knows and asked for a
+   single plan:
+
+   - every photograph's **full signal set** (`ShotSignal.brief()`): the rich
+     description, all ten taxonomy dimensions, place, time, camera, aperture, ISO,
+     orientation — so it can answer *which picture is this sentence about?*;
+   - **where every narration sentence starts and ends**, to the millisecond;
+   - **where every musical downbeat falls** (`feed/beats.py`), plus the tempo;
+   - the **effect library** (`feed/effects.py`), each entry describing what it looks
+     like, when to reach for it and when not to, with every parameter's range explained.
+
+   It returns, per position: which photograph plays, when it starts, how long it holds,
+   which effect with which parameters, and how it arrives. **It may reorder the film** —
+   showing the cat while the voice talks about the cat is the entire point, and a frozen
+   order cannot do that.
+
+   Nothing trusts the answer. `director.with_arrangement` repairs it: every photograph
+   appears exactly once, times are forced monotonic, names are validated, out-of-range
+   numbers are clamped, and a plan of the wrong length is dropped whole. A failed call
+   falls back to an even, beat-snapped arrangement, so a film never depends on it.
+
+**The beat grid is signal processing, not a model** (`feed/beats.py`). Spectral flux →
+onset envelope → tempo by autocorrelation → a phase-fitted pulse train, in numpy, on the
+clip we just generated. Cuts snap to a downbeat only within 0.35 s: sync serves the edit,
+it does not overrule it.
+
+**Nothing may JUMP at a cut.** The outgoing shot ends its push at, say, 1.12 while the
+incoming one begins at 1.00 — and because a dissolve shows both at once, the eye reads
+that difference as the picture snapping as the blend crosses over. So the incoming shot
+does not start on its own trajectory: it starts at **exactly the outgoing shot's current
+transform** — scale, offset and blur — and eases onto its own across the transition. At
+`tTrans = 0` the two are identical, so there is nothing to jump; by `tTrans = 1` the new
+shot owns its move. A hard `cut` is deliberately exempt: changing everything at once is
+what a cut is for. Beat weights are eased for the same reason — a linear ramp announces
+its own start and stop, where an eased one just becomes the next thing.
+
+**The craft pass ROTATES through the library** (`director._default_beats`). Which bed a
+shot gets suits the photograph, but *which of the suitable ones* rotates by shot index —
+deterministically, so a memory always cuts the same way. Without it, a memory whose
+photographs share one `light` tag received one identical bed on every shot and the film
+read as "two effects": a bit of light and a bit of movement.
+
+**A shot is an ARC, not a filter** (`effects.pack_beats`). One treatment held for eight
+seconds is a screensaver, so every shot carries a **sequence of beats** —
+`{effect, params, from, to}` with the times as fractions of that shot — and they
+**overlap**, so one hands over to the next instead of snapping. At most `MAX_ACTIVE`
+(two) play at once: one thing you notice and one thing you feel; past that the frame
+stops being a photograph. The shape that works, and the one the craft pass produces
+without any model: something **arrives** at the cut (`rack_focus`, `glitch`), a **bed**
+runs under most of the hold (`breeze`, `weave`, `bloom`, `bokeh`), and on a long hold
+something **leaves** near the end (`light_leak`, `pulse`). The renderer cross-fades each
+beat's weight over half a second and composes the two live ones in one pass — A's warp
+feeds B's, and B's colour pass sees A's output, so "a focus pull settling into a breeze"
+is one continuous thing rather than two filters fighting.
+
+**The effect library is data, and its descriptions ARE the interface** (`feed/effects.py`).
+**Thirty-six shot effects and fourteen transitions**, in six families:
+
+| family | effects |
+|---|---|
+| the plain push | `plain` |
+| optics — what the lens does with light | `rack_focus`, `bloom`, `bokeh`, `light_leak`, `anamorphic_flare`, `god_rays`, `prism`, `soft_focus`, `spotlight` |
+| colour — the same picture, developed differently | `duotone`, `bleach_bypass`, `cross_process`, `infrared`, `colour_isolate`, `flash` |
+| geometry — what the camera does with the frame | `breeze`, `pixelate`, `zoom_punch`, `shake`, `dolly_swing`, `mirror`, `kaleidoscope`, `tilt`, `parallax` |
+| the surface it is shown on | `weave`, `film_burn`, `vhs`, `crt`, `halftone`, `paper` |
+| rhythm — things that happen ON the beat | `pulse`, `glitch`, `strobe_cut`, `freeze_ripple`, `echo` |
+
+Transitions: `dissolve`, `cut`, `dip`, `whip`, `burn`, `slide`, `slide_up`, `zoom_blur`,
+`glitch_cut`, `iris`, `page_turn`, `shatter`, `match_zoom`.
+
+Each is one fragment-shader branch plus **four numbers packed positionally into a `vec4`**
+(`PARAM_ORDER`), so no effect costs a pass, a framebuffer or a texture. A model handed
+`{"bloom": "id 2"}` picks at random; a model told *what it looks like, when to use it and
+when to avoid it* picks like an editor — so every entry carries `feel`, `use_when`,
+`avoid_when`, and a note per parameter explaining both ends of its range.
+
+**NOTHING MAY APPEAR FROM NOWHERE, AND NOTHING MAY SNAP BACK.** Two beats run at once and
+hand over by weight, and a beat pinned to the shot's own edges is at weight 1 on its first
+frame — so an effect that is full strength at t = 0 is a jump, and one still displaced at
+t = dur is a snap. Every effect added beyond the first nine therefore carries its own
+envelope (`beatEnv` in the shader): exactly zero at t = 0, exactly zero once the shot's
+clock has run out, and zero through the overrun the outgoing layer spends inside a
+transition. Geometry effects satisfy it structurally as well — a fold reflects back into
+the frame, a curl pins its far edge, a parallax holds its border — so no move can uncover
+emptiness. Transitions carry the same guarantee at their own scale: every mid-transition
+flourish is multiplied by `sin(pi * uMix)`, which is zero at both ends, so a mode is
+exactly the outgoing picture at 0 and exactly the incoming one at 1. That is the `dip` bug
+of §11.1 made impossible by construction rather than by remembering it.
+
+**The conductor is shown only what this memory can use.** The whole library is ~13 000
+tokens and the brief already carries a line per photograph, so each entry declares the
+moods it belongs to and `catalogue_for_prompt(energy)` sends the shortlist — 28 effects
+for a lively memory, 15 for a sad one. A birthday is never offered `soft_focus`; a
+hospital visit is never offered `kaleidoscope`. `tests/test_feed_effects.py` fails the
+build if the catalogue ever advertises an effect or a transition the shader does not
+implement, and if the no-model pools in `feed/director.py` name one that does not exist or
+does not suit the energy they are filed under.
+
+**The waiting screen is part of the film.** Preparing takes minutes, nearly all of it one
+MusicGen call, so the memory's own photographs drift behind the progress bar as scattered
+rotated prints — **and the viewer's own notes tumble in among them**, as bubbles at
+varied sizes and angles. This run is reading those notes (§11.3), and a waiting screen
+showing only pictures gives no sign of it; seeing your own words in the pile is how you
+know they are part of what is being made. Positions, angles and scales are derived
+server-side from each item's index, so the layout is stable across the bar's one-second
+polling instead of flickering. Each stage is named
+for **what it is making** — "recording the voice", "composing the music", "matching
+effects to the music" — because that is the only thing the user can see during the run.
+
+**The renderer is WebGL2, not CSS** (`web/static/feed-gl.js`). CSS can cross-fade two
+`<img>` layers and nothing more; the film needs true dissolves and dips, **zoom and
+directional blur** on fast moves, a per-memory **colour grade**, vignette and grain —
+all of which are one fragment shader and none of which the DOM can do. The camera move
+is a UV transform, so it costs no layout and holds 60 fps. There is **no ffmpeg and no
+server-side render** anywhere in this pipeline — a video FILE is produced, but by
+recording this same canvas in the browser (§11.2).
+
+**Autoplay is a click.** Browsers refuse to start audio without a user gesture, so the
+film opens paused behind a title card; the first click starts picture and sound.
+
+**Language.** `feed_language` (§6, `app_settings`) is `en` by default and may be `ru`.
+It selects the language the story pass writes in, and therefore the language the voice
+reads. A **presentation is per language** — `memory_presentations` is keyed
+`(group_id, language)` — so both can exist side by side and switching does not discard
+the other. Narration needs a voice that speaks the language: Kokoro covers English but
+**not Russian**, so the catalog declares each voice's `languages` and `POST /speak`
+answers **503** when no offered voice can speak the requested one (§4.1). The film's
+language also picks the voice MODEL automatically — the user never selects it — and a
+Russian film that cannot be narrated is a failed film, not a mute one.
+
+**Film pipeline.**
+
+```mermaid
+flowchart TB
+    trigger["Prepare film (manual, background thread)<br/>one at a time per process · per LANGUAGE"] --> sig
+    sig["1 · Signals (PURE SQL, no model)<br/>orientation · tags (vibe/palette/light/quality/subject)<br/>place_city · shot_at · SigLIP vector"] --> dir
+    dir["2 · Direct (PURE, no model)<br/>camera move per shot (one eased PUSH, never a pan)<br/>burst → hard cuts · hero → long push-in<br/>palette+light → grade · a DEFAULT effect per shot<br/>this is the film if no model ever runs"] --> story
+    story["3 · Story (model call 1, POST /text/complete)<br/>narration script · sparse title cards · music prompt<br/>+ SCORE PLAN: where the music changes, and to what<br/>written DIRECTLY in en or ru"] --> narr
+    narr["4a · Narration (POST /speak, BATCH) — MANDATORY<br/>kokoro (en) · silero v4_ru (ru, split at sentences)<br/>returns segments [{text,start,end}] — the film's SPINE<br/>no script in the language, or no speech → FAIL"] --> music
+    narr -- "cannot speak" --> failed["status='failed' + the reason<br/>the page shows the error, never a mute film"]
+    music["4b · SCORE (POST /music, BATCH) — feed/score.py plans it<br/>2-4 sections on the story's own turns, each a CONTINUATION of the last<br/>brief per section = mood + THAT stretch's photographs + role (open/lift/turn/close)<br/>covers the runtime and ENDS — no loop · 503 when the slot is off"] --> beats
+    beats["4c · Beats (PURE numpy, feed/beats.py)<br/>spectral flux → onset envelope → tempo → downbeats<br/>NO model"] --> cond
+    cond["5 · Conduct (model call 2, feed/conductor.py)<br/>briefed with: every photo's description + 10 tag dimensions +<br/>place/time/EXIF · every narration sentence's timing ·<br/>every downbeat · the whole effect library<br/>returns: WHICH photo plays WHEN, with which effect + params<br/>MAY REORDER — the cat under the sentence about the cat<br/>repaired by director.with_arrangement · fallback = even + snapped"] --> persist
+    persist["6 · Persist<br/>WAVs → data_dir/audio (content-addressed, §6.1)<br/>row → memory_presentations(group_id, language)"] --> play
+    play["/feed/{key}?lang=… — WebGL2 player<br/>CLOCK = the soundtrack's currentTime, never a timer<br/>36 shot effects + 14 transitions, one fragment shader<br/>NO model · NO ffmpeg · a LEAF under the memory grid (§13.1)"] --> save
+    save["↓ Download (§11.2) — MediaRecorder over THIS canvas + THIS audio bus<br/>real time · mp4 where the browser can encode H.264, else webm<br/>no second renderer, so the file is what you watched"]
+```
+
+**A model CASTS the film; the code only checks the cast is real.** Every speaker a
+voice model offers is declared in `models/catalog.py` beside it — name, gender,
+register, and a sentence saying what it sounds like (CLAUDE.md § "A model's own metadata
+is DECLARED"). The story pass is shown that table together with the memory and the
+viewer's notes, and returns a **`narrator`** for the film plus, per passage, an optional
+different **`voice`**. Judging which voice suits which moment is taste, and taste is
+what the story pass owns; enumerating what exists is data, and `feed/voice.py` holds no
+list of names at all.
+
+Two things the model is not trusted with. `voice.resolve()` checks every cast against
+the catalog, because an invented name raises inside the TTS child and narration is
+mandatory — a bad cast would fail the whole film. And `voice.pick_speaker()` is the
+fallback for when no model runs, deriving a narrator from the memory's own mood and
+photographs.
+
+**A `[voice]` bracket repaints EXACTLY ONE PASSAGE, never the film.** The narration is
+spoken in parts — `POST /speak` takes the exact chunks *and* a speaker per chunk — and
+the clips are merged into one WAV, so the film keeps its narrator and returns to it after
+the moment that asked to sound different. *One* passage is load-bearing: keying the
+override to a **photograph** repainted every passage that showed it, and a story that
+returns to one picture five times got five hoarse passages out of a single note. The
+note's position through the film gives a target index; where a previous cut says which
+photograph was on screen, the **nearest** passage showing it wins instead, so the
+instruction follows that picture into a re-cut without spreading across every reuse.
+
+**Same-voice passages are spoken in ONE call** (`audio/segments.py`). Synthesising each
+passage separately restarts the prosody every time, so an eight-passage film came out
+sounding like eight different readers even where the speaker never changed. Passages are
+grouped into runs that share a voice, each run is one call, and the per-passage timings
+are recovered by splitting the run's audio in proportion to its text. That split is an
+approximation, bounded inside one continuous utterance — a far better trade than exact
+boundaries around a delivery that lurches every few seconds.
+
+**One memory can be retold on its own**, from a **↻ Rebuild** on its Organize card —
+on the memory, not on the film screen, because it changes the memory and every film made
+of it follows (`POST /feed/{key}/rebuild`,
+`memories_build.rebuild_memory`). Rebuilding *every* memory re-seeds the clusters, so a
+memory you liked can come back split or merged — a heavy, whole-library operation for
+what is usually one dissatisfaction. The per-memory button asks the same agent one
+question about one memory, with that memory's **current photographs** as the candidate,
+so it is re-ordering and re-describing what is already there rather than re-clustering
+anything.
+
+It rewrites the memory **in place** (`memory_store.rewrite_memory`), and that is
+load-bearing: `replace_memories` drops every group row and takes the group ids with it,
+and `memory_notes` cascades on those. The viewer's own words must survive a retelling —
+they are the input to it. What does *not* survive is the film: every stored presentation
+for that memory is dropped, because it narrated a memory that no longer exists in that
+shape. A retelling that fails writes nothing and the old memory stands.
+
+**THE PHOTO ORDER BELONGS TO THE MEMORY.** It is decided once, by the memory-composing
+agent (`albums/compose.py`), which now returns an `order` alongside `keep`/`title`/
+`description`: every kept photograph exactly once, pictures of the same thing placed
+next to each other so they read as one beat, and those groups sequenced the way the day
+would be told. The **description is written for that order**. The Organize album shows
+it, and **every film of that memory follows it** — `director.with_script` re-sorts the
+story pass's passages so a photograph can never be introduced out of sequence.
+
+The story pass still chooses which photograph carries each passage, how long the film
+dwells on one, and whether it returns to it: **a repeat is not a reorder**, so the
+constraint is on first appearances only, applied as a stable sort that leaves repeats
+where the story put them. The order changes only when the memory itself is rebuilt.
+Without this the same memory came out in a different sequence on every regeneration and
+never looked like itself twice. The agent's `order` is repaired, never trusted: invented
+ids are dropped and forgotten ones appended, so a memory cannot silently lose a
+photograph it decided to keep.
+
+**THE PROMPT IS CUT TO THE SERVER'S CONTEXT.** `llama-server` does not truncate a
+prompt that does not fit — it rejects the whole call ("request (6306 tokens) exceeds
+the available context size (4096 tokens)"), the story comes back empty and the film
+fails for want of narration, naming the language rather than the real cause. So the
+story pass asks the models service what the running server accepts
+(`GET /text/context`, §5.1) and budgets against it: everything else in the prompt is
+assembled first, and the **photo listing** — the only part that grows without limit,
+one ~130-token brief per photograph — is given what is left after the answer is
+reserved, shared equally and clipped per line. **Numbering is the contract** (the
+story answers with `shot` numbers), so a brief is clipped, never dropped. Below a
+floor of one short line per photograph nothing more can be cut; that memory is over
+the context however it is written, and it is logged as such rather than failing
+silently. Token counts are estimated from characters (~3.5 measured; 3.0 used, so the
+estimate errs towards trimming): `app` is a thin client and holds no tokenizer.
+
+**A NOTE THE MODEL WILL NOT WRITE IN IS PUT IN ANYWAY.** Asking twice is not a
+guarantee, and it was measured not to be one: on a real film gemma4-E2B dropped the same
+note through three different attempts — a word budget raised to cover it (it then wrote
+45 words of the 115 it was given), an explicit complaint on retry, and a required schema
+field forcing one entry per note (it filed the FIRST note twice). A 2B model composing a
+whole story around a fact is the hard version of the task. So after the retry, anything
+still uncovered gets the easy version:
+
+1. **One small call rewrites ONE passage** to carry that one fact, in the film's own
+   language — the same reason the language fallback is a translation pass rather than
+   another attempt. The passage is the one at the note's own share of the film.
+2. **If that does not carry it either, the viewer's own words go in verbatim**, as their
+   own passage, at their position, over the photograph they were written about. A
+   sentence that reads a little flat is worth more than one that is missing.
+
+A `[bracket]` is stripped before either — it is an instruction, never narration (§11.3)
+— and a note written in a language the film does not speak is left to the model rather
+than fed to a voice that would read it phonetically.
+
+**The word budget PAYS FOR THE NOTES.** `narration_words` adds 30 words per note on top
+of the photographs' share. It used to count photographs only, so a three-photograph
+memory was told to write 55-75 words in total while carrying two notes worth 32 words of
+mandatory content — the model obeyed the cap and dropped one, every time.
+
+**The story pass CHECKS ITS OWN OUTPUT, and asks again.** Telling a model that every
+note matters is not the same as it obeying, and each way it disobeys is silent — the film
+looks fine and something the person said is gone or in the wrong place. So three things
+are verified after the call, and any that fail are named back to it in one retry:
+
+- **coverage** — a note whose content appears nowhere (`uncovered_notes`);
+- **placement** — a note whose words landed far from where it was written
+  (`misplaced_notes`), measured in shares of the film rather than seconds because the
+  new cut is a different length. This exists because the coverage retry *caused* it:
+  told only to include a missing note, the model appended it to the last passage, so a
+  remark about the middle of the evening was read over the closing shot. The complaint
+  names both positions — "you put this about 92% in; it belongs about 49% in";
+- **casting** — a note carries a bracket and no passage was given a voice.
+
+The retry is kept only if it answered MORE than the first attempt, so a worse second try
+cannot make the film worse. None of these read what a bracket MEANS: they notice that
+something was asked and not answered, which is a different thing from deciding the
+answer.
+
+A share is quoted only when a previous cut says how long the film was. Falling back to
+the notes' own span made the last note "100% of the way through" every time — it is the
+one that defines the span, so that is an artefact, not a position.
+
+**Notes are a SEQUENCE, not a bag of facts.** They are listed to the story pass in time
+order, and the prompt states that this order *is* the order of the day: a note at 0:07
+describes something that happened before one at 0:11, and the passages must follow the
+same sequence. A story that tells the fourth and fifth and then doubles back to the third
+contradicts itself.
+
+**THE SCORE IS A SCORE, NOT A CLIP** (`feed/score.py`). The film's music is two to four
+**sections** that follow the story's own turns, generated in one call as one continuous
+piece: section two is a **continuation** of section one's last two seconds, so it
+arrives in the same key and tempo even when its brief asks for something different, and
+the join is crossfaded over the model's own reconstruction of what it was given. The
+score covers the runtime and **ends** — the player no longer loops anything, because a
+loop is both a seam in the middle of the story and the reason every film sounded like
+one bed under different pictures.
+
+Three things write each section's brief, and the order is the order of authority:
+
+- **the memory's measured mood and occasion** (`feed/mood.py`), first, for the reason
+  above;
+- **the photographs THAT SECTION is under** — its own stretch of `season_weather`,
+  `light`, `setting` and place. This is what a single prompt cannot do at all: it can
+  only ever describe the average of the whole memory, so snow in the last third either
+  colours the entire film or none of it;
+- **the role** — `open` is sparse, `lift` adds percussion, `turn` changes the lead
+  instrument, `close` resolves and fades. Without it the sections are four variations
+  on one idea rather than a piece that goes somewhere.
+
+**The story pass says WHERE the music changes.** It wrote the passages, so it knows
+where the film turns; its `score` plan is `[{from: passage, brief}]` and it decides the
+boundaries, while `feed/score.py` still writes the measured half of every brief. With no
+plan the film is split evenly, every boundary dragged to the nearest **passage start**
+(never mid-sentence, `SNAP_WINDOW`), and the story's one film-wide sentence colours each
+section. Nothing here can fail a film: music has always been the one artifact a memory
+may go without.
+
+**It costs what it covers.** MusicGen is autoregressive and measured at ~4.9x realtime
+for `musicgen-small` on an M-series mac (15 s of audio in 73 s), so a 90-second film is
+about seven minutes of generation and `SCORE_MAX_SECONDS` (180 s) is the ceiling that
+keeps a long memory from doubling a wait nobody asked for. The seed is derived from the
+memory, its language and its signature, so the same film scores the same way twice and
+no two memories share music.
+
+**The MOOD decides the score, the voice and the pace** (`feed/mood.py`). One vote across
+every photograph's `vibe`/`emotion`/`occasion` gives `high`, `calm` or `low`, and three
+things obey it so the film cannot contradict itself:
+
+- **the score** — the mood clause is put FIRST in every section brief and names a tempo
+  in BPM and real instruments. A small model reaches for "warm ambient pads, gentle"
+  whatever it is shown, and that is funeral music over a birthday; the story pass's own
+  sentence is kept after ours as colour, not as the brief. The energy also sets HOW the
+  score is sampled (`mood.SAMPLING`): a party is generated with more guidance and more
+  heat than a quiet afternoon, where MusicGen's one default setting for everything was
+  itself a reason every film came back sounding the same;
+- **the narrator** — the energy picks the band and the memory's own photo ids pick which
+  voice within it, so two quiet afternoons do not sound like the same person reading
+  twice. Every name is verified to load and produce audio before being offered, because
+  narration is mandatory and an unknown speaker FAILS a film rather than degrading it;
+- **the pace** — how many beats a shot cycles through and how fast they hand over
+  (`mood.PACE`), and which effects are reachable at all: `glitch` and `pulse` belong to
+  a party, not to a hospital visit.
+
+### 11.2 Taking the film with you
+
+A film you cannot keep is a demo. **`↓ Download` records the film to a video file**, and
+it records **this canvas and this audio bus** — the same WebGL context the player just
+drew and the same WebAudio mix it just played through. There is no second renderer, so
+the file cannot drift from what was on screen, and the effect library grew to thirty-six
+shaders and fourteen transitions without an export path to keep in step behind it.
+
+Consequences of that choice, both accepted deliberately:
+
+- **It records in REAL TIME.** `MediaRecorder` muxes a live audio track and there is no
+  way to hand it a faster-than-realtime one without shipping a muxer into the page, so a
+  50-second film takes 50 seconds to write. The button says so, shows a percentage, and
+  is its own Stop.
+- **The container follows the browser.** MP4 (H.264 + AAC) where the browser can encode
+  it — Chrome ≥ 130, Safari — and WebM (VP9 + Opus) otherwise. A playable WebM beats an
+  MP4 the browser refuses to produce. A browser with no `MediaRecorder` at all is told
+  so on the button rather than handed a broken file.
+- **NOTHING IS RECORDED UNTIL THE FILM CAN PLAY WITHOUT STOPPING.** Because it records
+  in real time, whatever the film does while the recorder runs is in the file — and on a
+  cold page neither WAV is buffered (`preload` is a hint, not a promise) and no
+  photograph is in the browser's cache, since textures are fetched as each shot comes
+  up. Starting the recorder and playing in the same tick therefore RECORDED THE
+  BUFFERING: the first download stalled and the second, after a reload had warmed the
+  cache, was smooth. So the export now waits for `canplaythrough` on both tracks and for
+  every photograph to decode before it starts, says "Preparing…" while it does, and
+  treats a click during that wait as "never mind". Both waits are bounded (20 s), because
+  a browser that never fires `canplaythrough` must not hang the button.
+
+**There is still no ffmpeg and no server-side render.** Exporting on the server would
+mean reimplementing every GLSL effect as a filter graph and maintaining two renderers
+that must agree frame for frame — the exact drift this app avoids everywhere else. The
+canvas already is the renderer; recording it is the whole feature.
+
+**One consequence for the audio graph:** `createMediaElementSource` may be called only
+once per `<audio>` element, so the mix is built once into a single `bus` node, and the
+recorder taps that bus. Building a second graph for the export throws and silences the
+film.
+
+### 11.3 The viewer's own words
+
+Generation knows what the machine could work out. It cannot know what the day MEANT to
+the person who lived it — who that is in the photograph, why that evening mattered, what
+the caption model got wrong. So **the film can be annotated while it plays**.
+
+Pausing opens a panel: every note already on this film, editable, plus a new one stamped
+at wherever the film is standing. Notes may be in **any language**. They are stored in
+`memory_notes(group_id, at_seconds, text)` and cascade with the memory, like a
+presentation.
+
+**The editor is hidden only while the film PLAYS.** Watching is the one moment a form
+over the picture is wrong; every other state wants it. So it is open on the title card
+(where you read what you already said before deciding to watch or to prepare again), on
+a pause, and on the **Prepare** screen where there is no player at all. It is hidden
+outright while a film is being generated, along with every other control except close
+and cancel. Bubbles frozen mid-flight stay **behind** it: context, never
+over the thing being typed into.
+
+**The panel is a sheet that folds.** It overlays the memory's own description on the
+Prepare screen, and covering the thing you are writing notes *about* is not a trade
+worth making — so the whole body slides down into its title bar, which keeps showing the
+count. The choice is remembered per browser, because reopening a film and finding the
+opposite state is the panel arguing with you. Each field is **sized to its text** rather
+than scrolling inside itself; the sheet takes the scrollbar when there are more notes
+than fit.
+
+**The panel does not belong to the player** (`web/static/feed-notes.js`). It renders on
+the **Prepare** screen too — the one where the film does not exist yet, which is exactly
+where a note is worth writing, because it is then the only thing that can steer the
+first cut. That screen has no canvas, no clock and no `feed-gl.js`, so the panel is its
+own script: the player borrows it through `window.feedNotes` to float bubbles and to
+stamp a note with the moment it paused at, and everything else works without one.
+
+Two things then happen with them:
+
+- **They are visible wherever the memory is, behind a fold.** On its Organize card, and
+  under the memory's own title when a photo is opened inside it — above the
+  photograph's words, because a note describes the memory rather than that picture.
+  Living only inside the player would mean a note can be found only by playing the film
+  again. Both are a collapsed `<details>` labelled "N notes for the film": they steer
+  the next generation, so they matter while you are working on the video and are noise
+  the rest of the time. Each timestamp deep-links back into the film at that second.
+- **They float during playback, one at its own second, and only while the film is
+  actually running.** Each rises up a right-hand column — the side the panel is on, so a
+  note appears where it was written and never over the middle of the photograph — and
+  drifts out of the top. Emission is gated on `playing` and each note fires once; the
+  record of what has been shown is cleared on a **seek or a replay**, as events, never
+  by testing the clock. (A clock test is true on every frame the film sits near it: on
+  the title card, where the clock rests at 0 for ever, a 0:00 note was emitted sixty
+  times a second until the screen was a wall of them.) They
+  live in the **DOM, never on the canvas** — the export records
+  `canvas.captureStream()`, so notes are absent from a downloaded film by construction.
+  They are working notes for the person making the memory, not for whoever receives it.
+- **They rewrite the next cut, and they are FACTS, not splices.** The story pass reads
+  them **first, above every machine label** — a label is a guess, this is testimony from
+  someone who was actually there — and each one is stamped with three things: the
+  timestamp, its position as a **percentage** of the way through (a model writing a list
+  of passages knows what "40% in" means and has no idea how long 0:12 is), and **which
+  photograph was on screen** when it was written, resolved from the previous cut.
+
+  That last one is what makes a note a fact rather than a local patch. "This is Julia"
+  written over photograph 3 means the woman in photograph 3 *is* Julia — named in the
+  passage about that photograph, named again wherever it comes back, named in any other
+  photograph that is plainly her, and named in passages **before** that point too,
+  because the writer knows who she is while writing them. Rewriting one sentence around
+  the timestamp and leaving her "a woman" everywhere else is the failure the instruction
+  exists to prevent. Where a note contradicts a caption, the note wins and the caption's
+  word is dropped from the whole film.
+
+- **Regenerate says so.** A note changes nothing until the film is rebuilt, and nothing
+  else on the page admits that. So writing one lights the Regenerate control and keeps
+  it lit — even while the film plays, where the controls normally fade back. A note
+  written and then forgotten is worse than one never written: the viewer believes they
+  have been heard.
+
+Editing a note to nothing deletes it: this is a scratchpad, not a form, and notes save
+on blur rather than behind a button. A note lost because it was not "submitted" is the
+whole feature failing quietly.
+
+**`[Brackets]` are instructions, not sentences** (`feed/directives.py`). Sometimes the
+viewer does not want to describe the moment, they want to DIRECT it. So anything in
+square brackets is lifted out of the note and routed to whichever stage can act on it,
+and the rest stays as prose — `[low man's voice] it was a bad day` gives the voice a
+register *and* the story a sentence, and the story pass never sees the bracket it would
+otherwise try to narrate.
+
+**NOTHING PARSES A BRACKET.** There was a matcher — a table of phrases, then of word
+stems — that classified each bracket and routed it. It is gone, and it was wrong in a
+way no amount of table-filling fixes: `[страшных хриплый мужкской голос]` fell straight
+through it, because it knew `хриплый голос` and another word sat between the two. People
+write instructions in their own words, in their own order, in either language, with
+typos; a table only ever recognises the phrasings someone thought to add.
+
+So notes go to the models **verbatim**, and each pass is told that brackets are
+instructions to obey rather than sentences to narrate. The story pass reads them and
+casts the narrator, any per-passage voice, and the score; the conductor reads them and
+places effects and lengths. Interpreting "a scary hoarse man's voice" into a speaker is
+judgement, and judgement is what a model is for. Code keeps only the parts a model must
+not be trusted with: `voice.resolve()` checks a cast is a real speaker, `effects` checks
+a named effect exists, and the deterministic fallbacks decide nothing more than what the
+film looks like when no model runs.
+
+The categories below are what the on-screen legend shows as EXAMPLES of what can be
+asked for — not a vocabulary, since a model is reading it:
+
+| category | what acts on it | example phrasings |
+|---|---|---|
+| `voice` | **that PASSAGE alone is spoken by another voice.** The film keeps its own narrator; the narration is synthesised per passage and the clips merged | `[low man's voice]` `[страшным хриплым голосом]` `[whisper]` `[excited]` |
+| `music` | **leads the score brief**, ahead of the measured mood and ahead of the story pass's own sentence | `[fun chord]` `[swell]` `[drums]` |
+| `effect` | **`feed/conductor.py`**, on the shot covering that timestamp, told not to substitute a nicer-looking one | `[glitch]` `[bloom]` `[slide]` `[light leak]` |
+| `timing` | **`feed/conductor.py`**: a named length sets that shot's `seconds` and its neighbours absorb the difference; `skip` drops the photograph, `title` gives it a card | `[hold 5s]` `[quick]` `[skip]` `[title]` |
+| anything else | passed to the story pass verbatim | `[like a fairytale]` |
+
+Every prompt that receives notes says in as many words that bracketed text is an
+**instruction, not inference, and outranks its own judgement**.
+
+There is deliberately no `sound effects` category: this app generates a score and a
+voice and nothing else, and a bracket the pipeline cannot honour would be a lie.
+
+**Either language, whatever the film is in.** A note may be written in English or
+Russian regardless of the language being generated. The *prose* half is translated by
+the story pass into the film's language; the *bracket* half is matched against a table
+of Russian aliases (`[низкий мужской голос]`, `[весёлый аккорд]`, `[держать 5с]`),
+because a direction is a switch rather than a sentence and matching it is cheaper and
+surer than asking a model to translate it. The legend shows both forms.
+
+A trailing number is kept, so `[hold 5s]` differs from `[hold]` — and `с`/`сек` count
+as seconds too. Every effect and
+transition name in the library is automatically a valid bracket, and an **unrecognised**
+bracket is not an error — it is passed on verbatim, because a person writing `[like a
+fairytale]` means something even though we never enumerated it. The on-screen legend is
+generated from the parser's own vocabulary, so it can never advertise a word the
+pipeline ignores.
+
+Directions **outrank the pipeline's own judgement**: they are the one thing in the whole
+prompt that is not a guess.
+
+## 12. Stage 2 — reorganizing your folders on disk
 
 Stage 1 learns what the photos are. Stage 2 acts on it, on the machine that holds
-them. The whole contract between the two is **one JSON manifest** — and the local
-`ivms777-sync` CLI is the only component that ever writes to your disk (§3.2b).
-**The manifest schema, the layout contract, the CLI commands, and the full safety
-rules live in [`docs/sync-cli.md`](sync-cli.md).** The design:
+them. The whole contract between the two is **one JSON plan document**, downloaded
+from Organize — and the local `ivms777-sync` CLI is the only component that ever
+writes to your disk (§3.2b). **The plan schema, the CLI commands, and the full
+safety rules live in [`docs/sync-cli.md`](sync-cli.md).** The design:
 
-- **The manifest** (`GET /api/manifest?layout=…`) lists, per photo, its content
-  hash, the `target` path the chosen layout assigns, and every source path it was
-  uploaded from. It is derived state: a different layout re-derives every `target`
+- **The organizer IS the layout.** There is no separate layout picker, no `Layout`
+  protocol, and no `/export` screen. The principle already chosen in Organize
+  (§11) — date at day/month/year, camera, place, memories — is exactly the folder
+  structure the plan produces, so adding an organizer adds an export for free.
+- **The plan** (`GET /api/plan?by=…&grain=…`) runs that organizer and lists, per
+  photo, its content hash, the `target` relative path its album assigns, and every
+  source path it was uploaded from; plus, per album, the folder name, title, and
+  description. It is derived state: a different organizer re-derives every `target`
   and nothing else. It carries a `complete` flag (§8).
-- **Layouts are pure functions** from a photo's facts to a relative path. Three
-  ship: `date` (default, EXIF-only so byte-stable), `date-tags` (date tree + an
-  `_albums/` symlink view), and `flat`. They run server-side; the CLI only executes
-  the paths it is handed.
-- **The CLI is `plan` / `apply` / `undo` / `verify`.** It matches files by content
-  hash, never by path, so a library reorganized since upload still matches.
+- **Reorganization happens in place, inside a source folder.** The tree is built
+  under the root the CLI is pointed at; files never move between folders and their
+  **filenames never change**. One plan covers the whole library — run it in each
+  source folder you want reorganized, and hash matching means each run touches only
+  the files actually present there.
+- **Every album folder gets a `description.txt`** — title, description, photo count.
+  For a memory that is the agent's full description, so the story survives outside
+  the app.
+- **A photo can be in several memories; a file cannot be in several folders.** The
+  export resolves it: the **event** memory owns the file, and a **theme** memory
+  becomes a folder holding `description.txt` plus a `photos.txt` listing where its
+  photos actually live (§11). Photos no album claims go to `_unsorted/`.
+- **The CLI is `apply` / `undo` / `verify`.** It matches files by content hash,
+  never by path, so a library reorganized since upload still matches. `apply` needs
+  no network — the plan document is self-contained.
 - **Safety is paranoid:** nothing is ever deleted (redundant copies move to
-  `_duplicates/`), nothing outside the manifest is touched, every operation is
+  `_duplicates/`), nothing outside the plan is touched, every operation is
   journaled before it runs and reversible by `undo`, cross-filesystem moves are
-  copy-verify-unlink, and plans expire against the root/manifest they were built for.
+  copy-verify-unlink, and `apply` refuses an incomplete plan unless told otherwise.
 
 ## 13. UI
 
@@ -1350,8 +2082,6 @@ that the four top-level links swap without re-rendering the nav. The routes:
 - **`/upload`** — the folder list (add / delete-from-library, §3.2c), then
   client-side hashing, transfer, and live per-stage processing progress with
   per-stage **Reprocess** buttons (§8).
-- **`/export`** — pick a layout, preview the tree, download the manifest, and see the
-  `ivms777-sync` command to run (§12).
 - **`/library`** — infinite-scroll grid with a faceted sidebar (model tags + EXIF
   facets, apply-on-change), sort, search box, and parsed-filter chips (§9).
 - **`/photo/{id}`** — the one **leaf** view: the photo shown inside the collection it
@@ -1360,7 +2090,18 @@ that the four top-level links swap without re-rendering the nav. The routes:
   why-it-matched reasons (§9). All drill-down navigation obeys §13.1.
 - **`/organize`** — a principle dropdown (date grain / camera / place / memories) over
   album cards; memories has the background Rebuild control; the last-opened view is
-  remembered.
+  remembered. An **Organize files…** button turns the current principle into a
+  stage-2 plan: `/organize/plan` previews the folder tree it would create, asks for
+  confirmation, and downloads `ivms777-plan.json` (§12).
+- **`/feed/{key}`** — the fullscreen **memory film**: one memory played as a directed
+  short with camera moves, cuts, a colour grade, a generated soundtrack and optional
+  narration (§11.1). A language selector (English / Русский) sits on the page; each
+  language is prepared and cached separately.
+  Reached from a ▶ Play control on a memory card in `/organize?by=memories`. A
+  memory with no prepared presentation is offered one, and the page polls while
+  the background job runs; otherwise it plays. It is a **leaf** under the memory
+  grid (§13.1), and it is the one page that does not use the app shell — a
+  fullscreen player has no room for the nav, and the nav must not boost it.
 - **`/chat`** — the persisted conversation with streamed answers and thumbnail
   citations (§10).
 - **Settings (⚙, in the nav beside the resource bar)** — a modal `<dialog>` served
@@ -1376,8 +2117,8 @@ that the four top-level links swap without re-rendering the nav. The routes:
   pushes no history entry and changes no URL, so §13.1's `[grid, leaf]` invariant is
   untouched, and Esc/close simply closes it.
 
-**Per-route detail — the resource-bar internals, the full `/photo` panel, throughput
-readouts — is in [`docs/ui.md`](ui.md).** The nav order **Upload → Library → Chat →
+**Per-route detail — the resource-bar internals, the full `/photo` panel, the feed
+player's controls, throughput readouts — is in [`docs/ui.md`](ui.md).** The nav order **Upload → Library → Chat →
 Organize** follows the workflow: bring photos in, browse, understand, then (last)
 reorganize — Organize feeds stage 2.
 
@@ -1396,6 +2137,9 @@ in front of bfcache and break the `[grid, leaf]` invariant.
 
 1. **A leaf is always exactly ONE level below a grid.** There is no photo-inside-a-
    photo nesting. A "similar" photo is still just a leaf one level under a grid.
+   **The memory feed (`/feed/{key}`, §11.1) is a leaf too**: one level under the
+   memory grid, it never opens a photo leaf from inside itself (that would be
+   leaf-inside-leaf), and every shot change is player state — never a history entry.
 
 2. **The leaf records its grid in a `ctx` URL parameter** — never guessed:
    - `ctx=library` (plus `q`/`f_`/`n_`/`t_`/`sort`/`date_*`) → the library grid.
@@ -1404,6 +2148,10 @@ in front of bfcache and break the `[grid, leaf]` invariant.
      intermediate **step on the way up**: it is shown as clickable context (a
      thumbnail in the header) AND it is what close returns to first. Close from
      there goes up to the library. It is the one ctx whose close takes two steps.
+   - The **feed** (`/feed/{key}`) needs no `ctx` at all: the key IS the memory's
+     album key, so its grid is never guessed. An optional `ctx` supplies only the
+     deep-link `href` fallback that close uses when the feed was opened cold from a
+     pasted URL.
    - `ctx=chat` → the grid is the **conversation**; close returns to `/chat`. A
      cited thumbnail carries this ctx, and it pages within the photos the current
      chat session cited (its evidence set), never the wider library.
@@ -1433,6 +2181,15 @@ in front of bfcache and break the `[grid, leaf]` invariant.
    the grid. Two closes: similar → origin → grid. The replace is what keeps rule 3
    intact — the depth stays two, the leaf slot simply now holds the origin photo.
 
+   **A LEAF MAY HOLD LEVELS OF ITS OWN, and Esc unwinds those first.** The film (§11.1)
+   is the case: a recording in progress and a playback in progress are each a state the
+   viewer is inside, and closing the page out from under one is not "up one level", it
+   is losing their place — the rule this whole section exists to protect. So Esc there
+   is: cancel the recording → stop the playback and return to the title card → and only
+   with nothing left to undo, `history.back()` to the grid. The film answers whether it
+   consumed the key (`window.feedFilm.escape()`); when it does not, the page closes
+   exactly as before.
+
 5. **Prev/next move only *within* the current layer's order** (owner-scoped),
    carrying `ctx` forward — never leaking into a sibling album/memory or the wider
    library.
@@ -1449,13 +2206,21 @@ must replace.
 
 The source uses a **flat layout**: each top-level package (`config`, `db`,
 `storage`, `inference`, `embedding`, `ingest`, `organize`, `search`, `albums`,
-`chat`, `web`) sits at the repo root — no wrapping package directory. **The full
-annotated tree is in [`docs/code-layout.md`](code-layout.md).** Two boundaries the
-architecture leans on:
+`feed`, `audio`, `chat`, `web`) sits at the repo root — no wrapping package
+directory. **The full annotated tree is in
+[`docs/code-layout.md`](code-layout.md).** Three boundaries the architecture leans
+on:
 
 - **One OpenAI-compatible HTTP client** (`inference/client.py`) covers every
   profile — `llama-server` (mac/jetson) and vLLM (cloud) differ only in `base_url`
   and model name.
+- **`feed` and `audio` are opposite sides of the one-model-process line** (§5.1).
+  `feed` builds and stores memory presentations (§11.1) and is a thin client — it
+  holds no model and is covered by the import gate. `audio` is models-service-only:
+  it hosts the TTS and music models inside `TorchWorker` children, so — like
+  `modelsvc` — it is exempt from that gate and is never imported by `app`, `worker`
+  or `feed`. `storage/wav.py` is the one piece both use, and it is torch-free
+  precisely so it can be.
 - **`ivms777_sync` is a standalone package** that imports nothing from `ivms777` —
   no database, no Pillow, no models, only the stdlib plus `httpx` — so it installs
   on a user's machine in seconds and runs anywhere Python does.
@@ -1471,8 +2236,8 @@ plan/apply/undo + failure-injection tests — lives in
 
 The delivery phases (0–7) live in [`docs/roadmap.md`](roadmap.md). Each phase
 leaves a working, useful application; phase 7 (stage-2 sync) is last because the
-manifest is richer the more the library knows, but it depends on nothing after
-phase 3 and can be pulled forward.
+plan is richer the more the library knows — memories need the agent — but it
+depends on nothing after phase 3 and can be pulled forward.
 
 ## 17. Risks
 
@@ -1484,5 +2249,6 @@ resumable indexing, HEIC/RAW handling, `sqlite-vec` portability, and
 
 The future-work backlog lives in [`docs/roadmap.md`](roadmap.md): auth/quotas
 (v02), face clustering, object storage, XMP export, a read-only MCP server, video
-support, an `ivms777-sync` watch mode, and user-defined layouts — plus the
+support, an `ivms777-sync` watch mode, and a browser-side apply wherever the File
+System Access API is actually available (§3.2b) — plus the
 already-shipped retrieval-core and chat-degradation items kept there for history.

@@ -1,7 +1,7 @@
 # Ingest pipeline — stages, residency, reprocessing
 
 The exact per-stage mechanics, the in-process residency guard, the reprocess
-endpoints, self-healing backfills, failure handling, and the manifest gate. Design
+endpoints, self-healing backfills, failure handling, and the plan gate. Design
 §8 carries the stage sequence and the draining invariant; this file is the detail.
 Section references point into `docs/design.md`.
 
@@ -162,9 +162,10 @@ caption vector — so a library predating a stage, or a photo whose
 thumbnail once failed, heals with no manual action. A photo that genuinely can't be
 thumbnailed is skipped by the later stages rather than crashing them.
 
-## The manifest gate
+## The plan gate
 
-Stage 2 must not run against a half-processed library, so `/api/manifest` reports
-the collection as `complete` only when no `pending` or `running` job rows remain for
-the owner. It still serves a manifest while incomplete, marked as such, and
-`ivms777-sync` refuses to `apply` one unless `--allow-incomplete` is passed.
+Stage 2 must not run against a half-processed library, so `/api/plan` reports the
+collection as `complete` only when no `pending` or `running` job rows remain for the
+owner. It still serves a plan while incomplete, marked as such and flagged in the
+Organize preview, and `ivms777-sync` refuses to `apply` one unless
+`--allow-incomplete` is passed.

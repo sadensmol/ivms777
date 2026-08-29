@@ -14,10 +14,14 @@ inside the one `models` service (design §5.1), loaded once — never in
 | `caption` — captions (caption sentence only — no tags) | `gemma4-E2B` GGUF (mac/jetson) · `qwen2.5vl:7b` (cloud) | OpenAI `/v1` call to `llama-server` (mac/jetson) / vLLM (cloud) | `llm_vision` |
 | `planner` — query planning, chat answers | `gemma4-E2B` GGUF (mac/jetson) · `qwen2.5:3b` (cloud) | OpenAI `/v1` call to `llama-server` (mac/jetson) / vLLM (cloud) | `llm` |
 | `text_embed` — caption text embeddings (§9 similar) | `nomic-embed-text-v1.5` (dedicated text embedder) | `TorchWorker` child, `transformers` — MPS (mac) / CUDA (jetson) | `text_embed` |
+| `voice` — memory-film narration (§11.1) | `Kokoro-82M` (en) · `Silero v4_ru` (ru) · **`off`** | `TorchWorker` child, `kokoro` / `torch.package` — MPS (mac) / CUDA (jetson) | `voice` |
+| `music` — memory-film score (§11.1) | `MusicGen medium` (mac) · `MusicGen small` (jetson/cloud) | `TorchWorker` child, `transformers` — MPS (mac) / CUDA (jetson) | `music` |
 
 Each slot is switchable at runtime from the settings popup (design §4.1, §13);
 the table gives the defaults. `caption` and `planner` share one `llama-server`
-child, so their two residency units are mutually exclusive.
+child, so their two residency units are mutually exclusive. `voice` and `music` are
+the two **optional** slots: their `off` entry registers no residency unit at all, so
+the governor never budgets for a model the user turned off.
 
 ## The catalog
 
@@ -37,12 +41,49 @@ What ships:
 | `text_embed` | `nomic-1.5` (default) · `embeddinggemma-300m` · `qwen3-embed-0.6b` |
 | `caption` | `gemma4-E2B` (default) · `qwen3-vl-4b` · `qwen3-vl-8b` (mac) |
 | `planner` | `gemma4-E2B` (default) · `qwen3-4b-2507` · `qwen3-vl-8b` (mac) |
+| `voice` | `kokoro-82m` (default, English) · `silero-v4-ru` (Russian) · `off` |
+| `music` | `musicgen-medium` (default on mac, mac-only) · `musicgen-small` (default on jetson/cloud) |
 
 Everything beyond the defaults carries an **estimated** `cost_mb` until it is
 measured on the board the way §8.1 requires (the drop in
 `psutil.virtual_memory().available` across a load). Until then the settings popup
 labels it unverified, and `test_every_model_fits_its_profile_budget` still refuses
 to offer any entry whose `cost_mb + headroom` exceeds the profile budget.
+
+### The two feed audio models
+
+| | Kokoro-82M | MusicGen small |
+|---|---|---|
+| Repo | `hexgrad/Kokoro-82M` | `facebook/musicgen-small` |
+| Licence | Apache-2.0 | **CC-BY-NC 4.0** (weights) — personal use only; the code is MIT |
+| Size | 82M params, ~330 MB | small 300M, ~2.2 GB · **medium 1.5B, ~7.6 GB (the mac default)** |
+| Output | 24 kHz **mono**, 54 voices | 32 kHz **mono**, any length (a 2-4 section score covering the film, §11.1) |
+| Speed | — | MEASURED on an M-series mac: medium 4.75x realtime, small 4.90x — the bigger model costs resident size, not time |
+| Cost | ~1200 MB, **estimated** | ~2600 MB, **estimated** |
+| Driver | `kokoro` | `transformers` (`MusicgenForConditionalGeneration`) |
+| Languages | 9, **Russian NOT among them** | n/a |
+| Gotchas | needs the `espeak-ng` system package (its G2P shells out to it), and pulls `spacy` transitively | non-commercial weights — never ship it in a commercial build |
+
+**Why MusicGen and not Stable Audio Open.** Stable Audio Open 1.0 was the first
+choice — better on paper, 44.1 kHz stereo, a permissive licence. It does not work
+here, and the reason is worth writing down so nobody re-picks it:
+
+- Stability's own `stable-audio-tools` hard-pins `torch==2.7.1` and pulls a transitive
+  `numpy==1.23.5`, both unsatisfiable against this project's `torch>=2.13` /
+  `numpy>=2.5` — `uv sync --extra models` fails outright with it declared.
+- Driving the same checkpoint through `diffusers` resolves cleanly, but its sampler is
+  `CosineDPMSolverMultistepScheduler`, which is **SDE-only** and therefore drives
+  `torchsde`. On this stack `BrownianInterval._split` recurses without terminating
+  near the smallest sigma: raising the recursion limit to 20 000 did not help, CPU
+  failed identically at step 7 of 8, and the scheduler exposes no ODE alternative.
+- It is also a **gated** repo, so an unattended machine stalls on a licence click.
+
+MusicGen has no scheduler at all — it is an autoregressive transformer under plain
+`transformers` — so there is nothing in a sampler to go wrong. The price is quality
+and licence: 32 kHz mono, and CC-BY-NC weights.
+
+Both audio models are `TorchWorker` children at `Priority.BATCH`, needed only while a
+film is *prepared* and never while one plays.
 
 A free-form "type any HF id" field is deliberately **not** offered: `cost_mb`,
 `dim` and `preprocess` cannot be discovered at runtime, and each breaks something

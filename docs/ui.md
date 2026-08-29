@@ -90,9 +90,13 @@ and Esc/backdrop/× just closes it.
   `embed`, `taxonomy` (re-tag), `caption embed` (the §9 caption vector, shown with a
   space), and a confirm-guarded `caption` (re-caption, the slow
   one); the worker drains the reset jobs.
-- `/export` — choose a layout, preview the folder tree it would produce, and download
-  the manifest. Shows whether the collection is fully processed, and the exact
-  `ivms777-sync` command line to run next.
+- `/organize/plan?by=…&grain=…` — reached by **Organize files…** on `/organize`. It
+  previews the folder tree the current principle would create — every album folder
+  with its photo count, plus `_unsorted/` and the theme-memory folders — asks
+  "reorganize your folders this way?", and on confirm downloads `ivms777-plan.json`.
+  It shows whether the collection is fully processed and the exact `ivms777-sync`
+  command line to run next. Cancel returns to `/organize` with its state intact
+  (design §13.1).
 - `/library` — infinite-scroll thumbnail grid. Hover shows caption and top tags; an
   `×N` badge marks photos with exact duplicates. Left sidebar has two filter groups
   with counts: model-derived tags per dimension, and EXIF facets (camera, lens, ISO
@@ -167,7 +171,37 @@ and Esc/backdrop/× just closes it.
   albums when it completes. The **last-opened organizer and grain are remembered** (a
   per-owner cookie), so loading `/organize` from the nav returns to the view you last
   used — memories, place, or a specific date grain — rather than snapping back to the
-  default date view ("never lose the user's place").
+  default date view ("never lose the user's place"). A **memory** card additionally
+  carries a **▶ Play** control that opens the memory feed below.
+- `/feed/{key}` — the **memory film**: one memory played fullscreen as a directed
+  short (design §11.1). A **language selector** (English / Русский) sits top-left;
+  each language is prepared and cached separately, so switching offers its own
+  Prepare rather than discarding the other.
+  It is the one route that does **not** use the app shell — a fullscreen player has
+  no room for the nav, and boosting it would break §13.1's history invariant — so it
+  renders its own black page with its own stylesheet.
+  - **Not prepared yet:** the memory's title and description over a **Prepare this
+    memory** button, with a one-line note that generating the soundtrack and
+    narration runs once, on this machine, and is kept until the memory is rebuilt.
+    While the background job runs, an HTMX poll shows "Composing music and
+    narration…" and reloads the page the moment it finishes.
+  - **Prepared:** the first shot behind a large title card with a **▶ Play** button.
+    Browsers refuse to start audio without a user gesture, so nothing plays until
+    that click — this is deliberate, not a loading state.
+  - **Playing:** a single **WebGL2 canvas**. The camera pushes, pulls and drifts
+    through each photo on an eased curve; shots dissolve, a burst cuts hard, and a
+    change of day or city dips to black. The whole film carries one colour grade
+    picked from its `palette`/`light` tags, plus a vignette and fine grain. Each
+    shot's written line fades up from the bottom. The generated track loops underneath
+    and **ducks automatically while the narration speaks** (WebAudio gain ramp, not a
+    volume jump).
+  - **Controls:** **space** play/pause, **←** / **→** step a shot back or forward,
+    **Esc** or the **×** close. Stepping never touches history — §13.1 rule 3 — so
+    close is always exactly one step back to `/organize?by=memories`, with the grid's
+    scroll restored by bfcache. `prefers-reduced-motion` drops only the CAPTION's
+    slide-in — never the camera. A film is the feature, not decoration around one, and
+    it plays only after a deliberate Play press; gating the camera on a global OS
+    setting turned every film into a static slideshow.
 - `/chat` — a normal chat view: a running **conversation history** of questions and
   their grounded answers, a text **input** at the bottom, a **processing indicator**
   while the model works, streamed answer tokens, and inline thumbnail citations.

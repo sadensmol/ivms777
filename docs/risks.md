@@ -18,5 +18,7 @@ Risk register for the app. Section references (`§4`, `§10`, …) point into
 | Hashing thousands of files freezes the browser tab | Hashing runs in a Web Worker, one file at a time, never on the main thread |
 | Storing every original fills the disk | Free space is checked before an upload is accepted and the upload is refused with a clear message rather than failing halfway |
 | `ivms777-sync` corrupts or loses photos | Every operation is journaled before it runs and reversed by `undo`; moves are same-filesystem renames where possible and copy-verify-unlink otherwise; nothing is ever deleted, only moved to `_duplicates/` |
-| The library changed on disk since upload, so the plan is stale | `plan` matches by content hash, not path; files whose hash is unknown to the manifest are reported and left untouched |
-| Stage 2 runs against a half-processed library | The manifest carries a `complete` flag; `apply` refuses an incomplete manifest without `--allow-incomplete` |
+| The library changed on disk since upload, so the plan is stale | `apply` matches by content hash, not path; files whose hash the plan does not know are reported and left untouched |
+| Stage 2 runs against a half-processed library | The plan carries a `complete` flag; `apply` refuses an incomplete plan without `--allow-incomplete` |
+| Reorganizing in place scrambles a folder the user cares about | Filenames never change, only album folders are created, and `undo` replays the journal backwards — the folder returns to exactly what it was |
+| A photo in several memories cannot be in several folders | The plan gives the file to its event memory; theme memories become description-only folders with a `photos.txt` pointing at the real paths (design §12) |

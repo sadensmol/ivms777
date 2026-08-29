@@ -15,7 +15,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from modelsvc.backends.base import ModelBackend
+from modelsvc.backends.base import ModelBackend, SlotOff
 
 
 class ImageEmbedRequest(BaseModel):
@@ -46,6 +46,59 @@ class CaptionResponse(BaseModel):
     # The ACTUAL model the backend used — the worker stores this, not the config
     # value. The caption model writes no tags; tags are SigLIP-only (design §7).
     model: str
+
+
+class SpeakRequest(BaseModel):
+    text: str
+    language: str = "en"
+    voice: str | None = None
+    # The EXACT chunks to speak, in order. When given, the voice does not choose its own
+    # sentence boundaries — it speaks these and reports where each one landed. That is
+    # what lets a film start a shot on the sentence about THAT photograph (§11.1): a
+    # boundary the caller did not choose is a boundary the caller cannot sync to.
+    segments: list[str] | None = None
+    # One speaker per segment, same length as `segments`. A viewer's `[voice]` bracket
+    # applies to the PASSAGE it was written over and nowhere else (§11.3), so the film
+    # is spoken in parts and merged: mostly its own narrator, with a different one for
+    # the moments that asked for it. `None`, or a shorter list, falls back to `voice`.
+    voices: list[str | None] | None = None
+
+
+class MusicSection(BaseModel):
+    """One stretch of a film's score (design §11.1) — what it sounds like, and for how
+    long. Planned by `feed/score.py`."""
+
+    brief: str
+    seconds: float = 30.0
+
+
+class MusicRequest(BaseModel):
+    # A whole SCORE, in order. Each section continues the one before it, so the result
+    # is one piece that changes rather than several clips. `prompt` is the one-section
+    # form and stays for callers that want a single bed.
+    sections: list[MusicSection] | None = None
+    prompt: str = ""
+    seconds: float = 30.0
+    seed: int | None = None
+    # Decoding controls. Left alone they are MusicGen's own defaults, which is what
+    # every film sounded like: the same safe average whatever it was asked for.
+    temperature: float | None = None
+    guidance: float | None = None
+
+
+class AudioResponse(BaseModel):
+    """A generated clip for a memory feed (design §11.1). `audio` is a base64 WAV —
+    base64 rather than a binary body because this is one artifact of a background
+    job, not a stream, and the caller stores it whole."""
+
+    audio: str
+    sample_rate: int
+    model: str
+    # WHERE each spoken sentence lands inside the clip, in seconds — `[{text, start,
+    # end}]`. The film cuts and titles ON the narration (§11.1), and only the voice
+    # child knows how long each sentence took to say, so it has to travel with the
+    # audio. Empty for music, and for a voice that cannot report it.
+    segments: list[dict] = []
 
 
 class TextCompleteRequest(BaseModel):
@@ -138,6 +191,15 @@ class ModelsStateResponse(BaseModel):
     generation: int = 0
 
 
+def _audio_response(result: dict) -> "AudioResponse":
+    return AudioResponse(
+        audio=base64.b64encode(result["audio"]).decode(),
+        sample_rate=result["sample_rate"],
+        model=result["model"],
+        segments=result.get("segments", []),
+    )
+
+
 def create_models_app(backend: ModelBackend) -> FastAPI:
     app = FastAPI(title="ivms777 models service")
 
@@ -164,6 +226,33 @@ def create_models_app(backend: ModelBackend) -> FastAPI:
         image = base64.b64decode(req.image)
         return CaptionResponse(**backend.caption(image))
 
+    @app.post("/speak", response_model=AudioResponse)
+    def speak(req: SpeakRequest) -> AudioResponse:
+        # A slot the user turned off is a 503; no voice covering the language is the
+        # same answer (§4.1). Anything else is a 500 that CARRIES THE MODEL'S OWN
+        # MESSAGE: narration is mandatory (§11.1), so this text is shown to the user
+        # on the failed film. Losing it is what made "no Russian voice" unreadable.
+        try:
+            result = backend.speak(req.text, req.language, req.voice, req.segments,
+                                   req.voices)
+        except SlotOff as exc:
+            raise HTTPException(status_code=503, detail=f"voice slot is off: {exc}") from exc
+        except Exception as exc:  # reported, never swallowed
+            raise HTTPException(status_code=500, detail=str(exc) or type(exc).__name__) from exc
+        return _audio_response(result)
+
+    @app.post("/music", response_model=AudioResponse)
+    def music(req: MusicRequest) -> AudioResponse:
+        if not req.sections and not req.prompt:
+            raise HTTPException(status_code=422, detail="music needs a prompt or sections")
+        sections = ([s.model_dump() for s in req.sections] if req.sections else None)
+        try:
+            result = backend.music(req.prompt, req.seconds, req.seed, sections=sections,
+                                   temperature=req.temperature, guidance=req.guidance)
+        except SlotOff as exc:
+            raise HTTPException(status_code=503, detail=f"music slot is off: {exc}") from exc
+        return _audio_response(result)
+
     @app.post("/text/complete", response_model=TextCompleteResponse)
     def text_complete(req: TextCompleteRequest) -> TextCompleteResponse:
         return TextCompleteResponse(
@@ -181,6 +270,10 @@ def create_models_app(backend: ModelBackend) -> FastAPI:
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(token_stream(), media_type="text/event-stream")
+
+    @app.get("/text/context")
+    def text_context() -> dict:
+        return {"context": backend.text_context()}
 
     @app.post("/text/embed", response_model=EmbedResponse)
     def text_embed(req: TextGenEmbedRequest) -> EmbedResponse:

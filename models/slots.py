@@ -32,6 +32,8 @@ _ENV_FIELD: dict[str, str] = {
     "text_embed": "text_embed_model",
     "caption": "caption_model",
     "planner": "planner_model",
+    "voice": "voice_model",
+    "music": "music_model",
 }
 
 

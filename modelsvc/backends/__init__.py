@@ -17,8 +17,10 @@ from modelsvc.backends.base import ModelBackend
 from modelsvc.backends.caption_backend import CaptionBackend
 from modelsvc.backends.composite import CompositeBackend
 from modelsvc.backends.fake import FakeBackend
+from modelsvc.backends.music_backend import MusicBackend
 from modelsvc.backends.siglip_backend import SiglipBackend
 from modelsvc.backends.text_backend import TextBackend
+from modelsvc.backends.voice_backend import VoiceBackend
 
 
 def build_backend(settings) -> ModelBackend:
@@ -74,8 +76,14 @@ def build_backend(settings) -> ModelBackend:
     return CompositeBackend(
         embed=embed,
         caption=caption,
+        # Providers again: either slot may be `off`, in which case `SlotManager`
+        # registers no unit and `CompositeBackend` raises SlotOff before ever calling
+        # these (§4.1, §11.1).
+        voice=VoiceBackend(lambda: manager.worker("voice")),
+        music=MusicBackend(lambda: manager.worker("music")),
         text=TextBackend(
-            inf, text_worker=text_worker, model_name=lambda: manager.entry("planner").key
+            inf, text_worker=text_worker, model_name=lambda: manager.entry("planner").key,
+            context_default=settings.llm_ctx,
         ),
         registry=registry,
         governor=governor,

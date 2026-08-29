@@ -25,7 +25,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from models import catalog
-from models.catalog import GgufSource, HfSource, ModelEntry
+from models.catalog import GgufSource, HfSource, ModelEntry, UrlSource
 from modelsvc.registry import ModelRegistry, ModelSpec
 
 # slot -> the residency unit it occupies.
@@ -34,8 +34,18 @@ UNIT_BY_SLOT: dict[str, str] = {
     "text_embed": "text_embed",
     "planner": "llm",
     "caption": "llm_vision",
+    "voice": "voice",
+    "music": "music",
 }
 LLM_UNITS = ("llm", "llm_vision")
+
+# Which child class hosts each `voice` entry. Unlike every other slot, the voice
+# entries are different MODELS rather than variants of one, so the target cannot be a
+# single constant (§4.1, §11.1).
+VOICE_TARGETS: dict[str, str] = {
+    "kokoro-82m": "audio.kokoro_voice:KokoroVoice",
+    "silero-v4-ru": "audio.silero_voice:SileroVoice",
+}
 
 
 class SlotManager:
@@ -101,6 +111,10 @@ class SlotManager:
             self._register_image_embed()
         if "text_embed" in changed:
             self._register_text_embed()
+        if "voice" in changed:
+            self._register_voice()
+        if "music" in changed:
+            self._register_music()
         if changed & {"caption", "planner"}:
             self._register_llm()
         self.generation += 1
@@ -116,8 +130,7 @@ class SlotManager:
         # the only thing that returns its memory (§8.1).
         self._registry.unload(unit)
         self._workers.pop(unit, None)
-        assert isinstance(entry.source, HfSource)
-        args = (entry.source.repo, self._settings.embed_device)
+        args = (self._child_arg(entry), self._settings.embed_device)
 
         def load() -> None:
             worker = self._workers.get(unit)
@@ -137,6 +150,18 @@ class SlotManager:
 
         self._registry.register(ModelSpec(unit, load, free, self._cost(unit, entry), alive=alive))
 
+    def _child_arg(self, entry: ModelEntry) -> str:
+        """What the child is constructed FROM — a Hub repo id, or a local file.
+
+        Most torch units load a `transformers` checkpoint by repo id. Silero is not on
+        the Hub at all (§4.1), so its archive is streamed into `data_dir/models` by the
+        downloader and the child is handed that path instead.
+        """
+        if isinstance(entry.source, UrlSource):
+            return str(self._settings.data_dir / "models" / entry.source.file)
+        assert isinstance(entry.source, HfSource)
+        return entry.source.repo
+
     def _register_image_embed(self) -> None:
         self._register_torch_unit(
             "image_embed", self.entry("image_embed"), "embedding.siglip:SiglipEmbedder"
@@ -152,6 +177,55 @@ class SlotManager:
             "embedding.text_embedder:TextEmbedder",
             warm="warm",  # this encoder loads lazily; resident must mean resident
         )
+
+    def _register_audio_unit(self, slot: str, target: str) -> None:
+        """A `voice` or `music` unit. Both always exist — there is no "off" model, and
+        never was a good reason for one: a film with no soundtrack is a broken film,
+        not a configuration."""
+        self._register_torch_unit(UNIT_BY_SLOT[slot], self.entry(slot), target, warm="warm")
+
+    def voice_entry_for(self, language: str) -> ModelEntry | None:
+        """The catalog entry that speaks `language`, or None.
+
+        Preference order: the SELECTED entry if it speaks the language, else any other
+        offered voice that does. `off` speaks nothing, so an off slot returns None and
+        stays off — turning narration off must stay a real choice.
+        """
+        selected = self.entry("voice")
+        if language in selected.languages:
+            return selected
+        for entry in catalog.entries_for("voice", self._settings.profile):
+            if language in entry.languages:
+                return entry
+        return None
+
+    def ensure_voice_for(self, language: str) -> bool:
+        """Point the `voice` unit at whichever model speaks `language`, swapping the
+        child if needed. False when nothing can (the slot is off, or no voice covers
+        it) — the caller then degrades to a silent film.
+
+        This is why the user never has to choose a voice model: a film has a language,
+        and the language picks the model. Only ONE voice is ever resident, and a film
+        is single-language, so the swap happens at most once per film.
+        """
+        entry = self.voice_entry_for(language)
+        if entry is None:
+            return False
+        if entry.key != self._slots.get("voice"):
+            self._slots["voice"] = entry.key
+            self._register_voice()
+            self.generation += 1
+        return True
+
+    def _register_voice(self) -> None:
+        # The `voice` slot is the one whose entries are DIFFERENT models, not variants
+        # of one (§4.1): Kokoro for English, Silero for Russian. So the child class is
+        # chosen by key rather than shared.
+        target = VOICE_TARGETS.get(self.entry("voice").key, VOICE_TARGETS["kokoro-82m"])
+        self._register_audio_unit("voice", target)
+
+    def _register_music(self) -> None:
+        self._register_audio_unit("music", "audio.musicgen:MusicGen")
 
     def _register_llm(self) -> None:
         for unit in LLM_UNITS:

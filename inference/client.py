@@ -203,7 +203,7 @@ class OpenAICompatClient:
         ("http://host:11434/v1/"), so strip it before checking the /v1 suffix.
         """
         base = str(self._client.base_url).rstrip("/")
-        root = base[: -len("/v1")] if base.endswith("/v1") else base
+        root = base.removesuffix("/v1")
         return root + path
 
     def warm(self, model: str, *, timeout: float = 120.0) -> None:
@@ -221,6 +221,28 @@ class OpenAICompatClient:
             json={"model": model, "prompt": "", "keep_alive": 0, "stream": False},
             timeout=timeout,
         ).raise_for_status()
+
+    def context_window(self, *, timeout: float = 2.0) -> int | None:
+        """How many tokens the SERVER will actually accept, from llama.cpp's `/props`.
+
+        A prompt over this is not truncated — llama-server rejects the whole call
+        ("request (6306 tokens) exceeds the available context size (4096 tokens)"),
+        which reaches the caller as a failed generation with no hint of why. Callers
+        that build big prompts (the story pass, §11.1) budget against this number, so
+        it has to come from the RUNNING server rather than from config: the two
+        disagree exactly when it matters, which is when the server was started before
+        the setting changed.
+
+        None when the backend does not speak `/props` (vLLM) or is unreachable — the
+        caller falls back to its configured context.
+        """
+        try:
+            resp = self._client.get(self._native_url("/props"), timeout=timeout)
+            resp.raise_for_status()
+            value = resp.json().get("default_generation_settings", {}).get("n_ctx")
+            return int(value) if value else None
+        except Exception:  # noqa: BLE001 - best-effort probe; the caller has a fallback
+            return None
 
     def loaded_models(self, *, timeout: float = 2.0) -> list[str]:
         """The text models Ollama currently holds resident (native `/api/ps`).

@@ -122,6 +122,47 @@ CREATE VIRTUAL TABLE IF NOT EXISTS photo_fts USING fts5(caption, tags_text);
 -- groups.id; rebuilt in lockstep with the memories in albums/memory_store.py.
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(name, description);
 
+-- One prepared memory feed (design §6, §11.1). `group_id` is the primary key AND a
+-- cascading foreign key onto `groups`, so §11's atomic memory swap drops every stale
+-- presentation for free — a recycled group id can never inherit an old feed. The
+-- WAVs themselves live in `data_dir/audio` and are pruned on the next prepare run.
+CREATE TABLE IF NOT EXISTS memory_presentations (
+  group_id      INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+  language      TEXT NOT NULL DEFAULT 'en',
+  signature     TEXT NOT NULL,
+  timeline_json TEXT NOT NULL,
+  music_key     TEXT,
+  narration_key TEXT,
+  status        TEXT NOT NULL,
+  error         TEXT,
+  -- EVERY CHOICE THE BUILD MADE, as JSON (design §11.1): the cast it asked for and the
+  -- cast it got, the score's sections and sampling, the seed, the model context, what
+  -- the story planned and what was used. Written on success AND on failure. Without it
+  -- "which voice read this?" had no answer after the fact, and a bracket the story pass
+  -- ignored was indistinguishable from one it obeyed.
+  decisions_json TEXT,
+  created_at    TEXT NOT NULL,
+  PRIMARY KEY (group_id, language)
+);
+
+-- What the VIEWER said about their own memory, and WHEN in the film they said it.
+-- Paused mid-play, typed a note; the next generation weaves it into the narration at
+-- that moment (design §11.3). Cascades with the memory, like a presentation: a note
+-- about a memory that no longer exists describes nothing.
+CREATE TABLE IF NOT EXISTS memory_notes (
+  id         INTEGER PRIMARY KEY,
+  group_id   INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+  -- Seconds into the film. The user's own sense of WHERE this belongs in the story,
+  -- which no label and no model can supply.
+  at_seconds REAL NOT NULL,
+  -- Any language. It is translated into the film's language when it is used, so the
+  -- viewer never has to think about which one the film is in.
+  text       TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS memory_notes_by_memory
+  ON memory_notes(group_id, at_seconds);
+
 CREATE TABLE IF NOT EXISTS chat_sessions (
   id         INTEGER PRIMARY KEY,
   owner_id   INTEGER NOT NULL,

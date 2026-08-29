@@ -16,14 +16,15 @@ the order it was built in and what may come next. Section references (`§3.2`,
 | 4 | Query planner, parsed-filter chips, caption vocabulary mining with tag suggestions |
 | 5 | Memories organizer — agentic RAG builder, persisted `groups(kind='memory')`, `/organize?by=memories` with rebuild (plan 07, done) |
 | 6 | Ask-your-library chat with streaming and citations |
-| 7 | Stage 2 — layouts, `/api/manifest`, `/export` preview, and the `ivms777-sync` CLI with plan, apply, undo, and verify |
+| 7 | Stage 2 — the **Organize files…** button, `/organize/plan` preview, `/api/plan`, and the `ivms777-sync` CLI with apply, undo, and verify (plan 22) |
 
 Each phase leaves a working, useful application.
 
-Phase 7 is last because the manifest is richer the more the library knows —
-the `date-tags` layout needs taxonomy from phase 2 and captions from phase 3.
-But it depends on nothing after phase 3, so it can be pulled forward if
-reorganizing the disk matters more than chat does.
+Phase 7 is last because the plan is richer the more the library knows — the
+organizer selected in Organize *is* the layout, so exporting memories needs the
+agent from phase 5. But it depends on nothing after phase 3 (date, camera, and
+place organizers export on their own), so it can be pulled forward if reorganizing
+the disk matters more than chat does.
 
 ## Future work
 
@@ -43,6 +44,17 @@ reorganizing the disk matters more than chat does.
   learned reranker model.
 - Postgres and pgvector if concurrent writes become a real constraint.
 - Video support.
+- **Faster-than-realtime export.** Downloading a film is DONE (design §11.2), by
+  recording the player's own canvas and audio bus with `MediaRecorder` — which
+  keeps one renderer instead of two, but records in real time. Beating that means
+  rendering frames on a virtual clock and muxing them against separately-rendered
+  audio, i.e. shipping a muxer into the page. Worth it only once someone is
+  exporting films long enough to mind the wait.
+
+  The ffmpeg route was considered and rejected rather than deferred: the timeline
+  JSON is a complete render script, but every one of the eight shot effects is
+  GLSL, and a filter graph reproducing them would be a SECOND renderer that has to
+  agree with the first frame for frame. That drift costs more than the wait does.
 - A watch mode for `ivms777-sync` that uploads new files as they appear.
 - **MCP server exposing the organized library, read-only (plan 11).** The
   counterpart to stage 2: instead of exporting a change plan to reshape the disk,
@@ -53,7 +65,8 @@ reorganizing the disk matters more than chat does.
   goes through the app's read layer only (`app` serves reads, §5) and never writes
   disk or DB, so "source folders are sacred" (§3.2c) still holds. Hosted,
   multi-tenant MCP with per-owner tokens waits on the auth work above (v02).
-- User-defined layouts, expressed as a path template over facets and tags.
+- A browser-side apply for stage 2, wherever the File System Access API is actually
+  usable (Chromium desktop over HTTPS/localhost only — see design §3.2b).
 - **Chat degradation now covers empty results, not only exceptions (done).** §10's
   rerank keeps a candidate whose `caption_vec` is not computed yet (signal-unavailable,
   not floored), so a partially-processed library no longer answers a false "no photos

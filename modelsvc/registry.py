@@ -58,6 +58,16 @@ class ModelRegistry:
             self._specs[name].free()
             del self._loaded[name]
 
+    def unregister(self, name: str) -> None:
+        """Forget a unit entirely — what a slot switched to `off` needs (§4.1).
+
+        Frees it FIRST if it is resident: a unit dropped while loaded would keep its
+        memory with no remaining way to release it (§8.1).
+        """
+        with self._lock:
+            self.unload(name)
+            self._specs.pop(name, None)
+
     def touch(self, name: str) -> None:
         with self._lock:
             if name in self._loaded:

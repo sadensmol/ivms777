@@ -10,7 +10,18 @@ different inputs (almost) never collide — reproducible offline, no model.
 import hashlib
 from collections.abc import Iterator
 
+import numpy as np
+
+from modelsvc.backends.base import SlotOff
+from storage.wav import encode_wav
+
 _DIM = 16
+# Stable Audio Open 1.0's ceiling (design §11.1). The fake clamps to the same figure
+# so a caller that asks for too much fails the same way here as on a real board.
+MUSIC_MAX_SECONDS = 47.0
+# The context the fake server "serves" — the smallest one we actually run (jetson's
+# `llm_ctx`), so a test that builds a prompt is budgeted like the tightest real box.
+FAKE_CONTEXT = 2048
 
 
 def _vector_from_bytes(seed: bytes, dim: int = _DIM) -> list[float]:
@@ -61,6 +72,55 @@ class FakeBackend:
             "model": "fake",
         }
 
+    def speak(self, text: str, language: str = "en", voice: str | None = None,
+              segments: list[str] | None = None,
+              voices: list[str | None] | None = None) -> dict:
+        # REAL, parseable WAV bytes, not a placeholder: downstream tests measure a true
+        # duration from these.
+        key = self._slots.get("voice")
+        if key == "off":
+            raise SlotOff("voice")
+        # The language picks the model (§11.1): swap to whichever voice speaks it,
+        # exactly as SlotManager does on the real path.
+        if language not in self._catalog.get("voice", key).languages:
+            for entry in self._catalog.entries_for("voice", self._profile):
+                if language in entry.languages:
+                    self._slots["voice"] = entry.key
+                    key = entry.key
+                    break
+            else:
+                raise SlotOff(f"no voice available for {language}")
+        # ~14 characters a second is roughly a read-aloud pace, so a longer memory
+        # yields a longer clip and `fit_to_narration` has something to fit.
+        seconds = max(0.5, len(text) / 14.0)
+        return {
+            "audio": encode_wav(np.zeros(int(24000 * seconds), dtype=np.float32), 24000),
+            "sample_rate": 24000,
+            "model": "fake-voice",
+        }
+
+    def music(
+        self, prompt: str = "", seconds: float = 30.0, seed: int | None = None,
+        sections: list[dict] | None = None, temperature: float | None = None,
+        guidance: float | None = None,
+    ) -> dict:
+        if self._slots.get("music") == "off":
+            raise SlotOff("music")
+        plan = sections or [{"brief": prompt, "seconds": seconds}]
+        segments, start = [], 0.0
+        for section in plan:
+            length = max(0.5, min(float(section.get("seconds", seconds)),
+                                  MUSIC_MAX_SECONDS))
+            segments.append({"start": round(start, 3), "end": round(start + length, 3)})
+            start += length
+        frames = int(44100 * start)
+        return {
+            "audio": encode_wav(np.zeros((2, frames), dtype=np.float32), 44100),
+            "sample_rate": 44100,
+            "model": "fake-music",
+            "segments": segments,
+        }
+
     def text_complete(
         self,
         model: str,
@@ -77,6 +137,9 @@ class FakeBackend:
         yield "Hello"
         yield " from"
         yield " the fake backend."
+
+    def text_context(self) -> int | None:
+        return FAKE_CONTEXT
 
     def text_embed(self, model: str, texts: list[str]) -> list[list[float]]:
         return [_vector_from_bytes(b"text-embed:" + text.encode()) for text in texts]

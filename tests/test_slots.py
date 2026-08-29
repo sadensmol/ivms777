@@ -103,11 +103,15 @@ def test_stored_keys_use_the_documented_prefix(tmp_path):
 def test_resolve_keys_returns_a_plain_slot_to_key_map(tmp_path):
     conn = _conn(tmp_path)
     settings = _settings(tmp_path, profile="mac")
+    # All six slots (§4.1) — the two feed audio slots included, so an added slot can
+    # never quietly go unresolved.
     assert slots.resolve_keys(conn, settings) == {
         "image_embed": "siglip2-so400m-384",
         "text_embed": "nomic-1.5",
         "caption": "gemma4-E2B",
         "planner": "gemma4-E2B",
+        "voice": "kokoro-82m",
+        "music": "musicgen-medium",
     }
 
 

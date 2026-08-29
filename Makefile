@@ -36,6 +36,15 @@ LLAMA_GGUF   ?= gemma-4-E2B-it-Q4_K_M.gguf
 LLAMA_MMPROJ ?= mmproj-F16.gguf
 LLAMA_REPO   ?= unsloth/gemma-4-E2B-it-GGUF
 LLAMA_PORT   ?= 8080
+# KV context (`-c`) for the host server, and the value `app`/`worker` are told the
+# server has (IVMS777_LLM_CTX → `settings.llm_ctx`, which the story pass budgets its
+# prompt against). 4096 was too small for a real film: a 40-shot memory's story prompt
+# is ~6 300 tokens and llama-server rejected the whole call ("request (6306 tokens)
+# exceeds the available context size (4096 tokens)"), which surfaced as a memory that
+# would not narrate. MEASURED on this mac (32 GB): after one generation the server is
+# 4.11 GiB resident at -c 4096, 4.18 at 16384 and 4.28 at 32768 — gemma's sliding
+# window keeps the KV cache tiny, so the whole increase costs ~0.17 GiB.
+LLAMA_CTX    ?= 32768
 
 # Jetson (8 GB Orin Nano, JetPack 7): fully containerised. Since plan 16 ONE
 # gemma4-E2B GGUF is served by a containerised sm_87 CUDA llama-server for text +
@@ -47,18 +56,30 @@ JETSON_CAPTION_MODEL ?= gemma4-E2B
 JETSON_PLANNER_MODEL ?= gemma4-E2B
 
 .DEFAULT_GOAL := help
-.PHONY: up set-maxn-jetson run-jetson stop-jetson clean-jetson test lint llama-mac llama-stop llama-rebuild clean help
+.PHONY: up models set-maxn-jetson run-jetson stop-jetson clean-jetson test lint llama-mac llama-stop llama-rebuild clean help
 
-up: llama-mac ## Ensure host llama-server, then run models + worker + app NATIVELY → http://localhost:8000
-	@mkdir -p "$$HOME/.ivms777"
+# The models service reloads too (--reload), scoped to the packages it actually
+# imports. Without it, every change to a backend, a slot rule or an audio child needed
+# a manual restart, and a stale service looks exactly like a broken feature — it is
+# what made Russian narration "not work" long after the code was right. The watch list
+# is scoped rather than the whole repo so an edit to web/ or feed/ does not drop the
+# resident models mid-generation.
+models: ## Pre-fetch the SELECTED slots' weights into the shared cache (idempotent)
 	@echo "  syncing the models extra (torch/transformers) for the native models service…"
 	@uv sync --extra models
+	@uv run --no-sync python -m scripts.fetch_models
+
+up: llama-mac models ## Ensure host llama-server + weights, then run models + worker + app NATIVELY → http://localhost:8000
+	@mkdir -p "$$HOME/.ivms777"
 	@echo "  data $$HOME/.ivms777 · inference localhost:$(LLAMA_PORT) · models localhost:9000 · app http://localhost:8000 (Ctrl-C stops all)"
 	@IVMS777_PROFILE="$${IVMS777_PROFILE:-mac}" \
 	 IVMS777_DATA_DIR="$${IVMS777_DATA_DIR:-$$HOME/.ivms777}" \
 	 IVMS777_MODELS_BASE_URL="$${IVMS777_MODELS_BASE_URL:-http://localhost:9000}" \
+	 IVMS777_LLM_CTX="$${IVMS777_LLM_CTX:-$(LLAMA_CTX)}" \
 	 bash -c 'IVMS777_INFERENCE_BASE_URL="$${IVMS777_INFERENCE_BASE_URL:-http://localhost:$(LLAMA_PORT)/v1}" \
-	   uv run --no-sync uvicorn modelsvc.asgi:app_factory --factory --host 0.0.0.0 --port 9000 & M=$$!; \
+	   uv run --no-sync uvicorn modelsvc.asgi:app_factory --factory --host 0.0.0.0 --port 9000 \
+	     --reload --reload-dir modelsvc --reload-dir audio --reload-dir models \
+	     --reload-dir embedding --reload-dir captioning --reload-dir inference & M=$$!; \
 	   uv run --no-sync watchfiles "python -m ingest.cli" ingest embedding search inference albums storage db models web config.py vocab.yaml & W=$$!; \
 	   trap "kill $$M $$W 2>/dev/null" EXIT INT TERM; \
 	   uv run --no-sync uvicorn web.app:app_factory --factory --host 0.0.0.0 --port 8000 --reload'
@@ -76,16 +97,23 @@ llama-mac: ## Build (if needed) + start the host-native llama-server (Metal) on 
 	@mkdir -p "$(LLAMA_MODELS)"
 	@[ -s "$(LLAMA_MODELS)/$(LLAMA_GGUF)" ]   || { echo "  downloading $(LLAMA_GGUF) (~2 GB, one time)…"; curl -fL --progress-bar -o "$(LLAMA_MODELS)/$(LLAMA_GGUF)"   "https://huggingface.co/$(LLAMA_REPO)/resolve/main/$(LLAMA_GGUF)"; }
 	@[ -s "$(LLAMA_MODELS)/$(LLAMA_MMPROJ)" ] || { echo "  downloading $(LLAMA_MMPROJ)…"; curl -fL --progress-bar -o "$(LLAMA_MODELS)/$(LLAMA_MMPROJ)" "https://huggingface.co/$(LLAMA_REPO)/resolve/main/$(LLAMA_MMPROJ)"; }
-	@if curl -sf "http://localhost:$(LLAMA_PORT)/health" >/dev/null 2>&1; then \
-	  echo "  llama-server already up on :$(LLAMA_PORT)"; \
+	@RUNNING=$$(python3 -c 'import json,urllib.request; print(json.load(urllib.request.urlopen("http://localhost:$(LLAMA_PORT)/props", timeout=2))["default_generation_settings"]["n_ctx"])' 2>/dev/null); \
+	 if [ "$$RUNNING" = "$(LLAMA_CTX)" ]; then \
+	  echo "  llama-server already up on :$(LLAMA_PORT) (context $$RUNNING)"; \
 	else \
-	  echo "  starting llama-server on :$(LLAMA_PORT) (log: /tmp/ivms777-llama.log)…"; \
+	  if [ -n "$$RUNNING" ]; then \
+	    echo "  llama-server on :$(LLAMA_PORT) has context $$RUNNING, want $(LLAMA_CTX) — restarting it…"; \
+	  fi; \
+	  pkill -f "llama-server .*--port $(LLAMA_PORT)" >/dev/null 2>&1 || true; \
+	  for i in $$(seq 1 40); do lsof -nP -iTCP:$(LLAMA_PORT) -sTCP:LISTEN >/dev/null 2>&1 || break; sleep 0.5; done; \
+	  echo "  starting llama-server on :$(LLAMA_PORT) (context $(LLAMA_CTX), log: /tmp/ivms777-llama.log)…"; \
 	  nohup "$(LLAMA_BIN)" -m "$(LLAMA_MODELS)/$(LLAMA_GGUF)" --mmproj "$(LLAMA_MODELS)/$(LLAMA_MMPROJ)" \
 	    -ngl 99 --flash-attn on --jinja --chat-template-kwargs '{"enable_thinking":false}' \
-	    -c 4096 --host 0.0.0.0 --port $(LLAMA_PORT) >/tmp/ivms777-llama.log 2>&1 & \
+	    -c $(LLAMA_CTX) --host 0.0.0.0 --port $(LLAMA_PORT) >/tmp/ivms777-llama.log 2>&1 & \
 	  for i in $$(seq 1 60); do curl -sf "http://localhost:$(LLAMA_PORT)/health" >/dev/null 2>&1 && break; sleep 1; done; \
-	  curl -sf "http://localhost:$(LLAMA_PORT)/health" >/dev/null 2>&1 || { echo "  llama-server did not come up — see /tmp/ivms777-llama.log"; exit 1; }; \
-	  echo "  llama-server ready."; \
+	  STARTED=$$(python3 -c 'import json,urllib.request; print(json.load(urllib.request.urlopen("http://localhost:$(LLAMA_PORT)/props", timeout=2))["default_generation_settings"]["n_ctx"])' 2>/dev/null); \
+	  [ "$$STARTED" = "$(LLAMA_CTX)" ] || { echo "  llama-server is not serving context $(LLAMA_CTX) (got '$$STARTED') — see /tmp/ivms777-llama.log"; exit 1; }; \
+	  echo "  llama-server ready (context $$STARTED)."; \
 	fi
 
 llama-stop: ## Stop the host-native llama-server started by `make llama-mac`

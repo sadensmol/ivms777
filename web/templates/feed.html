@@ -1,0 +1,257 @@
+{# The fullscreen memory film (design §11.1, §13, §13.1).
+
+   This is the ONE page that does not extend base.html. A fullscreen player has no
+   room for the app shell, and — more importantly — the shell's nav is hx-boosted:
+   boosting a leaf puts htmx's history cache in front of bfcache and breaks the
+   [grid, leaf] invariant §13.1 rule 3 depends on. So the player renders its own
+   page, with its own stylesheet, and every navigation out of it is a plain move. #}
+<!doctype html>
+<html lang="{{ language }}">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ title }} — ivms777</title>
+    <link rel="stylesheet" href="/static/feed.css?v={{ static_v('feed.css') }}">
+    <script src="/static/htmx.min.js?v={{ static_v('htmx.min.js') }}"></script>
+  </head>
+  <body class="feed-body{{ ' is-building' if building else '' }}"
+        data-key="{{ key }}" data-lang="{{ language }}">
+    <button class="feed-close" type="button" data-origin="{{ origin_url }}"
+            aria-label="Close">×</button>
+
+    {# Each language is prepared and cached separately (§11.1), so switching offers
+       its own Prepare rather than discarding the other. #}
+    <form class="feed-lang" method="get" action="/feed/{{ key }}">
+      {% for code, label in languages %}
+        <button type="submit" name="lang" value="{{ code }}"
+                class="{{ 'is-current' if code == language else '' }}">{{ label }}</button>
+      {% endfor %}
+    </form>
+
+    {% if busy %}
+      {# Regenerate was refused: one film is made at a time per process (§3.2). Saying
+         so beats a button that silently does nothing. #}
+      <p class="feed-busy">Stopping <strong>{{ busy }}</strong> first — this one starts
+        as soon as it does.</p>
+    {% endif %}
+
+    {% if ready %}
+      {# A prepared film must still be re-makeable: the story pass is sampled, so a
+         second run genuinely differs, and a run that lost its music or voice needs a
+         retry without deleting anything by hand (§11.1). #}
+      <form class="feed-regen" method="post" action="/feed/{{ key }}/prepare">
+        <input type="hidden" name="lang" value="{{ language }}">
+        <button type="submit"
+                title="Write and score this memory again, using your notes">↻ Regenerate</button>
+      </form>
+      {# Recorded from the canvas and the audio bus the player is already using, so the
+         file IS the film you just watched (§11.2). Real time, hence the warning: there
+         is no way to mux a faster-than-realtime audio track without shipping a muxer. #}
+      <button class="feed-download" id="download" type="button"
+              title="Record this film to a video file. Plays it through once in real
+time — leave the tab visible while it records.">
+        <span class="feed-download-text">↓ Download</span>
+      </button>
+      <canvas class="feed-stage" id="stage"></canvas>
+      <p class="feed-text" id="feed-text"></p>
+      <button class="feed-start" id="start" type="button">
+        <span class="feed-start-title">{{ title }}</span>
+        <span class="feed-start-desc">{{ description }}</span>
+        {# Browsers refuse to start audio without a user gesture, so the film opens
+           paused behind this control — deliberate, not a loading state (§11.1). #}
+        <span class="feed-start-play">▶ Play</span>
+        {# PAUSED is not the same state as NOT STARTED. Throwing the title card back
+           over the frame hides the very moment you stopped to look at, so a pause
+           shows only this, over an almost-clear scrim. #}
+        <span class="feed-start-resume">❚❚ Paused — click to resume</span>
+      </button>
+      {% if missing %}
+        <p class="feed-missing">{{ missing }}</p>
+      {% endif %}
+      {% if has_music %}
+        {# NOT looped: the score is written to cover this film and to END (§11.1). A
+           loop was what made every film sound like one clip under different pictures,
+           and it put a seam in the middle of the story. #}
+        <audio id="music" src="/feed/{{ key }}/audio/music?lang={{ language }}"
+               preload="auto"></audio>
+      {% endif %}
+      {% if has_narration %}
+        <audio id="narration" src="/feed/{{ key }}/audio/narration?lang={{ language }}"
+               preload="auto"></audio>
+      {% endif %}
+      {# The viewer's own notes (§11.3). They live in the DOM, NEVER on the canvas —
+         `canvas.captureStream()` records the canvas alone, so notes are automatically
+         absent from a downloaded film. They are for the person making it, not for
+         whoever they send it to. #}
+      <div class="feed-bubbles" id="bubbles" aria-live="polite"></div>
+
+      <script src="/static/feed-gl.js?v={{ static_v('feed-gl.js') }}" defer></script>
+    {% else %}
+      {# The wait is a minute or more, almost all of it one MusicGen call. Rather than
+         a bar on a black page, the memory's own photographs drift behind it — the film
+         starting before the film starts (§11.1). Pure CSS, no JS, no canvas: this page
+         is also shown while the GPU is busy, so it must cost nothing. #}
+      {% if preview or notes %}
+        <div class="feed-scatter" aria-hidden="true">
+          {# Position, angle and size are DERIVED from the index with coprime steps, so
+             successive prints land far apart and the layout is identical on every poll
+             of the progress bar rather than jumping each second. Computed here rather
+             than with CSS `mod()`, which is too new to depend on. #}
+          {% for pid in preview %}
+            <img class="feed-scatter-shot" src="/thumb/{{ pid }}?size=grid" alt=""
+                 loading="lazy"
+                 style="left: {{ 4 + (loop.index0 * 37) % 78 }}%;
+                        top: {{ 4 + (loop.index0 * 53) % 74 }}%;
+                        transform: rotate({{ (loop.index0 * 47) % 25 - 12 }}deg)
+                                   scale({{ '%.2f'|format(0.72 + ((loop.index0 * 13) % 45) / 100) }});
+                        animation-delay: -{{ '%.1f'|format(loop.index0 * 1.1) }}s">
+          {% endfor %}
+          {# The viewer's own notes, scattered among the prints. This run is READING
+             them (§11.3), and a waiting screen that shows only photographs gives no
+             sign of that — seeing your own words tumbling in with the pictures is how
+             you know they are part of what is being made. Different steps from the
+             photos so the two do not stack on each other. #}
+          {% for note in notes %}
+            <p class="feed-scatter-note"
+               style="left: {{ 6 + (loop.index0 * 61) % 62 }}%;
+                      top: {{ 8 + (loop.index0 * 29) % 70 }}%;
+                      transform: rotate({{ (loop.index0 * 31) % 19 - 9 }}deg)
+                                 scale({{ '%.2f'|format(0.85 + ((loop.index0 * 17) % 40) / 100) }});
+                      animation-delay: -{{ '%.1f'|format(loop.index0 * 1.7 + 0.6) }}s">{{ note.text }}</p>
+          {% endfor %}
+        </div>
+      {% endif %}
+      <div class="feed-prepare">
+        <h1>{{ title }}</h1>
+        <p>{{ description }}</p>
+        {# Narration is mandatory (§11.1). A run that could not produce a voice made no
+           film, so the reason is stated here rather than a mute player being shown. #}
+        {% if failed %}
+          <p class="feed-failed">{{ failed }}</p>
+        {% endif %}
+        {% if building %}
+          <div hx-get="/feed/{{ key }}/prepare/progress?lang={{ language }}"
+               hx-trigger="load, every 1s" hx-swap="outerHTML">
+            <div class="feed-bar"><span style="width: 0%"></span></div>
+            <p class="feed-step">starting · 0%</p>
+          </div>
+        {% else %}
+          <form method="post" action="/feed/{{ key }}/prepare">
+            <input type="hidden" name="lang" value="{{ language }}">
+            <button type="submit">Prepare this memory</button>
+          </form>
+          <p class="feed-note">
+            Writes the edit, the narration and a soundtrack on this machine. It runs
+            once per language and is kept until the memory is rebuilt.
+          </p>
+        {% endif %}
+      </div>
+    {% endif %}
+
+    {# Notes belong to the MEMORY, not to a film, so this sits OUTSIDE the
+       ready/not-ready branch: the screen where you most want to write them is the
+       one where the film does not exist yet (§11.3). `feed-notes.js` works with or
+       without a player. #}
+    {# `| safe` because this is a JSON document, not HTML: autoescaping turns every
+       quote into &#34; and `JSON.parse` then throws, which showed up as a panel that
+       renders but never lists anything. It is safe to mark: `json.dumps` has already
+       escaped every quote and backslash, and the server neutralises `</` so the
+       payload cannot close this tag early. #}
+    <script id="notes" type="application/json">{{ notes_json | safe }}</script>
+      {# Every note on this memory, editable, plus a new one at wherever the film
+         is standing — or at 0:00 on the Prepare screen, where a note is about the
+         film as a whole. #}
+      <div class="feed-notes" id="notes-panel"
+           {{ "hidden" if ready else "" }}>
+        {# The whole sheet slides down to this bar. It sits over the memory's own
+           description on the Prepare screen, and covering the thing you are writing
+           notes ABOUT is not a trade worth making. #}
+        <button class="feed-notes-title" id="notes-toggle" type="button"
+                aria-expanded="true" aria-controls="notes-body">
+          <span>Tell the story better</span>
+          <span class="feed-notes-count" id="notes-count"></span>
+          <span class="feed-notes-chevron" aria-hidden="true">▾</span>
+        </button>
+        <div class="feed-notes-body" id="notes-body">
+        <ul class="feed-notes-list" id="notes-list"></ul>
+        {# Anything in [square brackets] is an INSTRUCTION rather than a sentence: it
+           is lifted out and sent to whichever part of generation can act on it, and
+           the rest of the note stays as prose (§11.3). The list is generated from the
+           parser's own vocabulary, so it cannot drift from what actually works. #}
+        <details class="feed-legend">
+          <summary>Use [brackets] to direct it</summary>
+          <p class="feed-legend-lead">
+            <code>[low man's voice] it was a bad day</code> — the words become
+            narration, the bracket becomes an instruction. Add a number for a length:
+            <code>[hold 5s]</code>.
+          </p>
+          {% for kind, blurb, words in legend %}
+            <p class="feed-legend-row">
+              <strong>{{ kind }}</strong> <span>{{ blurb }}</span><br>
+              {% for word in words %}<code>[{{ word }}]</code>{% endfor %}
+            </p>
+          {% endfor %}
+          <p class="feed-legend-lead">
+            Anything else in brackets is passed on as-is, so
+            <code>[like a fairytale]</code> works too.
+          </p>
+        </details>
+        <form class="feed-notes-new" id="note-form">
+          <label class="feed-notes-at" for="note-text"><span id="note-at">0:00</span></label>
+          <textarea id="note-text" rows="2"
+                    placeholder="Who is this? What happened here?"></textarea>
+          <button type="submit">Add</button>
+        </form>
+        </div>
+      </div>
+    <script src="/static/feed-notes.js?v={{ static_v('feed-notes.js') }}" defer></script>
+
+    <script>
+      // §13.1 rules 4/5: close goes UP exactly one level. history.back() restores the
+      // Organize grid's scroll and filters through bfcache; the data-origin href is
+      // only the fallback for a film opened cold from a pasted URL.
+      (() => {
+        const close = document.querySelector('.feed-close');
+        const leave = () => {
+          if (history.length > 1) { history.back(); } else { location.href = close.dataset.origin; }
+        };
+        close.addEventListener('click', leave);
+        document.addEventListener('keydown', (event) => {
+          if (event.key !== 'Escape') { return; }
+          // The FILM gets first refusal: a recording to cancel or a playback to stop is
+          // "one level" of its own, and closing the page out from under either is not
+          // what Esc was asked to do. It answers false when there is nothing to undo.
+          if (window.feedFilm && window.feedFilm.escape()) { return; }
+          leave();
+        });
+
+        // §13.1 rule 3: history must stay [grid, film] — depth TWO. Every move made
+        // WITHIN the film (switching language, Prepare, Regenerate) must REPLACE the
+        // current entry, never push a new one. Submitting these forms normally pushes,
+        // so watching a film three times left three entries and X had to be pressed
+        // three times to get back to the grid. This is the exact bug §13.1 warns
+        // about: "if close ever replays, it pushed where it must replace".
+        const lang = document.querySelector('.feed-lang');
+        if (lang) {
+          lang.addEventListener('submit', (event) => {
+            event.preventDefault();
+            const code = event.submitter && event.submitter.value;
+            if (code) { location.replace(`${lang.getAttribute('action')}?lang=${code}`); }
+          });
+        }
+        for (const form of document.querySelectorAll('form[action$="/prepare"]')) {
+          form.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            await fetch(form.getAttribute('action'), {
+              method: 'POST',
+              body: new FormData(form),
+              redirect: 'manual',
+            }).catch(() => {});
+            const code = (new FormData(form)).get('lang') || '';
+            location.replace(`${location.pathname}?lang=${code}`);
+          });
+        }
+      })();
+    </script>
+  </body>
+</html>

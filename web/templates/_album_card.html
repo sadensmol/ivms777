@@ -19,5 +19,40 @@
   <div class="album-info">
     <h2>{{ album.title }}</h2>
     <p class="album-desc">{{ album.description }}</p>
+    {% if play_url %}
+      {# The feed is a LEAF under this grid (§13.1): a plain <a>, never boosted, so
+         history stays [grid, leaf] and close can restore the grid from bfcache. #}
+      <a class="album-play" href="{{ play_url }}">▶ Play</a>
+      {# Retell THIS memory — a new description and a better ORDER for its photographs
+         (§11). It belongs here, on the memory, not on the film screen: it changes the
+         memory, and every film made of it follows. #}
+      <form class="album-retell" method="post" action="/feed/{{ album.key }}/rebuild">
+        <button type="submit" {{ 'disabled' if retelling else '' }}
+                title="Rebuild this memory: a new description and a better order for
+its photos. Its film must then be prepared again.">
+          {{ '↻ Retelling…' if retelling else '↻ Rebuild' }}
+        </button>
+      </form>
+    {% endif %}
+    {% if notes %}
+      {# What the VIEWER said about this memory, typed while watching (§11.3). Shown
+         here as well as in the player because it is the one thing on a memory that
+         came from the person rather than from the pipeline — leaving it only inside
+         the film would mean it can only be found by playing the film again. Each
+         timestamp deep-links into the film at that second. #}
+      {# Folded away by default: these steer the next FILM, so they matter when you
+         are working on the video and are noise the rest of the time. #}
+      <details class="album-notes">
+        <summary>{{ notes|length }} note{{ '' if notes|length == 1 else 's' }} for the film</summary>
+        <ul>
+          {% for note in notes %}
+            <li>
+              <a href="{{ play_url }}#t={{ note.at_seconds }}">{{ note.stamp }}</a>
+              <span>{{ note.text }}</span>
+            </li>
+          {% endfor %}
+        </ul>
+      </details>
+    {% endif %}
   </div>
 </section>

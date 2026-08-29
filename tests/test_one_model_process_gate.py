@@ -39,7 +39,8 @@ _FORBIDDEN_TOP_MODULES = {"torch", "transformers", "bitsandbytes"}
 
 def _thin_client_files() -> list[Path]:
     files = [REPO_ROOT / "config.py"]
-    for d in ("chat", "search", "ingest", "web", "albums", "storage", "db", "embedding", "inference"):
+    for d in ("chat", "search", "ingest", "web", "albums", "storage", "db", "embedding",
+              "inference", "feed"):
         files += sorted((REPO_ROOT / d).rglob("*.py"))
     return [p for p in files if p not in _EXEMPT_FILES and "__pycache__" not in p.parts]
 

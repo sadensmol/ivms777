@@ -21,9 +21,11 @@ FROM nvidia/cuda:13.2.0-runtime-ubuntu24.04
 # python3.12: Ubuntu 24.04 base ships it. libheif1: HEIC (pillow-heif).
 # libjpeg-turbo8/zlib1g: Pillow runtime. libsndfile1: transformers 5.x dlopen()s
 # libsndfile even for vision-only SigLIP. libgomp1: llama.cpp OpenMP. curl: health.
+# espeak-ng: kokoro's G2P shells out to it for the feed narration (§11.1).
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3.12 python3.12-venv \
-      libheif1 libjpeg-turbo8 zlib1g libsndfile1 libgomp1 ca-certificates curl \
+      libheif1 libjpeg-turbo8 zlib1g libsndfile1 libgomp1 espeak-ng \
+      ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
@@ -56,6 +58,11 @@ COPY captioning ./captioning
 COPY inference ./inference
 COPY models/__init__.py models/catalog.py models/slots.py ./models/
 COPY search/__init__.py search/signals.py ./search/
+#   audio/             — the feed's TTS + music children (§11.1), torch-owning
+#   storage/wav.py     — WAV encode/measure; numpy + stdlib, the one module `audio`
+#                        and `feed` share across the one-model-process line (§5.1)
+COPY audio ./audio
+COPY storage/__init__.py storage/wav.py ./storage/
 
 # Drop CUDA forward-compat libs. The nvidia/cuda base ships /usr/local/cuda/compat_orin;
 # on Jetson forward-compat is never used (container CUDA 13.2 == host driver, torch cu132

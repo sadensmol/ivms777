@@ -24,8 +24,12 @@ class TextBackend:
         *,
         text_worker=None,
         model_name: Callable[[], str] | None = None,
+        context_default: int | None = None,
     ) -> None:
         self._client = client
+        # The configured `-c`, used only when the server cannot be asked. See
+        # `text_context`.
+        self._context_default = context_default
         # A PROVIDER of the text embedder's `TorchWorker` (plan 20), or None on cloud
         # (real /embeddings backend). A provider, not the worker itself: switching the
         # `text_embed` slot builds a new child (design §4.1).
@@ -52,6 +56,18 @@ class TextBackend:
 
     def text_stream(self, model: str, messages: list[dict]) -> Iterator[str]:
         yield from self._client.stream(model, messages)
+
+    def text_context(self) -> int | None:
+        """Tokens the text server accepts, ASKED OF THE SERVER (§5.1, §11.1).
+
+        The running server is the authority, not the setting: a `-c` change only takes
+        effect on a restart, so the two disagree precisely when a prompt is about to be
+        rejected. The configured value is the fallback for a backend with no `/props`
+        (vLLM) or one that is not up yet.
+        """
+        probe = getattr(self._client, "context_window", None)
+        served = probe() if probe is not None else None
+        return served or self._context_default
 
     def text_embed(self, model: str, texts: list[str]) -> list[list[float]]:
         # nomic runs in a killable child (plan 20, §8.1) so evicting it really

@@ -24,11 +24,14 @@ class AppContext:
         db_path: Path,
         derived: LocalStorage,
         originals: LocalStorage,
+        audio: LocalStorage,
     ) -> None:
         self.settings = settings
         self._db_path = db_path
         self.derived = derived
         self.originals = originals
+        # Generated feed audio (§11.1) — derived, like thumbs, and content-addressed.
+        self.audio = audio
         self._local = threading.local()
 
     @property
@@ -56,6 +59,7 @@ def build_context(settings: Settings) -> AppContext:
         db_path=settings.db_path,
         derived=LocalStorage(settings.thumb_dir),
         originals=LocalStorage(settings.originals_dir),
+        audio=LocalStorage(settings.audio_dir),
     )
 
 

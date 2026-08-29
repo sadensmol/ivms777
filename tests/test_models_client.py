@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 from inference.models_client import ModelsClient
 from modelsvc.app import create_models_app
-from modelsvc.backends.fake import FakeBackend
+from modelsvc.backends.fake import FAKE_CONTEXT, FakeBackend
 
 
 def _client() -> ModelsClient:
@@ -118,3 +118,54 @@ def test_resources_round_trips_models_only_never_machine_metrics():
 def test_text_stream_yields_tokens_in_order():
     tokens = list(_client().text_stream("m", [{"role": "user", "content": "hi"}]))
     assert tokens == ["Hello", " from", " the fake backend."]
+
+
+def test_speak_round_trips_raw_wav_bytes():
+    result = _client().speak("Beach day.")
+    assert isinstance(result["audio"], bytes)
+    assert result["audio"][:4] == b"RIFF"
+    assert result["sample_rate"] == 24000
+
+
+def test_music_round_trips_raw_wav_bytes():
+    result = _client().music("warm guitar", seconds=2.0)
+    assert result["audio"][:4] == b"RIFF"
+    assert result["sample_rate"] == 44100
+
+
+def test_speak_503s_when_no_voice_covers_the_language():
+    # The catalog has no `off` voice any more (CLAUDE.md § "No off / none options"), so
+    # the only 503 left on this route is "nothing offered speaks this language" (§4.1).
+    backend = FakeBackend()
+    transport = TestClient(create_models_app(backend))._transport
+    client = ModelsClient("http://modelsvc", transport=transport)
+    with pytest.raises(httpx.HTTPStatusError) as excinfo:
+        client.speak("hi", "ja")
+    assert excinfo.value.response.status_code == 503
+
+
+def test_speak_reports_the_models_own_message_on_a_failure():
+    # Narration is mandatory (§11.1) and its failure is shown to the user, so the
+    # reason must survive the hop. Losing it is what made a Silero refusal read as
+    # "the models service refused to speak ru" with no way to tell why.
+    class Refusing(FakeBackend):
+        def speak(self, text, language="en", voice=None, segments=None, voices=None):
+            raise RuntimeError("Model couldn't generate your text")
+
+    transport = TestClient(create_models_app(Refusing()))._transport
+    client = ModelsClient("http://modelsvc", transport=transport)
+    with pytest.raises(httpx.HTTPStatusError) as excinfo:
+        client.speak("hi")
+    assert excinfo.value.response.status_code == 500
+    assert excinfo.value.response.json()["detail"] == "Model couldn't generate your text"
+
+
+def test_text_context_round_trips():
+    assert _client().text_context() == FAKE_CONTEXT
+
+
+def test_music_sends_the_whole_score():
+    result = _client().music(sections=[{"brief": "piano", "seconds": 3},
+                                       {"brief": "drums", "seconds": 3}])
+    assert len(result["segments"]) == 2
+    assert isinstance(result["audio"], bytes)

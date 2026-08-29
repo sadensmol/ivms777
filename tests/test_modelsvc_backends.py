@@ -10,6 +10,7 @@ from config import Settings
 from modelsvc.backends import build_backend
 from modelsvc.backends.composite import CompositeBackend
 from modelsvc.backends.fake import FakeBackend
+from modelsvc.backends.text_backend import TextBackend
 from modelsvc.governor import MemoryGovernor
 from modelsvc.registry import ModelRegistry, ModelSpec
 from modelsvc.scheduler import Scheduler
@@ -64,8 +65,11 @@ def test_build_backend_wires_conveyor_on_jetson(tmp_path):
     backend = build_backend(Settings(data_dir=tmp_path, profile="jetson"))
     assert isinstance(backend._scheduler, Scheduler)
     assert backend._scheduler.slots == 1  # jetson serializes the GPU
-    # The four slot units are registered as managed models (design §4.1).
-    assert set(backend._registry._specs) == {"image_embed", "text_embed", "llm", "llm_vision"}
+    # One managed unit per slot (design §4.1). There is no "off" model any more, so
+    # every slot has one.
+    assert set(backend._registry._specs) == {
+        "image_embed", "text_embed", "llm", "llm_vision", "voice", "music",
+    }
     assert backend._text_embed_needs == ("text_embed",)
 
 
@@ -248,3 +252,154 @@ def test_resources_reports_registry_resident_when_wired():
 def test_resources_falls_back_to_placeholder_without_registry():
     backend = CompositeBackend(embed=_StubEmbed())
     assert backend.resources()["resident"] == ["image_embed"]
+
+
+class _RecordingScheduler:
+    """Records what each op asked the conveyor for (needed units, priority)."""
+
+    def __init__(self) -> None:
+        self.seen: list[tuple[tuple[str, ...], object]] = []
+
+    def run(self, needed, priority, fn):
+        self.seen.append((tuple(needed), priority))
+        return fn()
+
+    def reap_idle(self, units):
+        pass
+
+
+class _Voice:
+    def speak(self, text, voice, segments=None, voices=None):
+        return {"audio": b"RIFF", "sample_rate": 24000, "model": "v"}
+
+
+class _Music:
+    def __init__(self):
+        self.calls = []
+
+    def music(self, prompt, seconds, seed, sections=None, temperature=None, guidance=None):
+        self.calls.append({"prompt": prompt, "seconds": seconds, "sections": sections,
+                           "temperature": temperature, "guidance": guidance})
+        return {"audio": b"RIFF", "sample_rate": 44100, "model": "m", "segments": []}
+
+
+def test_composite_runs_speak_on_the_voice_unit_at_batch_priority():
+    from modelsvc.scheduler import Priority
+
+    scheduler = _RecordingScheduler()
+    backend = CompositeBackend(embed=None, voice=_Voice(), scheduler=scheduler)
+    assert backend.speak("hi")["sample_rate"] == 24000
+    assert scheduler.seen == [(("voice",), Priority.BATCH)]
+
+
+def test_composite_runs_music_on_the_music_unit_at_batch_priority():
+    from modelsvc.scheduler import Priority
+
+    scheduler = _RecordingScheduler()
+    backend = CompositeBackend(embed=None, music=_Music(), scheduler=scheduler)
+    assert backend.music("warm guitar", 10.0)["sample_rate"] == 44100
+    assert scheduler.seen == [(("music",), Priority.BATCH)]
+
+
+def test_composite_raises_slot_off_when_no_voice_is_wired():
+    from modelsvc.backends.base import SlotOff
+
+    with pytest.raises(SlotOff):
+        CompositeBackend(embed=None).speak("hi")
+
+
+def test_composite_raises_slot_off_when_the_unit_is_unregistered():
+    # A slot switched to `off` unregisters its residency unit (§4.1); asking the
+    # scheduler for it would KeyError deep in the governor, so the composite must
+    # check first and answer with the honest reason.
+    class _Slots:
+        def has_unit(self, unit):
+            return False
+
+    from modelsvc.backends.base import SlotOff
+
+    backend = CompositeBackend(embed=None, music=_Music(), slots=_Slots())
+    with pytest.raises(SlotOff):
+        backend.music("x", 5.0)
+
+
+class _Slots:
+    """Just the two members CompositeBackend asks a SlotManager for."""
+
+    def __init__(self, languages):
+        self._languages = languages
+
+    def has_unit(self, unit):
+        return True
+
+    def entry(self, slot):
+        from models import catalog
+
+        return catalog.get("voice", "kokoro-82m") if self._languages == ("en",) \
+            else catalog.get("voice", "silero-v4-ru")
+
+
+class _RoutingSlots:
+    """A SlotManager stub that records which language it was asked to prepare for."""
+
+    def __init__(self, can: bool = True):
+        self.can = can
+        self.asked: list[str] = []
+
+    def has_unit(self, unit):
+        return True
+
+    def ensure_voice_for(self, language):
+        self.asked.append(language)
+        return self.can
+
+
+def test_composite_asks_the_manager_to_route_the_voice_by_language():
+    slots = _RoutingSlots()
+    backend = CompositeBackend(embed=None, voice=_Voice(), slots=slots,
+                               scheduler=_RecordingScheduler())
+    assert backend.speak("привет", "ru")["sample_rate"] == 24000
+    assert slots.asked == ["ru"]
+
+
+def test_composite_refuses_only_when_no_voice_covers_the_language():
+    from modelsvc.backends.base import SlotOff
+
+    backend = CompositeBackend(embed=None, voice=_Voice(), slots=_RoutingSlots(can=False),
+                               scheduler=_RecordingScheduler())
+    with pytest.raises(SlotOff):
+        backend.speak("hello", "en")
+
+
+# --- the served context (§5.1, §11.1) ----------------------------------------------
+
+
+class _ContextClient:
+    def __init__(self, served):
+        self._served = served
+
+    def context_window(self):
+        return self._served
+
+
+def test_text_context_prefers_the_running_server():
+    # The setting only takes effect on a restart, so the server is the authority.
+    backend = TextBackend(_ContextClient(32768), context_default=4096)
+    assert backend.text_context() == 32768
+
+
+def test_text_context_falls_back_to_the_configured_value():
+    backend = TextBackend(_ContextClient(None), context_default=4096)
+    assert backend.text_context() == 4096
+
+
+def test_text_context_is_none_when_nobody_can_say():
+    assert TextBackend(object()).text_context() is None
+
+
+def test_composite_passes_the_whole_score_to_the_music_backend():
+    music = _Music()
+    backend = CompositeBackend(embed=None, music=music)
+    backend.music(sections=[{"brief": "piano", "seconds": 4}], temperature=1.2, guidance=4.0)
+    assert music.calls[0]["sections"] == [{"brief": "piano", "seconds": 4}]
+    assert music.calls[0]["temperature"] == 1.2 and music.calls[0]["guidance"] == 4.0

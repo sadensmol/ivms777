@@ -24,7 +24,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-SLOTS: tuple[str, ...] = ("image_embed", "text_embed", "caption", "planner")
+SLOTS: tuple[str, ...] = (
+    "image_embed", "text_embed", "caption", "planner", "voice", "music",
+)
 
 # Which ingest stages a slot switch invalidates, inclusive (design §4.1). `None`
 # means the slot stores nothing, so switching it re-runs nothing.
@@ -33,6 +35,11 @@ INVALIDATES: dict[str, tuple[str, str] | None] = {
     "text_embed": ("caption_embed", "caption_embed"),
     "caption": ("caption", "caption_embed"),
     "planner": None,
+    # The feed's models store nothing in the ingest pipeline (§11.1), so switching
+    # either re-runs no stage. A prepared presentation is invalidated by the MEMORY
+    # changing (§6's cascade), never by the voice changing — a switch is free.
+    "voice": None,
+    "music": None,
 }
 
 
@@ -70,11 +77,46 @@ class GgufSource:
 
 
 @dataclass(frozen=True)
+class UrlSource:
+    """A single file fetched over plain HTTP into `data_dir/models`.
+
+    For weights that are NOT on the Hub at all. Silero publishes its TTS as one
+    `torch.package` archive on its own host — there is no `silero/*` HF repo — so an
+    `HfSource` would make the downloader probe a repo that does not exist and report
+    the model as permanently absent. The GGUF path already streams files this way, so
+    `Downloads` reuses that fetcher.
+    """
+
+    url: str
+    file: str
+
+
+@dataclass(frozen=True)
+class Speaker:
+    """One voice a `voice` model can read in, with what it SOUNDS like.
+
+    This is metadata about the model, so it belongs beside the model — not hardcoded in
+    whatever happens to pick a narrator. `feed/voice.py` reads it, the story pass is
+    shown it and casts from it, and code validates the choice against this list: a name
+    that is not here would make the voice model raise, and narration is mandatory
+    (§11.1), so a bad cast would fail the whole film.
+
+    Every name here has been verified to load and produce audio (CLAUDE.md § "Verify a
+    model RUNS").
+    """
+
+    name: str        # exactly what `POST /speak` takes
+    gender: str      # "female" | "male"
+    register: str    # "bright" | "warm" | "neutral" | "deep"
+    note: str        # what it sounds like, for whoever is casting
+
+
+@dataclass(frozen=True)
 class ModelEntry:
     key: str
     slot: str
     display: str
-    source: HfSource | GgufSource
+    source: HfSource | GgufSource | UrlSource
     size_mb: int  # download size, for the popup
     cost_mb: int  # resident cost (jetson), for the governor
     cost_measured: bool
@@ -82,6 +124,12 @@ class ModelEntry:
     dim: int | None = None  # embedder slots
     preprocess: Preprocess | None = None  # image_embed only
     prompt_template: str | None = None  # caption/planner only
+    # Which languages a VOICE entry can speak (design §4.1, §11.1). Empty for every
+    # other slot. `POST /speak` 503s when the film's language is not in here: a voice
+    # reading Russian text through an English frontend is worse than silence.
+    languages: tuple[str, ...] = ()
+    # The voices this entry can read in (§11.1). Empty for every other slot.
+    speakers: tuple[Speaker, ...] = ()
     note: str | None = None
 
 
@@ -290,6 +338,97 @@ CATALOG: tuple[ModelEntry, ...] = (
         prompt_template="qwen2.5:3b",
         note="Served by vLLM; the cloud profile does not switch models from the UI.",
     ),
+    # --- voice (feed narration, design §11.1) --------------------------------
+    ModelEntry(
+        key="kokoro-82m",
+        slot="voice",
+        display="Kokoro 82M",
+        source=HfSource("hexgrad/Kokoro-82M"),
+        size_mb=330,
+        cost_mb=1200,
+        cost_measured=False,
+        profiles=_ALL,
+        languages=("en",),
+        speakers=(
+            Speaker("af_heart", "female", "warm",
+                    "warm, close, unhurried — the default for an ordinary day"),
+            Speaker("af_bella", "female", "bright",
+                    "bright and lively, smiling; good for celebrations"),
+            Speaker("af_sky", "female", "bright", "light and young"),
+            Speaker("af_nicole", "female", "neutral", "soft and even, almost whispered"),
+            Speaker("af_sarah", "female", "neutral", "plain and steady, unshowy"),
+            Speaker("bf_emma", "female", "warm", "British, warm and measured"),
+            Speaker("am_adam", "male", "neutral", "plain and steady"),
+            Speaker("am_puck", "male", "bright", "playful and quick"),
+            Speaker("am_michael", "male", "deep",
+                    "low and grave; the darkest voice here"),
+            Speaker("bm_george", "male", "deep", "British, low and dry"),
+        ),
+        note="The default. 82M params, Apache-2.0, 24 kHz mono, 54 voices. Reads a "
+        "memory's title, description and captions over the feed. Needs the "
+        "`espeak-ng` system package — its G2P shells out to it.",
+    ),
+    ModelEntry(
+        key="silero-v4-ru",
+        slot="voice",
+        display="Silero v4 · Russian",
+        source=UrlSource("https://models.silero.ai/models/tts/ru/v4_ru.pt", "v4_ru.pt"),
+        size_mb=60,
+        cost_mb=700,
+        cost_measured=False,
+        profiles=_ALL,
+        languages=("ru",),
+        speakers=(
+            Speaker("xenia", "female", "warm", "warm and calm; the everyday choice"),
+            Speaker("kseniya", "female", "bright", "brighter and livelier"),
+            Speaker("baya", "female", "neutral", "even and unhurried"),
+            Speaker("eugene", "male", "neutral", "plain male, mid register"),
+            Speaker("aidar", "male", "deep",
+                    "low and rough; the darkest Russian voice here"),
+        ),
+        note="Russian narration. Kokoro speaks nine languages but NOT Russian, so this "
+        "is a second voice rather than a bigger one. One torch.package archive, pure "
+        "torch — no espeak, no uroman — and tiny. NOT on Hugging Face: it is fetched "
+        "straight from models.silero.ai. Licence is CC-BY-NC (Silero's MIT covers only "
+        "their base cis-tts models): fine for a personal library, not for shipping.",
+    ),
+    # --- music (feed soundtrack, design §11.1) -------------------------------
+    ModelEntry(
+        key="musicgen-small",
+        slot="music",
+        display="MusicGen small",
+        source=HfSource("facebook/musicgen-small"),
+        size_mb=2200,
+        cost_mb=2600,
+        cost_measured=False,
+        profiles=_ALL,
+        note="300M params, 32 kHz mono, generated autoregressively so any length is "
+        "possible (capped at 30 s for cost). Weights are CC-BY-NC 4.0 — personal use "
+        "only, not a commercial build; the code is MIT. Chosen over Stable Audio Open, "
+        "which is a better model on paper but whose SDE sampler drives torchsde into "
+        "non-terminating recursion on this torch/Python stack. Its cost is an ESTIMATE "
+        "— measure it on the board and pin it with IVMS777_MODEL_COST_MB.",
+    ),
+    ModelEntry(
+        key="musicgen-medium",
+        slot="music",
+        display="MusicGen medium",
+        source=HfSource("facebook/musicgen-medium"),
+        size_mb=7670,
+        cost_mb=8200,
+        cost_measured=False,
+        profiles=("mac",),
+        note="1.5B params, 32 kHz mono, the mac default since the score became 2-4 "
+        "generated sections rather than one looped clip (§11.1). It is not slower: "
+        "MEASURED on an M-series mac it generates at 4.75x realtime (14.9 s of audio "
+        "in 71 s) against musicgen-small's 4.90x — autoregressive decode at this size "
+        "is bound by memory bandwidth, not by parameter count, so the bigger model is "
+        "very nearly free per second of music. What it costs is RESIDENT SIZE (fp32 "
+        "weights are a 7.6 GB download) and a slower first load, which is why jetson "
+        "and cloud stay on small — the 8 GB board has no room for it at all. Weights "
+        "are CC-BY-NC 4.0, personal use only; the code is MIT. Its resident cost is an "
+        "ESTIMATE — measure it and pin it with IVMS777_MODEL_COST_MB.",
+    ),
 )
 
 # Per-profile defaults. These reproduce `config.PROFILE_DEFAULTS` exactly: an
@@ -300,18 +439,25 @@ DEFAULTS: dict[str, dict[str, str]] = {
         "text_embed": "nomic-1.5",
         "caption": "gemma4-E2B",
         "planner": "gemma4-E2B",
+        "voice": "kokoro-82m",
+        # mac has the memory and pays no time for it — see the entry's measured note.
+        "music": "musicgen-medium",
     },
     "jetson": {
         "image_embed": "siglip2-so400m-384",
         "text_embed": "nomic-1.5",
         "caption": "gemma4-E2B",
         "planner": "gemma4-E2B",
+        "voice": "kokoro-82m",
+        "music": "musicgen-small",
     },
     "cloud": {
         "image_embed": "siglip2-so400m-384",
         "text_embed": "nomic-1.5",
         "caption": "qwen2.5vl-7b",
         "planner": "qwen2.5-3b",
+        "voice": "kokoro-82m",
+        "music": "musicgen-small",
     },
 }
 
@@ -336,10 +482,16 @@ def default_key(slot: str, profile: str) -> str:
     return DEFAULTS[profile][slot]
 
 
+# `voice` is never offered to the user. Which voice narrates a film follows from the
+# film's LANGUAGE and the memory's mood (§11.1) — nobody should have to know that
+# Kokoro cannot speak Russian in order to get Russian narration.
+AUTOMATIC_SLOTS: frozenset[str] = frozenset({"voice"})
+
+
 def is_switchable(slot: str, profile: str) -> bool:
     """`cloud` serves one model per container (vLLM), so its slots are config-only
-    (design §4.1). Everywhere else every slot is switchable from the UI."""
-    return profile != "cloud"
+    (design §4.1); `voice` is automatic everywhere. Every other slot is switchable."""
+    return profile != "cloud" and slot not in AUTOMATIC_SLOTS
 
 
 def has(slot: str, key: str) -> bool:

@@ -11,6 +11,15 @@ from collections.abc import Iterator
 from typing import Protocol
 
 
+class SlotOff(RuntimeError):
+    """The requested slot holds the catalog's `off` entry (design §4.1).
+
+    A distinct exception, not `NotImplementedError`: "the user turned this off" is a
+    normal, expected answer that the HTTP layer turns into a 503 and the feed builder
+    turns into a skipped artifact (§11.1). A wiring bug must not look the same.
+    """
+
+
 class ModelBackend(Protocol):
     def embed_image(self, images: list[bytes]) -> list[list[float]]:
         """SigLIP image embeddings (ingest `embed`, "similar")."""
@@ -51,6 +60,37 @@ class ModelBackend(Protocol):
         """
         ...
 
+    def speak(self, text: str, language: str = "en", voice: str | None = None,
+              segments: list[str] | None = None,
+              voices: list[str | None] | None = None) -> dict:
+        """One narration clip for a memory film (design §11.1).
+
+        Returns `{audio: bytes (WAV), sample_rate: int, model: str}`. Raises `SlotOff`
+        when the `voice` slot holds `off`, or when the selected voice does not list
+        `language` in its catalog `languages` (§4.1) — the film is then prepared
+        without speech rather than narrated in the wrong language.
+        """
+        ...
+
+    def music(
+        self, prompt: str = "", seconds: float = 30.0, seed: int | None = None,
+        sections: list[dict] | None = None, temperature: float | None = None,
+        guidance: float | None = None,
+    ) -> dict:
+        """The score for a memory feed (design §11.1).
+
+        `sections` is the whole score — `[{"brief", "seconds"}]`, each generated as a
+        continuation of the one before it, so it is one piece that changes rather than
+        one clip looped. A bare `prompt` is the one-section form. `segments` in the
+        reply says where each section actually landed.
+
+        `seconds` is CLAMPED by the backend to the model's ceiling (47 s for Stable
+        Audio Open 1.0); the player loops the clip to cover a longer memory. Returns
+        `{audio: bytes (WAV), sample_rate: int, model: str}`. Raises `SlotOff` when
+        the `music` slot holds `off`.
+        """
+        ...
+
     def text_complete(
         self,
         model: str,
@@ -69,6 +109,14 @@ class ModelBackend(Protocol):
 
     def text_stream(self, model: str, messages: list[dict]) -> Iterator[str]:
         """Chat answer generation, streamed one token at a time."""
+        ...
+
+    def text_context(self) -> int | None:
+        """How many tokens the text server accepts (design §5.1, §11.1).
+
+        Asked of the RUNNING server, so a caller that assembles a large prompt can cut
+        it to fit instead of having the whole call rejected. `None` when no text
+        backend can say."""
         ...
 
     def text_embed(self, model: str, texts: list[str]) -> list[list[float]]:
