@@ -101,6 +101,16 @@
     return sum / 26.0;
   }
 
+  // A beat is an ARRIVAL and a DEPARTURE, never a switch. Every effect added after the
+  // first nine multiplies its WHOLE contribution by this, so it is exactly zero at
+  // t = 0 and exactly zero once the shot's clock has run out. Without it an effect is
+  // full strength on the shot's first frame and dies on its last one — which is what a
+  // viewer sees as a jump when one beat hands over to the next.
+  float beatEnv(float t, float dur) {
+    float ramp = clamp(dur * 0.22, 0.12, 0.9);
+    return smoothstep(0.0, ramp, t) * (1.0 - smoothstep(dur - ramp, dur, t));
+  }
+
   // --- effects that move where we SAMPLE ------------------------------------------
   vec2 warp(vec2 uv, int fx, vec4 p, float t, float dur) {
     if (fx == 6) {                                    // breeze — the print hangs in air
@@ -296,16 +306,6 @@
   }
   vec2 focusPoint(int fx, vec4 p) {
     return fx == 1 ? vec2(p.x, 1.0 - p.y) : vec2(0.5);   // y is authored top-down
-  }
-
-  // A beat is an ARRIVAL and a DEPARTURE, never a switch. Every effect added after the
-  // first nine multiplies its WHOLE contribution by this, so it is exactly zero at
-  // t = 0 and exactly zero once the shot's clock has run out. Without it an effect is
-  // full strength on the shot's first frame and dies on its last one — which is what a
-  // viewer sees as a jump when one beat hands over to the next.
-  float beatEnv(float t, float dur) {
-    float ramp = clamp(dur * 0.22, 0.12, 0.9);
-    return smoothstep(0.0, ramp, t) * (1.0 - smoothstep(dur - ramp, dur, t));
   }
 
   float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }

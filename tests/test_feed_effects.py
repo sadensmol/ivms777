@@ -198,3 +198,40 @@ def test_the_shortlist_is_smaller_than_the_whole_library():
     for energy in ("high", "calm", "low"):
         assert len(effects.reachable(energy)) < len(effects.SHOT_EFFECTS)
         assert effects.reachable(energy), energy
+
+
+def _frag() -> str:
+    src = _shader()
+    at = src.index("const FRAG = `")
+    start = src.index("`", at)
+    return src[start + 1:src.index("`", start + 1)]
+
+
+def test_no_glsl_function_is_called_before_it_is_declared():
+    """GLSL has no forward declarations: a call above the definition fails the WHOLE
+    compile, the canvas stays black, and the audio plays on regardless — which is not a
+    symptom anyone reads as "the shader did not build". It has happened once, when
+    `beatEnv` was declared beside the colour effects and called from `warp`.
+    """
+    body = _frag()
+    lines = body.splitlines()
+    declared: dict[str, int] = {}
+    signature = re.compile(r"^\s{0,2}(?:float|vec2|vec3|vec4|int|bool)\s+(\w+)\s*\(")
+    for number, line in enumerate(lines):
+        found = signature.match(line)
+        if found:
+            declared.setdefault(found.group(1), number)
+    called: dict[str, int] = {}
+    call = re.compile(r"\b(\w+)\s*\(")
+    for number, line in enumerate(lines):
+        if signature.match(line):
+            continue                      # the declaration itself is not a call
+        for name in call.findall(line):
+            if name in declared:
+                called.setdefault(name, number)
+    early = {name: (called[name], declared[name])
+             for name in called if called[name] < declared[name]}
+    assert not early, (
+        "called before it is declared (the shader will not compile): "
+        + ", ".join(f"{n} used at line {c}, declared at {d}"
+                    for n, (c, d) in early.items()))
