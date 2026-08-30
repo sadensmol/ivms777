@@ -781,3 +781,59 @@ def test_without_a_previous_cut_nothing_is_gated():
 
     notes = [Note(id=1, group_id=1, at_seconds=0.0, text="[x] a", created_at="now")]
     assert _bracketed_passages(notes, film_seconds=0.0, passages=3) is None
+
+
+# --- the long stage reports its own progress (§11.1) ---------------------------------
+
+
+def test_the_music_stage_moves_while_it_waits():
+    # A number that does not move for five minutes is indistinguishable from a hang.
+    import time
+
+    from feed.build import _Ticking
+
+    seen = []
+    with _Ticking(lambda stage, fraction: seen.append((stage, fraction)),
+                  "composing the music", (0.92, 0.97), expect=4.0):
+        time.sleep(2.2)
+    assert len(seen) >= 2, "the bar never ticked"
+    fractions = [f for _, f in seen]
+    assert fractions == sorted(fractions), "the bar went backwards"
+    assert all(0.92 <= f < 0.97 for f in fractions), fractions
+    assert all("composing the music" in stage for stage, _ in seen)
+
+
+def test_the_music_stage_counts_down_and_never_reaches_the_next_one():
+    import time
+
+    from feed.build import _Ticking
+
+    seen = []
+    # An estimate that has already run out: it must hold, not overshoot.
+    with _Ticking(lambda stage, fraction: seen.append((stage, fraction)),
+                  "composing the music", (0.92, 0.97), expect=0.5):
+        time.sleep(1.4)
+    assert seen
+    assert max(f for _, f in seen) < 0.97
+    assert any("nearly there" in stage for stage, _ in seen)
+
+
+def test_a_failing_progress_callback_never_breaks_the_film():
+    import time
+
+    from feed.build import _Ticking
+
+    def explode(stage, fraction):
+        raise RuntimeError("the page went away")
+
+    with _Ticking(explode, "composing the music", (0.92, 0.97), expect=2.0):
+        time.sleep(1.2)      # the thread dies quietly; the build carries on
+
+
+def test_no_progress_callback_at_all_is_fine():
+    import time
+
+    from feed.build import _Ticking
+
+    with _Ticking(None, "composing the music", (0.92, 0.97), expect=2.0):
+        time.sleep(0.1)

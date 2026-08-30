@@ -16,6 +16,8 @@ or a refusal) and still leave a watchable, silent film.
 import hashlib
 import logging
 import sqlite3
+import threading
+import time
 
 import httpx
 
@@ -68,6 +70,70 @@ _STAGES: tuple[tuple[str, float], ...] = (
     ("matching effects to the music", 0.97),
     ("saving the film", 1.00),
 )
+
+
+# Seconds of compute per second of audio, MEASURED on this mac (musicgen at 4.75-4.90x
+# realtime, both small and medium). It is only ever used to say how long is left, never
+# to decide anything, so a board that runs at a different rate gets a wrong estimate and
+# a correct film.
+MUSIC_RATE = 4.8
+
+
+class _Ticking:
+    """A stage that reports its own progress while it waits on ONE long call.
+
+    Composing the score is minutes of work behind a single blocking request, so the bar
+    parked at 92% for the whole of it — and a number that does not move is
+    indistinguishable from a hung process, which is exactly what CLAUDE.md forbids and
+    exactly what happened: the score took five minutes and looked broken for four of
+    them.
+
+    The share is an ESTIMATE from the measured rate, and it says so: the label counts
+    down in minutes rather than pretending to know. It never goes backwards, never
+    reaches the next stage's number, and it holds at the ceiling if the estimate runs
+    out before the call returns — a slow board shows "nearly there", not 100%.
+    """
+
+    def __init__(self, progress, stage: str, span: tuple[float, float], expect: float):
+        self._progress = progress
+        self._stage = stage
+        self._low, self._high = span
+        self._expect = max(expect, 1.0)
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self):
+        if self._progress is None:
+            return self
+        started = time.monotonic()
+
+        def tick() -> None:
+            while not self._stop.wait(1.0):
+                spent = time.monotonic() - started
+                share = min(spent / self._expect, 1.0)
+                left = self._expect - spent
+                if left > 45:
+                    label = f"{self._stage} — about {round(left / 60) or 1} min left"
+                elif left > 5:
+                    label = f"{self._stage} — about {int(left)}s left"
+                else:
+                    label = f"{self._stage} — nearly there"
+                # Stops just short of the next stage: only the work finishing may
+                # advance past this.
+                fraction = self._low + (self._high - self._low) * 0.97 * share
+                try:
+                    self._progress(label, fraction)
+                except Exception:  # noqa: BLE001 - a bar must never fail a film
+                    return
+
+        self._thread = threading.Thread(target=tick, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
 
 
 class Cancelled(RuntimeError):
@@ -269,13 +335,20 @@ def build_presentation(
                      for s in sections],
     }
     logger.info("score: %s", decisions["score"])
-    music = _optional(
-        client.music, sections=[{"brief": s.brief, "seconds": s.seconds}
-                                for s in sections],
-        # The SAME memory scores the same way twice, and a different memory never gets
-        # this one's music: the seed is the film's own identity (§11.1).
-        seed=_seed(group_id, language, signature), **SAMPLING[energy],
-    )
+    # The one call that takes minutes. It reports its own progress while it runs, from
+    # the seconds of audio it is about to generate and the measured rate.
+    wanted = sum(section.seconds for section in sections)
+    with _Ticking(progress, "composing the music",
+                  (stages["composing the music"],
+                   stages["matching effects to the music"]),
+                  wanted * MUSIC_RATE):
+        music = _optional(
+            client.music, sections=[{"brief": s.brief, "seconds": s.seconds}
+                                    for s in sections],
+            # The SAME memory scores the same way twice, and a different memory never
+            # gets this one's music: the seed is the film's own identity (§11.1).
+            seed=_seed(group_id, language, signature), **SAMPLING[energy],
+        )
     music_key = _store_audio(audio, music["audio"]) if music is not None else None
     if music is None:
         notes.append("no music — the models service refused to compose")

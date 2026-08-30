@@ -35,7 +35,12 @@ LLAMA_MODELS ?= $(LLAMA_HOME)/models
 LLAMA_GGUF   ?= gemma-4-E2B-it-Q4_K_M.gguf
 LLAMA_MMPROJ ?= mmproj-F16.gguf
 LLAMA_REPO   ?= unsloth/gemma-4-E2B-it-GGUF
-LLAMA_PORT   ?= 8080
+# NOT 8080, and the models service is NOT on 9000. Both are among the most contended
+# ports on a developer's machine — on this one an OrbStack container publishes 8080 and
+# a SigNoz ClickHouse publishes 9000, so `make up` failed to bind llama-server and, more
+# quietly, the models service died on startup and the whole stack looked broken. Two
+# ports nobody else wants cost nothing and save an afternoon.
+LLAMA_PORT   ?= 8088
 # KV context (`-c`) for the host server, and the value `app`/`worker` are told the
 # server has (IVMS777_LLM_CTX → `settings.llm_ctx`, which the story pass budgets its
 # prompt against). 4096 was too small for a real film: a 40-shot memory's story prompt
@@ -55,6 +60,9 @@ JETSON_COMPOSE       := -f compose.yaml -f compose.jetson.yaml
 JETSON_CAPTION_MODEL ?= gemma4-E2B
 JETSON_PLANNER_MODEL ?= gemma4-E2B
 
+# The models service's port, for the same reason.
+MODELS_PORT  ?= 9100
+
 .DEFAULT_GOAL := help
 .PHONY: up models set-maxn-jetson run-jetson stop-jetson clean-jetson test lint llama-mac llama-stop llama-rebuild clean help
 
@@ -71,17 +79,26 @@ models: ## Pre-fetch the SELECTED slots' weights into the shared cache (idempote
 
 up: llama-mac models ## Ensure host llama-server + weights, then run models + worker + app NATIVELY → http://localhost:8000
 	@mkdir -p "$$HOME/.ivms777"
-	@echo "  data $$HOME/.ivms777 · inference localhost:$(LLAMA_PORT) · models localhost:9000 · app http://localhost:8000 (Ctrl-C stops all)"
+	@echo "  data $$HOME/.ivms777 · inference localhost:$(LLAMA_PORT) · models localhost:$(MODELS_PORT) · app http://localhost:8000 (Ctrl-C stops all)"
 	@IVMS777_PROFILE="$${IVMS777_PROFILE:-mac}" \
 	 IVMS777_DATA_DIR="$${IVMS777_DATA_DIR:-$$HOME/.ivms777}" \
-	 IVMS777_MODELS_BASE_URL="$${IVMS777_MODELS_BASE_URL:-http://localhost:9000}" \
+	 IVMS777_MODELS_BASE_URL="$${IVMS777_MODELS_BASE_URL:-http://localhost:$(MODELS_PORT)}" \
 	 IVMS777_LLM_CTX="$${IVMS777_LLM_CTX:-$(LLAMA_CTX)}" \
 	 bash -c 'IVMS777_INFERENCE_BASE_URL="$${IVMS777_INFERENCE_BASE_URL:-http://localhost:$(LLAMA_PORT)/v1}" \
-	   uv run --no-sync uvicorn modelsvc.asgi:app_factory --factory --host 0.0.0.0 --port 9000 \
+	   uv run --no-sync uvicorn modelsvc.asgi:app_factory --factory --host 0.0.0.0 --port $(MODELS_PORT) \
 	     --reload --reload-dir modelsvc --reload-dir audio --reload-dir models \
 	     --reload-dir embedding --reload-dir captioning --reload-dir inference & M=$$!; \
 	   uv run --no-sync watchfiles "python -m ingest.cli" ingest embedding search inference albums storage db models web config.py vocab.yaml & W=$$!; \
-	   trap "kill $$M $$W 2>/dev/null" EXIT INT TERM; \
+	   ( for i in $$(seq 1 120); do \
+	       curl -sf -o /dev/null "http://localhost:8000/" && { \
+	         printf "\n  ┌────────────────────────────────────────────┐\n"; \
+	         printf   "  │  ivms777 is up — open the web page at:     │\n"; \
+	         printf   "  │  \033[1;36mhttp://localhost:8000\033[0m                     │\n"; \
+	         printf   "  └────────────────────────────────────────────┘\n\n"; \
+	         break; }; \
+	       sleep 1; \
+	     done ) & R=$$!; \
+	   trap "kill $$M $$W $$R 2>/dev/null" EXIT INT TERM; \
 	   uv run --no-sync uvicorn web.app:app_factory --factory --host 0.0.0.0 --port 8000 --reload'
 
 llama-mac: ## Build (if needed) + start the host-native llama-server (Metal) on :$(LLAMA_PORT)
@@ -94,6 +111,14 @@ llama-mac: ## Build (if needed) + start the host-native llama-server (Metal) on 
 	else \
 	  echo "  reusing cached llama-server ($(LLAMA_BIN)) — no build."; \
 	fi
+	@for PORT in $(LLAMA_PORT) $(MODELS_PORT); do \
+	  HOLDER=$$(lsof -nP -iTCP:$$PORT -sTCP:LISTEN 2>/dev/null | awk 'NR==2 {print $$1" (pid "$$2")"}'); \
+	  if [ -n "$$HOLDER" ] && ! echo "$$HOLDER" | grep -q llama-server; then \
+	    echo "  port $$PORT is already held by $$HOLDER."; \
+	    echo "  Free it, or run: make up LLAMA_PORT=<free> MODELS_PORT=<free>"; \
+	    exit 1; \
+	  fi; \
+	done
 	@mkdir -p "$(LLAMA_MODELS)"
 	@[ -s "$(LLAMA_MODELS)/$(LLAMA_GGUF)" ]   || { echo "  downloading $(LLAMA_GGUF) (~2 GB, one time)…"; curl -fL --progress-bar -o "$(LLAMA_MODELS)/$(LLAMA_GGUF)"   "https://huggingface.co/$(LLAMA_REPO)/resolve/main/$(LLAMA_GGUF)"; }
 	@[ -s "$(LLAMA_MODELS)/$(LLAMA_MMPROJ)" ] || { echo "  downloading $(LLAMA_MMPROJ)…"; curl -fL --progress-bar -o "$(LLAMA_MODELS)/$(LLAMA_MMPROJ)" "https://huggingface.co/$(LLAMA_REPO)/resolve/main/$(LLAMA_MMPROJ)"; }

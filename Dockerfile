@@ -21,9 +21,11 @@ COPY captioning ./captioning
 COPY chat ./chat
 COPY db ./db
 COPY embedding ./embedding
+COPY feed ./feed
 COPY inference ./inference
 COPY ingest ./ingest
 COPY models ./models
+COPY organize ./organize
 COPY search ./search
 COPY storage ./storage
 COPY web ./web

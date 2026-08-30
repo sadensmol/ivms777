@@ -87,6 +87,44 @@ memories* and a background agent groups the library into named, described albums
 model present first, and re-opening the tab is instant. Agentic RAG + reranking for
 chat retrieval is the next planned phase — see `docs/plans/10-chat-agentic-rerank.md`.
 
+## Play a memory — and save it as a video
+
+A memory is not only an album: it plays as a **film**, cutting the photos to a
+written narration over a composed score on a WebGL canvas (design §11.1).
+
+1. Open `/organize?by=memories` and hit **▶ Play** on a memory card — or go
+   straight to `/feed/<memory-key>`.
+2. The first play needs a **Prepare**. Three models run in turn: the planner
+   (`gemma4-E2B`) writes the story, `kokoro-82m` speaks it, and MusicGen
+   composes a score that is written to end with the film (`musicgen-medium` on a
+   Mac, `musicgen-small` on the Jetson). A named stage, a percentage, and a
+   **Cancel** show the whole way. The language buttons at the top prepare and
+   cache each language separately, so switching does not discard the other.
+3. Press **▶ Play**. The film opens paused behind its title card because
+   browsers refuse to start audio without a click — that is not a loading state.
+4. **↻ Regenerate** writes and scores it again; the story pass is sampled, so a
+   second run genuinely differs. One film is prepared at a time per process — ask
+   for another and the first is stopped, then yours starts.
+
+### Download it as a video file
+
+**↓ Download** records the film to a video file. It records *this* canvas and
+*this* audio bus — the same renderer and mix you just watched — so the file
+cannot drift from the player (design §11.2). There is no ffmpeg and no
+server-side render.
+
+- It records in **real time**: a 50-second film takes 50 seconds to write. The
+  button shows a percentage and is its own Stop. Leave the tab visible while it
+  runs.
+- Nothing is recorded until the film can play without stopping: it waits for both
+  audio tracks and every photograph to decode, says *Preparing…* while it does,
+  and treats a click during that wait as "never mind". Both waits are bounded at
+  20 s.
+- The container follows the browser — **MP4** (H.264 + AAC) on Chrome ≥ 130 and
+  Safari, **WebM** (VP9 + Opus) otherwise. A browser with no `MediaRecorder` is
+  told so on the button instead of being handed a broken file.
+- A cancelled recording produces no file.
+
 ## Run on a Jetson Orin Nano (8 GB)
 
 Fully containerised — the NVIDIA container runtime hands the Orin iGPU to

@@ -23,17 +23,24 @@ PROFILE_DEFAULTS: dict[Profile, dict[str, object]] = {
         # the CPU, which §3.1 forbids on every profile.
         #
         # One gemma4-E2B GGUF on a host-native llama-server (Metal), started by
-        # `make llama-mac` on :8080 (plan 16). The models service does NOT
+        # `make llama-mac` on :8088 (plan 16). The models service does NOT
         # supervise it — it is an EXTERNAL server the service reuses (RemoteLlm),
         # so `llm_managed` is False; spawning a second llama-server would clash on
-        # :8080. SigLIP and the caption-text embedder reach the same GPU through
-        # torch's `mps` backend.
+        # the same port. SigLIP and the caption-text embedder reach the same GPU
+        # through torch's `mps` backend.
+        #
+        # NOT :8080 and NOT :9000. Both are among the most contended ports on a
+        # developer's machine — here an OrbStack container publishes 8080 and a
+        # ClickHouse publishes 9000 — and the collision is nasty rather than loud:
+        # llama-server refuses to bind and says so, but the models service dies on
+        # startup and the app then fails every model call for no visible reason.
+        # These must stay in step with `LLAMA_PORT`/`MODELS_PORT` in the Makefile.
         "caption_model": "gemma4-E2B",
         "planner_model": "gemma4-E2B",
         "embed_device": "mps",
-        "inference_base_url": "http://localhost:8080/v1",
+        "inference_base_url": "http://localhost:8088/v1",
         "ram_budget_mb": 24000,
-        "models_base_url": "http://localhost:9000",
+        "models_base_url": "http://localhost:9100",
         "gpu_concurrency": 3,
         "llm_managed": False,
         "llm_idle_ttl_s": None,
@@ -45,6 +52,7 @@ PROFILE_DEFAULTS: dict[Profile, dict[str, object]] = {
         # tokens and llama-server rejected the call outright. `make up` starts the host
         # server with `-c $(LLAMA_CTX)` and exports the same number here.
         "llm_ctx": 32768,
+        "llm_port": 8088,
     },
     "jetson": {
         # One gemma4-E2B GGUF on a containerised sm_87 CUDA llama-server, text +
@@ -71,6 +79,7 @@ PROFILE_DEFAULTS: dict[Profile, dict[str, object]] = {
         # Smaller KV cache to shrink gemma's resident footprint on the 8 GB box
         # (~0.5 GB less than 4096) — chat turns are short (design §3.1/§8.1).
         "llm_ctx": 2048,
+        "llm_port": 8080,
     },
     "cloud": {
         # cloud is unchanged by plan 16 — still vLLM (open item).
@@ -83,6 +92,7 @@ PROFILE_DEFAULTS: dict[Profile, dict[str, object]] = {
         "gpu_concurrency": 4,
         "llm_managed": False,
         "llm_idle_ttl_s": None,
+        "llm_port": 8080,
     },
 }
 
@@ -233,7 +243,10 @@ class Settings(BaseSettings):
     # gemma (jetson: llm_managed=True). None → resolve `llama-server` from PATH. On
     # mac gemma runs as an EXTERNAL host server (make llama-mac), so this is unused.
     llm_bin: str | None = None
-    llm_port: int = 8080
+    # The port llama-server listens on. PER PROFILE, because mac must avoid the ports a
+    # developer's containers take (8080 is published by Docker/OrbStack on this machine)
+    # while jetson's is inside its own container network and free.
+    llm_port: int | None = None
     # KV-cache context length for the supervised `llama-server` (`-c`). Smaller =
     # less resident RAM; jetson uses 2048 (chat turns are short) to give the 8 GB
     # box headroom, mac/cloud 4096. Per-profile default below (env: IVMS777_LLM_CTX).

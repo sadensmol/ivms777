@@ -1629,6 +1629,15 @@ polling instead of flickering. Each stage is named
 for **what it is making** — "recording the voice", "composing the music", "matching
 effects to the music" — because that is the only thing the user can see during the run.
 
+**The long stage reports its own progress.** Composing the score is minutes of work
+behind ONE blocking call, so the bar parked at 92% for the whole of it — and a number
+that does not move is indistinguishable from a hung process, which is the failure this
+whole bar exists to prevent. It now counts down inside that stage ("composing the music
+— about 3 min left") from the seconds of audio it is about to generate and the MEASURED
+rate (~4.8 s of compute per second of audio). It is an estimate and it says so: it never
+runs backwards, never reaches the next stage's number, and holds at "nearly there" if a
+slower board outlasts the estimate.
+
 **The renderer is WebGL2, not CSS** (`web/static/feed-gl.js`). CSS can cross-fade two
 `<img>` layers and nothing more; the film needs true dissolves and dips, **zoom and
 directional blur** on fast moves, a per-memory **colour grade**, vignette and grain —
