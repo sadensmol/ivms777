@@ -373,13 +373,13 @@ img.cite { height: 40px; width: 40px; object-fit: cover; border-radius: 4px;
   .settings-dialog { width: 96vw; padding: 1rem; }
 }
 
-/* ▶ Play on a memory card — opens the fullscreen feed (design §11.1). */
-.album-play {
-  display: inline-block;
-  margin-top: 0.4rem;
-  font-size: 0.9rem;
-  text-decoration: none;
-}
+/* A memory card's films, one row per language (design §11.1): the link to the
+   fullscreen feed, then its state. */
+.album-films { list-style: none; margin: 0.4rem 0 0; padding: 0; font-size: 0.85rem; }
+.album-films li { margin-bottom: 0.2rem; line-height: 1.4; }
+.album-film { text-decoration: none; }
+.album-film:hover { text-decoration: underline; }
+.album-film-state { opacity: 0.65; }
 
 /* What the viewer said about a memory, on its Organize card (design §11.3). Styled as
    quiet annotation rather than as content: it belongs to the memory, but the mosaic
@@ -434,10 +434,12 @@ img.cite { height: 40px; width: 40px; object-fit: cover; border-radius: 4px;
   font-variant-numeric: tabular-nums;
 }
 
-/* "Rebuild" on a memory card — retell THIS memory (design §11): a new description and
-   a better order for its photographs. Quiet, because it is the heavier of the two
-   rebuilds and should not be reached for by accident. */
-.album-retell { display: inline-block; margin-left: 0.5rem; }
+/* "↻ Retell memory" on a memory card — retell THIS memory (design §11): a new
+   description and a better order for its photographs. Quiet, because it is the heavier
+   of the two rebuilds and should not be reached for by accident; its note says what it
+   deletes. */
+.album-retell { margin: 0.5rem 0 0; }
+.album-retell-note { margin: 0.25rem 0 0; font-size: 0.75rem; opacity: 0.6; line-height: 1.4; }
 .album-retell button {
   padding: 0.2rem 0.6rem;
   border: 1px solid rgba(128, 128, 128, 0.4);
@@ -451,3 +453,128 @@ img.cite { height: 40px; width: 40px; object-fit: cover; border-radius: 4px;
 }
 .album-retell button:hover:not(:disabled) { opacity: 1; }
 .album-retell button:disabled { opacity: 0.3; cursor: default; }
+
+.voices-shell { max-width: 900px; }
+.voice-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 12px; margin-top: 16px; }
+.voice-card { display: flex; flex-direction: column; gap: 2px; padding: 12px 14px;
+  background: #1a1a1a; border: 1px solid #262626; border-radius: 10px; color: #ddd;
+  text-decoration: none; }
+a.voice-card:hover { border-color: #3a3a3a; background: #1e1e1e; color: #fff; }
+a.voice-card:focus-visible { outline: 2px solid #8ab4f8; outline-offset: 2px; }
+.voice-card-name { font-weight: 600; font-size: 16px; color: #eee; margin-bottom: 4px;
+  overflow-wrap: anywhere; }
+.voice-card-line { font-size: 13px; color: #bbb; }
+.voice-card-ready { font-size: 13px; color: #9fd49f; }
+.voice-card-unready { color: #ffb070; }
+.voice-head { display: flex; align-items: center; gap: 12px; }
+.voice-title { flex: 1; min-width: 0; margin: 0; overflow-wrap: anywhere; }
+.voices-up { color: #8ab4f8; text-decoration: none; font-weight: 500; }
+.voices-up:hover { color: #fff; }
+.voice-crumb { color: #666; font-weight: 400; }
+.voices-close { font-size: 1.5rem; line-height: 1; background: #191919; color: #ddd;
+  border: 1px solid #333; border-radius: 6px; padding: 2px 10px; cursor: pointer; }
+.voices-close:hover { color: #fff; background: #262626; }
+.voice-menu { position: relative; }
+.voice-menu summary { list-style: none; cursor: pointer; font-size: 1.3rem; line-height: 1;
+  padding: 2px 10px; border: 1px solid #333; border-radius: 6px; background: #191919; color: #ddd; }
+.voice-menu summary::-webkit-details-marker { display: none; }
+.voice-menu[open] summary, .voice-menu summary:hover { color: #fff; background: #262626; }
+.voice-menu-body { position: absolute; right: 0; top: calc(100% + 6px); z-index: 5;
+  display: flex; flex-direction: column; gap: 10px; padding: 12px; min-width: 260px;
+  background: #1c1c1c; border: 1px solid #333; border-radius: 10px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5); }
+.voice-menu-body form { margin: 0; display: flex; gap: 6px; align-items: center; }
+.voice-ready { margin: 6px 0 0; font-size: 14px; color: #9fd49f; overflow-wrap: anywhere; }
+.voice-unready { color: #ffb070; }
+.voice-tabs { display: flex; gap: 4px; margin: 16px 0 12px; border-bottom: 1px solid #2a2a2a; }
+.voice-tab { font: inherit; background: none; border: 0; border-bottom: 2px solid transparent;
+  color: #aaa; padding: 8px 14px; cursor: pointer; margin-bottom: -1px; }
+.voice-tab:hover { color: #fff; }
+.voice-tab[aria-selected="true"] { color: #fff; border-bottom-color: #8ab4f8; font-weight: 600; }
+.voice-tab:focus-visible { outline: 2px solid #8ab4f8; outline-offset: 2px; }
+.voice-lang { font-size: 14px; font-weight: 600; color: #ccc; margin: 16px 0 4px; }
+.take-id { font: 13px ui-monospace, monospace; color: #aaa; }
+.take-unused { color: #ff8080; font-size: 13px; overflow-wrap: anywhere; }
+.take-actions { margin-left: auto; display: flex; gap: 6px; align-items: center; }
+.kit-style { font-size: 13px; font-weight: 600; color: #aaa; margin: 12px 0 2px; }
+.kit-texts { list-style: none; padding: 0; margin: 0; }
+.kit-row { padding: 4px 0; border-bottom: 1px solid #222; }
+.kit-line { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.kit-id { font: 12px ui-monospace, monospace; color: #888; min-width: 110px; }
+.kit-text { color: #ccc; font-size: 13px; overflow-wrap: anywhere; }
+.kit-row .voice-examples { margin: 4px 0 0 20px; }
+.kit-record, .voice-hear, .voice-hearing-job button { font: inherit;
+  font-size: 13px; background: #1e1e1e; border: 1px solid #333; color: #ddd; border-radius: 8px;
+  padding: 3px 10px; cursor: pointer; }
+.kit-record:hover, .voice-hear:hover, .voice-hearing-job button:hover { background: #262626; color: #fff; }
+/* The hearing job line under the header (§11.1): its `hidden` must win, so no `display`. */
+.voice-hearing-job { max-width: 640px; font-size: 14px; }
+.voice-hearing-job p { margin: 6px 0; overflow-wrap: anywhere; }
+.hearing-step { color: #ccc; }
+.hearing-error { color: #ff8080; }
+.take-waiting { color: #aaa; font-size: 13px; }
+/* A native select is as wide as its longest option (a take's words): hold it to the
+   page. */
+.test-label { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-weight: 600;
+  margin: 6px 0; }
+.test-label[hidden] { display: none; }
+.test-language, .test-text { max-width: 100%; min-width: 0; padding: 6px 10px;
+  border-radius: 8px; border: 1px solid #333; background: #1a1a1a; color: #eee; font: inherit;
+  font-size: 14px; }
+.test-text { flex: 1; }
+.preview-compare { margin-top: 12px; border-top: 1px solid #2a2a2a; padding-top: 8px; }
+.compare-line { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 4px 0; }
+.compare-what { overflow-wrap: anywhere; }
+.compare-line audio { height: 28px; }
+.voices-unavailable { padding: 8px 12px; background: #191919; border-radius: 6px;
+  border-left: 3px solid #b5651d; display: inline-block; }
+.voices-new { display: flex; align-items: center; gap: 8px; margin: 12px 0; }
+.voices-new input, .voice-rename input { padding: 6px 10px; border-radius: 8px;
+  border: 1px solid #333; background: #1a1a1a; color: #eee; font-size: 14px; }
+.voices-error { color: #ff8080; margin: 8px 0; }
+.voice-name { font-weight: 600; }
+.voice-deleting { color: #b5651d; font-size: 13px; }
+.voice-pending { opacity: 0.7; }
+.voice-examples { list-style: none; padding: 0; margin: 10px 0 0; }
+.voice-example { display: flex; align-items: center; gap: 10px; padding: 6px 0;
+  border-bottom: 1px solid #2a2a2a; flex-wrap: wrap; }
+.voice-example form { margin: 0; }
+.voice-example audio { height: 28px; }
+.voice-add { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 20px;
+  padding-top: 12px; border-top: 1px solid #2a2a2a; }
+.voice-add-title { font-weight: 600; font-size: 13px; }
+.voice-add select { padding: 4px 8px; border-radius: 8px; border: 1px solid #333;
+  background: #1a1a1a; color: #eee; }
+.voice-recorder { margin-top: 16px; padding: 12px 14px; background: #191919;
+  border: 1px solid #b5651d; border-radius: 10px; max-width: 640px; }
+.recorder-prompt { font-size: 17px; line-height: 1.5; margin: 0 0 10px; }
+.recorder-instruction { font-size: 13px; color: #aaa; margin: 0 0 4px; }
+.recorder-hint { font-size: 13px; margin: 0 0 10px; }
+.recorder-prepare:not([hidden]) { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.voices-tip { flex-basis: 100%; margin: 0; font-size: 13px; }
+.recorder-live:not([hidden]), .recorder-take:not([hidden]) { display: flex; align-items: center; gap: 10px; }
+.recorder-timer { font: 15px ui-monospace, monospace; color: #ff8080; }
+.example-label { font-size: 12px; color: #aaa; text-transform: uppercase; letter-spacing: 0.04em; }
+.example-test { flex-basis: 100%; font-size: 12px; }
+.voice-preview { margin-top: 16px; padding: 12px 14px; background: #191919;
+  border: 1px solid #2f5f8f; border-radius: 10px; max-width: 640px; }
+.preview-bar { height: 6px; background: #2a2a2a; border-radius: 3px; overflow: hidden; margin: 8px 0; }
+.preview-bar span { display: block; height: 100%; background: #8ab4f8; }
+.preview-step { font-size: 13px; color: #ccc; margin: 0 0 8px; }
+.preview-error { color: #ff8080; margin: 0 0 8px; overflow-wrap: anywhere; }
+/* No `display` here or on the buttons: their `hidden` toggles must win. */
+.preview-custom { width: 100%; max-width: 100%; min-width: 0; box-sizing: border-box;
+  margin: 8px 0; padding: 8px 12px; border-radius: 10px; border: 1px solid #333;
+  background: #1a1a1a; color: #eee; font: inherit; font-size: 14px; }
+.preview-count { font-size: 12px; margin: -4px 0 8px; }
+.preview-actions { display: flex; gap: 10px; flex-wrap: wrap; margin: 8px 0; }
+.voice-preview button { font: inherit; background: #1e1e1e; border: 1px solid #333; color: #ddd;
+  border-radius: 8px; padding: 6px 12px; cursor: pointer; }
+.voice-preview button:hover:not(:disabled) { background: #262626; color: #fff; }
+.voice-preview button:focus-visible { outline: 2px solid #8ab4f8; outline-offset: 2px; }
+.voice-preview button:disabled { opacity: 0.5; cursor: default; }
+.voice-preview .preview-generate { background: #2d5bd7; border-color: #2d5bd7; color: #fff;
+  font-weight: 600; }
+.voice-preview .preview-generate:hover:not(:disabled) { background: #3a68e4; }
+.preview-what { overflow-wrap: anywhere; }

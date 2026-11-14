@@ -22,7 +22,15 @@ class KokoroVoice:
     def __init__(self, repo: str, device: str) -> None:
         # `repo` is the HF id the `voice` SLOT holds (§4.1) — never hardcoded, so
         # switching the slot rebuilds this child against the new checkpoint.
+        import espeakng_loader
         from kokoro import KPipeline
+        from phonemizer.backend.espeak.wrapper import EspeakWrapper
+
+        from audio.espeak_path import short_data_path
+
+        # Importing kokoro made misaki point espeak at the bundled data. From a long
+        # venv path espeak-ng drops it and exit(1)s the child (audio/espeak_path.py).
+        EspeakWrapper.set_data_path(short_data_path(espeakng_loader.get_data_path()))
 
         self.repo = repo
         self.device = device

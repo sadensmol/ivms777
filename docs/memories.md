@@ -27,12 +27,24 @@ by design: one photo may sit in one event and several themes, which `group_photo
    and a flat 6 h gap cut every trip into night-separated fragments. *Home* is simply
    the region holding the most photos; without that exception the wider gap would weld
    months of ordinary days at home into one endless memory.
+
+   **A photo with no capture date still takes part.** Pooling is the only step that
+   reads the date, and it only bounds context — so an undated photo is pooled by its
+   **upload folder** instead (the directory of its first source path): every undated
+   photo from one folder is one session. A scan or an exported set with its EXIF
+   stripped would otherwise never reach a memory at all. The `min_size` floor applies
+   the same way, and the agent still decides the carve.
 2. **Compose events (agent, per session).** For each session the agent reads compact
    per-photo summaries (date, place, caption, tags) and **decides the carve** — one
    memory, or several chapters, or skip — pulling extra context on demand via bounded
    tools (similar photos, facet lookups, photos nearby in time, same-subject
    retrieval) so it can reach *across* sessions when an event spans a pool boundary.
    It returns each memory as `{title, description, photo_ids[]}`.
+
+   **A drop list never empties a kept memory.** `drop_photo_ids` is for the odd
+   outlier; a reply with `keep: true` whose drops would leave fewer than two photos
+   contradicts itself (a small model listed every id), so the drops are ignored and
+   the whole candidate is kept. A one-photo candidate is still skipped.
 
    **The place in a summary is a NAME, never coordinates** — `Borjomi, Georgia`, read
    from the `place_city`/`place_country` facets (§6.2); a photo whose place cannot be
@@ -111,6 +123,12 @@ build at a time per process, signature-guarded (owner photo count + newest
 `updated_at`, stored in each memory's `params`) so opening the tab never silently
 re-runs the agent; the tab flags **stale** when the signature moves. Because only
 processed photos participate, **rebuild after captioning/embedding completes**.
+
+**A build says what it did.** It logs its candidates, every skipped candidate with
+the reason and the model's raw reply (`keep=false`, a missing title/description,
+fewer than two photos, unparseable output), and how many it kept. The `albums`
+loggers write to the terminal and to `<data_dir>/memories.log`, so "I clicked and
+nothing appeared" is answerable after the fact.
 
 > The earlier heuristic seed→curate (one time/place run → one memory, minus
 > outliers) is superseded by the above: it let a distance rule, not the model, decide

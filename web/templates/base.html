@@ -8,7 +8,7 @@
     <script src="/static/htmx.min.js?v={{ static_v('htmx.min.js') }}"></script>
   </head>
   <body>
-    {# The persistent app shell: only the four nav links are HTMX-boosted, and they
+    {# The persistent app shell: only the five nav links are HTMX-boosted, and they
        swap ONLY <main>. So <nav> — and the live resource bar's polling — stay in the
        DOM across top-level navigation; the menu never re-renders and the resbar never
        blanks. Boost is scoped to these links on purpose: photo/grid drill-downs are
@@ -18,8 +18,9 @@
       <a href="/library">Library</a>
       <a href="/chat">Chat</a>
       <a href="/organize">Organize</a>
+      <a href="/voices">Voices</a>
       <span id="resbar" class="resbar" aria-live="polite"></span>
-      {# Settings is an OVERLAY, not a fifth nav destination: a <button>, never an
+      {# Settings is an OVERLAY, not a sixth nav destination: a <button>, never an
          <a href>, so it pushes no history entry and changes no URL (§13.1).
          hx-select is INHERITED from the nav, and the popup fragment carries no
          <main> — without the unset htmx filters the response to nothing and the

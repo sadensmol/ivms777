@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 from config import Settings
 from scripts.fetch_models import main, wanted
 
@@ -63,16 +65,22 @@ def test_a_stored_voice_choice_is_ignored_because_voice_is_automatic():
     conn.close()
 
 
-def test_a_failing_repo_does_not_fail_the_target():
-    # A gated repo must never stop the app from starting: the slot is simply silent.
+def test_a_failing_download_fails_the_target_after_trying_the_rest():
+    # `make up` must not start an app that is missing a model it needs — a silently
+    # skipped Silero is how Russian narration had no voice. Every model is still
+    # tried, so one run reports every failure at once.
     calls = []
 
     def boom(target):
         calls.append(target)
         raise RuntimeError("Access denied. This repository requires approval.")
 
-    assert main(["--profile", "mac"], fetch=boom) == 0
+    assert main(["--profile", "mac"], fetch=boom) == 1
     assert len(calls) >= 3          # it kept going after the first failure
+
+
+def test_a_clean_run_succeeds():
+    assert main(["--profile", "mac"], fetch=lambda target: None) == 0
 
 
 def test_it_reports_what_it_skipped_and_why(capsys):
@@ -85,7 +93,7 @@ def test_it_reports_what_it_skipped_and_why(capsys):
     assert "musicgen-medium" in out
     assert "requires approval" in out
     assert "skipped" in out
-    assert "the app still starts" in out
+    assert "make up stops" in out
 
 
 def test_a_clean_run_reports_no_skips(capsys):
@@ -109,3 +117,69 @@ def test_a_non_automatic_slot_fetches_only_the_selected_model():
     settings = Settings(data_dir=Path("/tmp/pl"), profile="mac")
     embed = [target for slot, target in wanted(settings) if slot == "image_embed"]
     assert embed == ["google/siglip2-so400m-patch14-384"]
+
+
+def test_mac_prefetches_voxcpm2_at_its_pinned_commit():
+    # Voice copy is a `voice` entry, so the automatic slot pre-fetches it too, and at
+    # the ONE commit the child is pinned to (§4.1).
+    from models import catalog
+
+    source = catalog.get("voice", "voxcpm2").source
+    settings = Settings(data_dir=Path("/tmp/pl"), profile="mac")
+    voices = [target for slot, target in wanted(settings) if slot == "voice"]
+    assert f"openbmb/VoxCPM2@{source.revision}" in voices
+    assert "hexgrad/Kokoro-82M" in voices          # unpinned: listed by repo id alone
+
+
+def test_jetson_does_not_prefetch_voxcpm2():
+    settings = Settings(data_dir=Path("/tmp/pl"), profile="jetson")
+    assert not any("VoxCPM2" in target for _, target in wanted(settings))
+
+
+def test_a_pinned_target_is_fetched_at_its_revision(monkeypatch):
+    import sys
+    import types
+
+    from scripts.fetch_models import _fetch
+
+    calls = []
+    hub = types.ModuleType("huggingface_hub")
+    hub.snapshot_download = lambda repo, **kw: calls.append((repo, kw))
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+    settings = Settings(data_dir=Path("/tmp/pl"), profile="mac")
+
+    _fetch("openbmb/VoxCPM2@abc123", settings)
+    _fetch("hexgrad/Kokoro-82M", settings)
+    assert calls == [
+        ("openbmb/VoxCPM2", {"revision": "abc123"}),
+        ("hexgrad/Kokoro-82M", {}),
+    ]
+
+
+WHISPER = "openai/whisper-large-v3-turbo@41f01f3fe87f28c78e2fbf8b568835947dd65ed9"
+
+
+@pytest.mark.parametrize("profile", ["mac", "cloud"])
+def test_whisper_is_prefetched_at_its_pinned_commit_where_voices_clone(profile):
+    settings = Settings(data_dir=Path("/tmp/pl"), profile=profile)
+    assert ("asr", WHISPER) in wanted(settings)
+
+
+def test_jetson_does_not_prefetch_whisper():
+    settings = Settings(data_dir=Path("/tmp/pl"), profile="jetson")
+    assert not any(slot == "asr" or "whisper" in target for slot, target in wanted(settings))
+
+
+ECAPA = "speechbrain/spkrec-ecapa-voxceleb@0f99f2d0ebe89ac095bcc5903c4dd8f72b367286"
+
+
+def test_mac_prefetches_the_speaker_model_at_its_pinned_commit():
+    settings = Settings(data_dir=Path("/tmp/pl"), profile="mac")
+    assert ("speaker_embed", ECAPA) in wanted(settings)
+
+
+def test_the_speaker_model_is_prefetched_on_mac_only():
+    for profile in ("jetson", "cloud"):
+        settings = Settings(data_dir=Path("/tmp/pl"), profile=profile)
+        assert not any(slot == "speaker_embed" or "ecapa" in target
+                       for slot, target in wanted(settings)), profile

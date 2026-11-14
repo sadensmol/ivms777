@@ -2,10 +2,15 @@
 via the FastAPI `TestClient`'s own sync-capable ASGI transport — no real
 network, no real models."""
 
+import base64
+import json
+from types import SimpleNamespace
+
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from feed.saved_voices import model_reference
 from inference.models_client import ModelsClient
 from modelsvc.app import create_models_app
 from modelsvc.backends.fake import FAKE_CONTEXT, FakeBackend
@@ -169,3 +174,304 @@ def test_music_sends_the_whole_score():
                                        {"brief": "drums", "seconds": 3}])
     assert len(result["segments"]) == 2
     assert isinstance(result["audio"], bytes)
+
+
+_REFS = {"saved:1": {"audio": b"RIFF-clip", "sha256": "ab", "language": "en",
+                     "transcript": None,
+                     "conditioning": [{"model": "voxcpm2", "revision": "abc",
+                                       "blob": b"\x00old"}]}}
+_REPLY = {"audio": base64.b64encode(b"RIFF").decode(), "sample_rate": 48000,
+          "model": "voxcpm2", "revision": "abc", "segments": [],
+          "conditioning": {
+              "saved:1": {"state": "built", "model": "voxcpm2", "revision": "abc",
+                          "reason": "clip changed",
+                          "blob": base64.b64encode(b"\x00new").decode()},
+              "saved:2": {"state": "restored", "model": "voxcpm2", "revision": "abc",
+                          "reason": None, "blob": None},
+          }}
+
+
+def _capturing_client(seen: list) -> ModelsClient:
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((json.loads(request.content), request.extensions["timeout"]))
+        return httpx.Response(200, json=_REPLY)
+
+    return ModelsClient("http://modelsvc", transport=httpx.MockTransport(handler))
+
+
+def test_speak_encodes_the_references_as_base64():
+    seen: list = []
+    _capturing_client(seen).speak("hi", "en", "saved:1", references=_REFS)
+    payload, _ = seen[0]
+    assert payload["references"] == {"saved:1": {
+        "audio": base64.b64encode(b"RIFF-clip").decode(), "sha256": "ab", "language": "en",
+        "transcript": None,
+        "conditioning": [{"model": "voxcpm2", "revision": "abc",
+                          "blob": base64.b64encode(b"\x00old").decode()}],
+    }}
+
+
+def test_speak_without_references_sends_no_references_field():
+    seen: list = []
+    _capturing_client(seen).speak("hi")
+    assert "references" not in seen[0][0]
+
+
+def test_speak_waits_1800_s_with_references_and_300_s_without():
+    seen: list = []
+    client = _capturing_client(seen)
+    client.speak("hi", references=_REFS, voice="saved:1")
+    client.speak("hi")
+    client.speak("hi", timeout=12.0)
+    assert [timeout["read"] for _, timeout in seen] == [1800.0, 300.0, 12.0]
+
+
+def test_speak_decodes_the_revision_and_the_conditioning_blobs():
+    result = _capturing_client([]).speak("hi", "en", "saved:1", references=_REFS)
+    assert result["revision"] == "abc"
+    assert result["conditioning"]["saved:1"]["blob"] == b"\x00new"
+    assert result["conditioning"]["saved:1"]["reason"] == "clip changed"
+    assert result["conditioning"]["saved:2"]["blob"] is None
+
+
+def test_speak_round_trips_a_saved_voice_through_the_service():
+    import hashlib
+
+    clip = b"RIFF-a-saved-example"
+    refs = {"saved:1": {"audio": clip, "sha256": hashlib.sha256(clip).hexdigest(),
+                        "language": "en", "transcript": None, "conditioning": []}}
+    result = _client().speak("hi", "en", "saved:1", references=refs)
+    assert result["audio"][:4] == b"RIFF"
+    assert result["revision"] is None
+    assert isinstance(result["conditioning"]["saved:1"]["blob"], bytes)
+
+
+def test_speak_sends_the_adapter_as_base64_with_its_sha256_and_use_clip():
+    seen: list = []
+    refs = {"saved:1": _REFS["saved:1"] | {"adapter": {"blob": b"\x00lora", "sha256": "cd"},
+                                           "use_clip": False}}
+    _capturing_client(seen).speak("hi", "en", "saved:1", references=refs)
+    sent = seen[0][0]["references"]["saved:1"]
+    assert sent["adapter"] == {"blob": base64.b64encode(b"\x00lora").decode(), "sha256": "cd"}
+    assert sent["use_clip"] is False
+
+
+def test_speak_passes_the_adapter_states_through():
+    states = {"saved:1": {"state": "kept", "sha256": "cd"}}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_REPLY | {"adapters": states})
+
+    client = ModelsClient("http://modelsvc", transport=httpx.MockTransport(handler))
+    assert client.speak("hi", "en", "saved:1", references=_REFS)["adapters"] == states
+
+
+def test_speak_sends_no_audio_and_no_sha256_for_a_model_only_reference():
+    seen: list = []
+    refs = {"saved:1": {"language": "ru", "adapter": {"blob": b"\x00lora", "sha256": "cd"},
+                        "use_clip": False}}
+    _capturing_client(seen).speak("hi", "ru", "saved:1", references=refs)
+    assert seen[0][0]["references"] == {"saved:1": {
+        "language": "ru", "transcript": None, "conditioning": [],
+        "adapter": {"blob": base64.b64encode(b"\x00lora").decode(), "sha256": "cd"},
+        "use_clip": False,
+    }}
+
+
+def test_speak_round_trips_a_model_only_reference_through_the_service():
+    import hashlib
+
+    blob = b"safetensors-of-a-baked-voice"
+    sha = hashlib.sha256(blob).hexdigest()
+    refs = {"saved:1": {"language": "ru", "adapter": {"blob": blob, "sha256": sha},
+                        "use_clip": False}}
+    result = _client().speak("hi", "ru", "saved:1", references=refs)
+    assert result["audio"][:4] == b"RIFF"
+    assert result["conditioning"] == {}
+    assert result["adapters"] == {"saved:1": {"state": "loaded", "sha256": sha}}
+
+
+_CONTROLS = {"cfg_value": 3.0, "inference_timesteps": 20}
+
+
+def test_speak_forwards_the_controls_of_a_reference():
+    seen: list = []
+    refs = {"saved:1": _REFS["saved:1"] | {"controls": _CONTROLS}}
+    _capturing_client(seen).speak("hi", "en", "saved:1", references=refs)
+    assert seen[0][0]["references"]["saved:1"]["controls"] == _CONTROLS
+
+
+def test_speak_passes_the_echo_of_the_controls_through():
+    echo = {"saved:1": _CONTROLS}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_REPLY | {"controls": echo})
+
+    client = ModelsClient("http://modelsvc", transport=httpx.MockTransport(handler))
+    assert client.speak("hi", "en", "saved:1", references=_REFS)["controls"] == echo
+
+
+def test_a_reply_with_no_echo_has_empty_controls():
+    reply = _capturing_client([]).speak("hi", "en", "saved:1", references=_REFS)
+    assert reply["controls"] == {}
+
+
+def test_the_reference_the_app_builds_sends_no_controls():
+    seen: list = []
+    model = SimpleNamespace(sha256="cd")
+    refs = {"saved:1": model_reference(model, b"\x00lora", "ru")}
+    _capturing_client(seen).speak("hi", "ru", "saved:1", references=refs)
+    assert "controls" not in seen[0][0]["references"]["saved:1"]
+
+
+def _bake_client(seen: list, status: int = 200, body=None, content: bytes = b"") -> ModelsClient:
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append({"method": request.method, "path": request.url.path,
+                     "timeout": request.extensions["timeout"]["read"],
+                     "json": json.loads(request.content) if request.content else None})
+        if body is not None:
+            return httpx.Response(status, json=body)
+        return httpx.Response(status, content=content)
+
+    return ModelsClient("http://modelsvc", transport=httpx.MockTransport(handler))
+
+
+_STATUS = {"id": "b1", "state": "running"}
+
+
+@pytest.mark.parametrize(("call", "method", "path", "timeout"), [
+    (lambda c: c.bake_status("b1"), "GET", "/voice/bakes/b1", 10.0),
+    (lambda c: c.bake_current(), "GET", "/voice/bakes/current", 10.0),
+    (lambda c: c.bake_cancel("b1"), "POST", "/voice/bakes/b1/cancel", 30.0),
+])
+def test_the_bake_status_calls_reach_their_paths_and_decode_the_status(
+        call, method, path, timeout):
+    seen: list = []
+    assert call(_bake_client(seen, body=_STATUS)) == _STATUS
+    assert (seen[0]["method"], seen[0]["path"], seen[0]["timeout"]) == (method, path, timeout)
+
+
+def test_bake_start_encodes_the_takes_and_waits_600_s():
+    seen: list = []
+    clip = {"audio": b"RIFF-take", "sha256": "ab", "text": "Hello.", "language": "en"}
+    result = _bake_client(seen, 202, body=_STATUS).bake_start(
+        [clip], tag={"check": "me"}, config={"steps": 3})
+    assert result == _STATUS
+    assert (seen[0]["method"], seen[0]["path"], seen[0]["timeout"]) == (
+        "POST", "/voice/bakes", 600.0)
+    assert seen[0]["json"] == {
+        "clips": [clip | {"audio": base64.b64encode(b"RIFF-take").decode()}],
+        "config": {"steps": 3}, "tag": {"check": "me"}}
+
+
+def test_bake_current_is_none_when_no_bake_exists():
+    seen: list = []
+    assert _bake_client(seen, 404, body={"detail": "no such bake"}).bake_current() is None
+
+
+def test_bake_adapter_returns_the_raw_bytes():
+    seen: list = []
+    assert _bake_client(seen, content=b"\x00safetensors").bake_adapter("b1") == b"\x00safetensors"
+    assert (seen[0]["method"], seen[0]["path"], seen[0]["timeout"]) == (
+        "GET", "/voice/bakes/b1/adapter", 120.0)
+
+
+def test_bake_delete_sends_a_delete_and_returns_nothing():
+    seen: list = []
+    assert _bake_client(seen, 204).bake_delete("b1") is None
+    assert (seen[0]["method"], seen[0]["path"], seen[0]["timeout"]) == (
+        "DELETE", "/voice/bakes/b1", 30.0)
+
+
+def test_a_refused_bake_raises_for_its_status():
+    with pytest.raises(httpx.HTTPStatusError):
+        _bake_client([], 409, body={"detail": "a voice is already being baked"}).bake_status("b1")
+
+
+def test_a_bake_round_trips_through_the_service():
+    client = _client()
+    started = client.bake_start([{"audio": b"RIFF", "sha256": "ab", "text": "Hi.",
+                                  "language": "en"}], tag={"check": "me"})
+    assert client.bake_current()["id"] == started["id"]
+    assert [client.bake_status(started["id"])["state"] for _ in range(3)][-1] == "done"
+    assert client.bake_adapter(started["id"]) == b"fake-adapter"
+    client.bake_delete(started["id"])
+    assert client.bake_current() is None
+
+
+_HEARD = {"text": "Мои слова.", "model": "whisper-large-v3-turbo", "revision": "41f01f3",
+          "seconds": 6.0, "elapsed_s": 1.5}
+
+
+def test_transcribe_posts_the_take_its_sha256_and_language_and_waits_600_s():
+    import hashlib
+
+    seen: list = []
+    result = _bake_client(seen, body=_HEARD).transcribe(b"RIFF-take", "ru")
+    assert result == _HEARD
+    assert (seen[0]["method"], seen[0]["path"], seen[0]["timeout"]) == (
+        "POST", "/voice/transcribe", 600.0)
+    assert seen[0]["json"] == {"audio": base64.b64encode(b"RIFF-take").decode(),
+                               "sha256": hashlib.sha256(b"RIFF-take").hexdigest(),
+                               "language": "ru"}
+
+
+def test_a_refused_transcribe_raises_for_its_status():
+    client = _bake_client([], 409, body={"detail": "a voice is being baked (40%)"})
+    with pytest.raises(httpx.HTTPStatusError) as caught:
+        client.transcribe(b"RIFF", "en")
+    assert caught.value.response.status_code == 409
+
+
+def test_a_transcribe_round_trips_through_the_service():
+    import io
+    import wave
+
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(48000)
+        handle.writeframes(b"\x01\x00" * 48000 * 6)
+    result = _client().transcribe(buffer.getvalue(), "en")
+    assert result == {"text": "fake words", "model": "fake-asr", "revision": "fake",
+                      "seconds": 6.0, "elapsed_s": 0.0}
+
+
+_EMBEDDED = {"vector": [0.5] * 192, "model": "ecapa-voxceleb", "revision": "0f99f2d",
+             "seconds": 6.0, "elapsed_s": 0.2, "pipeline": 1}
+
+
+def test_embed_voice_posts_the_clip_and_its_sha256_and_waits_600_s():
+    import hashlib
+
+    seen: list = []
+    result = _bake_client(seen, body=_EMBEDDED).embed_voice(b"RIFF-clip")
+    assert result == _EMBEDDED
+    assert (seen[0]["method"], seen[0]["path"], seen[0]["timeout"]) == (
+        "POST", "/voice/embed", 600.0)
+    assert seen[0]["json"] == {"audio": base64.b64encode(b"RIFF-clip").decode(),
+                               "sha256": hashlib.sha256(b"RIFF-clip").hexdigest()}
+
+
+@pytest.mark.parametrize("status", [409, 422, 503])
+def test_a_refused_embed_raises_for_its_status(status):
+    client = _bake_client([], status, body={"detail": "no"})
+    with pytest.raises(httpx.HTTPStatusError) as caught:
+        client.embed_voice(b"RIFF")
+    assert caught.value.response.status_code == status
+
+
+def test_an_embed_round_trips_through_the_service():
+    import io
+    import wave
+
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(48000)
+        handle.writeframes(b"\x01\x00" * 48000 * 6)
+    result = _client().embed_voice(buffer.getvalue())
+    assert len(result["vector"]) == 192
+    assert (result["model"], result["seconds"], result["pipeline"]) == ("fake-speaker", 6.0, 1)

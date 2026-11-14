@@ -22,6 +22,7 @@ constructing the service still spawns nothing and imports no torch (§5.1).
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 
 from models import catalog
@@ -45,7 +46,16 @@ LLM_UNITS = ("llm", "llm_vision")
 VOICE_TARGETS: dict[str, str] = {
     "kokoro-82m": "audio.kokoro_voice:KokoroVoice",
     "silero-v4-ru": "audio.silero_voice:SileroVoice",
+    "voxcpm2": "audio.voxcpm_voice:VoxCPMVoice",
 }
+
+# The training child of a bake (§8.1). No slot and no catalog choice: only a bake loads it.
+TRAIN_UNIT = "voice_train"
+# The bake's speech-recognition child (§8.1). No slot and no catalog choice: only a
+# bake's transcription stage asks for it.
+ASR_UNIT = "asr"
+# The speaker-similarity meter's child (§8.1). No slot and no catalog choice.
+SPEAKER_EMBED_UNIT = "speaker_embed"
 
 
 class SlotManager:
@@ -117,6 +127,9 @@ class SlotManager:
             self._register_music()
         if changed & {"caption", "planner"}:
             self._register_llm()
+        self._register_voice_train()
+        self._register_asr()
+        self._register_speaker_embed()
         self.generation += 1
 
     # --- unit registration ---------------------------------------------------
@@ -126,11 +139,25 @@ class SlotManager:
         return self._settings.model_cost_mb.get(unit, entry.cost_mb)
 
     def _register_torch_unit(self, unit: str, entry: ModelEntry, target: str, warm=None) -> None:
+        self._register_worker(unit, target, self._child_args(entry), self._cost(unit, entry), warm)
+
+    def _child_args(self, entry: ModelEntry) -> tuple:
+        args = (self._child_arg(entry), self._settings.embed_device)
+        # A pinned Hub entry also tells the child WHICH commit to load, so the child
+        # can refuse weights of another revision. Unpinned entries keep today's args.
+        if isinstance(entry.source, HfSource) and entry.source.revision is not None:
+            args = (*args, entry.source.revision)
+        # The child of an entry that bakes is built with the catalog's LoRA layers, so
+        # an adapter loads without a rebuild and its shape matches the trainer's (§4.1).
+        if entry.adapter is not None:
+            args = (*args, json.dumps(entry.adapter.lora, sort_keys=True))
+        return args
+
+    def _register_worker(self, unit: str, target: str, args: tuple, cost_mb: int, warm=None) -> None:
         # Drop whatever occupies the unit first: `unload` kills the child, which is
         # the only thing that returns its memory (§8.1).
         self._registry.unload(unit)
         self._workers.pop(unit, None)
-        args = (self._child_arg(entry), self._settings.embed_device)
 
         def load() -> None:
             worker = self._workers.get(unit)
@@ -148,7 +175,7 @@ class SlotManager:
             worker = self._workers.get(unit)
             return worker is not None and worker.is_alive()
 
-        self._registry.register(ModelSpec(unit, load, free, self._cost(unit, entry), alive=alive))
+        self._registry.register(ModelSpec(unit, load, free, cost_mb, alive=alive))
 
     def _child_arg(self, entry: ModelEntry) -> str:
         """What the child is constructed FROM — a Hub repo id, or a local file.
@@ -184,22 +211,26 @@ class SlotManager:
         not a configuration."""
         self._register_torch_unit(UNIT_BY_SLOT[slot], self.entry(slot), target, warm="warm")
 
-    def voice_entry_for(self, language: str) -> ModelEntry | None:
+    def voice_entry_for(self, language: str, *, cloning: bool = False) -> ModelEntry | None:
         """The catalog entry that speaks `language`, or None.
+
+        `cloning` picks the kind: preset speakers (False) or a SAVED voice (True).
+        Only entries of that kind count, so a preset request never reaches a cloning
+        child and a saved voice never reaches a preset one (§11.1).
 
         Preference order: the SELECTED entry if it speaks the language, else any other
         offered voice that does. `off` speaks nothing, so an off slot returns None and
         stays off — turning narration off must stay a real choice.
         """
         selected = self.entry("voice")
-        if language in selected.languages:
+        if selected.clones == cloning and language in selected.languages:
             return selected
         for entry in catalog.entries_for("voice", self._settings.profile):
-            if language in entry.languages:
+            if entry.clones == cloning and language in entry.languages:
                 return entry
         return None
 
-    def ensure_voice_for(self, language: str) -> bool:
+    def ensure_voice_for(self, language: str, *, cloning: bool = False) -> bool:
         """Point the `voice` unit at whichever model speaks `language`, swapping the
         child if needed. False when nothing can (the slot is off, or no voice covers
         it) — the caller then degrades to a silent film.
@@ -207,8 +238,11 @@ class SlotManager:
         This is why the user never has to choose a voice model: a film has a language,
         and the language picks the model. Only ONE voice is ever resident, and a film
         is single-language, so the swap happens at most once per film.
+
+        `cloning=True` routes to the saved-voice entry. False then means the profile
+        has no voice copy for the language (jetson offers none).
         """
-        entry = self.voice_entry_for(language)
+        entry = self.voice_entry_for(language, cloning=cloning)
         if entry is None:
             return False
         if entry.key != self._slots.get("voice"):
@@ -219,10 +253,47 @@ class SlotManager:
 
     def _register_voice(self) -> None:
         # The `voice` slot is the one whose entries are DIFFERENT models, not variants
-        # of one (§4.1): Kokoro for English, Silero for Russian. So the child class is
-        # chosen by key rather than shared.
-        target = VOICE_TARGETS.get(self.entry("voice").key, VOICE_TARGETS["kokoro-82m"])
+        # of one (§4.1): Kokoro for English, Silero for Russian, VoxCPM2 for a saved
+        # voice. So the child class is chosen by key rather than shared. An unknown key
+        # raises: a silent Kokoro fallback would speak another model under its name.
+        target = VOICE_TARGETS[self.entry("voice").key]
         self._register_audio_unit("voice", target)
+
+    def _register_voice_train(self) -> None:
+        # Once only: a registration unloads its unit first, and a later slot switch
+        # must never end a running bake (§8.1).
+        if self.has_unit(TRAIN_UNIT):
+            return
+        entry = catalog.adapter_entry_for(self._settings.profile)
+        if entry is None:
+            return
+        self._register_worker(
+            TRAIN_UNIT,
+            "audio.voxcpm_trainer:VoxCPMTrainer",
+            (*self._child_args(entry), str(self._settings.data_dir / "voice-bakes")),
+            self._settings.model_cost_mb.get(TRAIN_UNIT, entry.adapter.train_cost_mb),
+        )
+
+    def _register_asr(self) -> None:
+        # Once only, like `voice_train`: a registration unloads its unit first, and a
+        # later slot switch must never end a transcribe call (§8.1).
+        if self.has_unit(ASR_UNIT):
+            return
+        entry = catalog.transcriber_for(self._settings.profile)
+        if entry is None:
+            return
+        self._register_worker(ASR_UNIT, "audio.whisper_asr:WhisperASR",
+                              self._child_args(entry), self._cost(ASR_UNIT, entry))
+
+    def _register_speaker_embed(self) -> None:
+        # Once only, like `asr`: a later slot switch must never end an embed call (§8.1).
+        if self.has_unit(SPEAKER_EMBED_UNIT):
+            return
+        entry = catalog.speaker_embedder_for(self._settings.profile)
+        if entry is None:
+            return
+        self._register_worker(SPEAKER_EMBED_UNIT, "audio.speaker_embed:SpeakerEmbedder",
+                              self._child_args(entry), self._cost(SPEAKER_EMBED_UNIT, entry))
 
     def _register_music(self) -> None:
         self._register_audio_unit("music", "audio.musicgen:MusicGen")

@@ -246,47 +246,24 @@ def with_script(edit: Edit, script: tuple[tuple[int, str], ...]) -> Edit:
     Until now a shot was a photograph. It is not: a shot is a **passage of the story**,
     and a photograph is what illustrates it. So the same picture may appear twice
     because the story came back to it, and a picture the story never needed simply does
-    not appear. Each new shot inherits its photograph's move, grade and effect arc.
+    not appear (§11.1). Each new shot inherits its photograph's move, grade and effect arc.
+
+    The story's sentence order is the film's order: shot `i` is passage `i`, because
+    the voice speaks the passages in that order. The memory's photo order is only
+    recorded in the story pass, never imposed here, so a passage's words and its
+    photograph never separate.
 
     An empty script leaves the edit alone — a film with no words still shows its
     pictures in library order.
     """
     if not script:
         return edit
-    ordered = _in_memory_order(script, len(edit.shots))
     shots = tuple(
         replace(edit.shots[index], line="")
-        for index, _text in ordered
+        for index, _text in script
         if 0 <= index < len(edit.shots)
     )
     return replace(edit, shots=shots) if shots else edit
-
-
-def _in_memory_order(script, total: int):
-    """The script with its passages re-sorted into the MEMORY's photo order.
-
-    The order photographs appear in belongs to the memory, not to a film: it was
-    decided when the memory was built, and every cut of that memory shows them the same
-    way. Only rebuilding the memory may change it. A story pass free to reorder gave a
-    different sequence on every regeneration, so the same memory never looked like
-    itself twice.
-
-    What the story pass DOES still choose is which photograph carries each passage, how
-    long the film dwells on one, and whether it comes back to it — a repeat is not a
-    reorder. So the constraint applied here is on FIRST APPEARANCES: photograph 2 may
-    not be introduced before photograph 1. Passages are stably re-sorted by the rank of
-    the photograph they carry, which leaves repeats where the story put them.
-    """
-    first: dict[int, int] = {}
-    for position, (index, _text) in enumerate(script):
-        first.setdefault(index, position)
-    # Stable: passages carrying the same photograph keep their relative order, so a
-    # story that returns to a face still returns to it in the place it chose.
-    return sorted(
-        script,
-        key=lambda passage: (passage[0] if 0 <= passage[0] < total else total,
-                             first.get(passage[0], 0)),
-    )
 
 
 def with_narration_timing(
@@ -316,19 +293,23 @@ def with_narration_timing(
     return replace(edit, shots=tuple(shots))
 
 
-def with_arrangement(edit: Edit, entries: list[dict], *, keep_timing: bool = False) -> Edit:
+def with_arrangement(
+    edit: Edit, entries: list[dict], *, keep_timing: bool = False, keep_order: bool = False
+) -> Edit:
     """Apply the conductor's plan.
 
     Each entry is `{shot, at, seconds, beats, transition}`.
 
-    With `keep_timing` — the normal path — the running order came from the STORY and the
-    clock came from the VOICE, so the conductor only chooses the effects and how each
-    shot arrives. Without it (no narration timings), `shot` is a 1-based index into this
-    edit and the plan may reorder the film.
+    With `keep_order` the running order came from the STORY, so the conductor never
+    reorders the shots. With `keep_timing` — the normal path — the clock also came from
+    the VOICE, so the conductor only chooses the effects and how each shot arrives;
+    `keep_timing` implies `keep_order`. Without either (a film with no script), `shot`
+    is a 1-based index into this edit and the plan may reorder the film. Without
+    `keep_timing` the conductor's times stand.
 
     The plan comes from a model, so nothing here trusts it:
 
-    - a `shot` that is out of range or missing is repaired, and with `keep_timing` the
+    - a `shot` that is out of range or missing is repaired, and with `keep_order` the
       running order is already fixed by the story, so only the effects move;
     - times are forced monotonic, so two shots can never be on screen at once;
     - effect and transition names are validated against the library;
@@ -336,10 +317,9 @@ def with_arrangement(edit: Edit, entries: list[dict], *, keep_timing: bool = Fal
     """
     if len(entries) != len(edit.shots):
         return edit
-    # With `keep_timing` the STORY already fixed the running order and the VOICE already
-    # fixed the clock, so the conductor is choosing effects and nothing else. Letting it
-    # reorder here would move a shot away from the words it was written for.
-    order = (list(range(len(edit.shots))) if keep_timing
+    # The STORY already fixed the running order. Letting the conductor reorder here
+    # would move a shot away from the words it was written for.
+    order = (list(range(len(edit.shots))) if keep_order or keep_timing
              else _resolve_order(entries, len(edit.shots)))
     shots: list[Shot] = []
     cursor = 0.0

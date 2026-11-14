@@ -25,6 +25,7 @@ class AppContext:
         derived: LocalStorage,
         originals: LocalStorage,
         audio: LocalStorage,
+        voices: LocalStorage,
     ) -> None:
         self.settings = settings
         self._db_path = db_path
@@ -32,6 +33,9 @@ class AppContext:
         self.originals = originals
         # Generated feed audio (§11.1) — derived, like thumbs, and content-addressed.
         self.audio = audio
+        # Saved-voice clips and conditioning blobs (§6) — user data; only the voice
+        # deletion drain removes a file here (feed/saved_voices.py).
+        self.voices = voices
         self._local = threading.local()
 
     @property
@@ -60,6 +64,7 @@ def build_context(settings: Settings) -> AppContext:
         derived=LocalStorage(settings.thumb_dir),
         originals=LocalStorage(settings.originals_dir),
         audio=LocalStorage(settings.audio_dir),
+        voices=LocalStorage(settings.voices_dir),
     )
 
 

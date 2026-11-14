@@ -2,14 +2,17 @@ import html
 import json
 import logging
 import re
+import secrets
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import urlencode
 
 logger = logging.getLogger("ivms777.web")
 
 from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import (
     HTMLResponse,
     JSONResponse,
@@ -51,12 +54,42 @@ from chat.history import (
 )
 from chat.prefs import get_prefs, set_prefs
 from config import Settings
-from feed.build import Cancelled, NarrationFailed, build_presentation
+from feed.build import Cancelled, NarrationFailed, _cannot_narrate, build_presentation
 from feed.directives import legend as directive_legend
 from feed.language import DISPLAY as LANGUAGE_DISPLAY
 from feed.language import LANGUAGES, get_language
+from feed.narration import (
+    NarrationRefused,
+    NarrationRows,
+    _check_fresh,
+    discard_draft,
+    draft_languages,
+    narration_rows,
+    remove_passage,
+    rewrite_passages,
+    save_passage,
+)
 from feed.notes import add_note, delete_note, read_notes
-from feed.store import read_presentation
+from feed.rephrase import (
+    Ask,
+    RephraseRefused,
+    clean_request,
+    propose,
+    read_changes,
+    read_history,
+)
+from feed.saved_voices import (
+    SavedVoice,
+    VoiceDeleting,
+    castable_takes,
+    film_take,
+    get_voice,
+    list_voices,
+    read_narrator,
+    set_narrator,
+)
+from feed.store import FilmState, film_narrator, film_states, read_presentation
+from feed.voice import offered, resolve
 from inference.prompts import (
     GUARDRAIL_REFUSAL,
     agentic_answer_messages,
@@ -77,6 +110,7 @@ from ingest.thumbs import thumb_key
 from ingest.vocab import load_vocab, seed_tags
 from models import catalog as model_catalog
 from models import slots as model_slots
+from models.catalog import cloning_entry_for
 from models.resources import snapshot
 from search import signals
 from search.dates import date_where
@@ -93,6 +127,8 @@ from search.semantic import similar_photos, similarity_breakdown
 from search.tags import parse_tag_filters, tag_sidebar, tag_where
 from web.deps import AppContext, build_context
 from web.upload_api import register as register_upload_api
+from web.voices_api import language_name
+from web.voices_api import register as register_voices_api
 
 TEMPLATE_DIR = Path(__file__).parent / "templates"
 STATIC_DIR = Path(__file__).parent / "static"
@@ -115,6 +151,101 @@ DUPES_ONLY = (
 )
 
 DEFAULT_ORDER = " ORDER BY COALESCE(p.shot_at, p.created_at) DESC, p.id DESC"
+
+
+class RephraseJobs:
+    """The one rephrase of this process (§11.3): the `VoicePreviews` job pattern.
+
+    `run` names the current job; `start` and `cancel` bump it, so an older thread is stale
+    and its result is dropped. `/text/complete` cannot be stopped, so `cancel` never waits:
+    the call runs out on its thread. The state lives in memory, so a reload of `app` loses
+    the job and the page hears a 404.
+    """
+
+    def __init__(self, context: Callable[[], AppContext]) -> None:
+        self._context = context
+        self.lock = threading.Lock()
+        self.run = 0
+        self.state: dict = {}
+        self._threads: list[threading.Thread] = []
+
+    def start(self, key: str, ask: Ask) -> str:
+        """Start a rephrase; a running one is replaced. Returns its job id at once."""
+        job = secrets.token_hex(16)
+        with self.lock:
+            self.run += 1
+            self.state = {"job": job, "key": key, "language": ask.language,
+                          "state": "running", "stage": "starting", "fraction": 0.0}
+            thread = threading.Thread(target=self._run, args=(self.run, ask), daemon=True)
+            self._threads = [held for held in self._threads if held.is_alive()] + [thread]
+            thread.start()
+        return job
+
+    def cancel(self, key: str, job: str) -> bool:
+        with self.lock:
+            if not self._holds(key, job):
+                return False
+            self.run += 1
+            self.state = {}
+            return True
+
+    def snapshot(self, key: str, job: str) -> dict | None:
+        with self.lock:
+            if not self._holds(key, job):
+                return None
+            state = dict(self.state)
+        return {
+            "job": job,
+            "language": state["language"],
+            "state": state["state"],
+            "stage": state.get("stage", ""),
+            # A time estimate, so only the end of the work may reach 100.
+            "percent": min(99, max(0, int(100 * state.get("fraction", 0.0)))),
+            "error": state.get("error"),
+            "result": state.get("result"),
+        }
+
+    def join(self) -> None:
+        """Test seam: wait until no job thread runs, stale ones included."""
+        while True:
+            with self.lock:
+                alive = [held for held in self._threads if held.is_alive()]
+            if not alive:
+                return
+            for held in alive:
+                held.join()
+
+    def _holds(self, key: str, job: str) -> bool:
+        return self.state.get("job") == job and self.state.get("key") == key
+
+    def _run(self, run: int, ask: Ask) -> None:
+        # `ctx.conn` is thread-local (web/deps.py), so this thread uses its own.
+        ctx = self._context()
+
+        def progress(stage: str, fraction: float) -> None:
+            with self.lock:
+                if self.run == run:
+                    self.state = self.state | {"stage": stage, "fraction": fraction}
+
+        try:
+            proposal = propose(ctx.conn, ctx.settings.build_models_client(), ask,
+                               progress=progress, cancelled=lambda: self.run != run)
+        except Cancelled:
+            logger.info("rephrase of memory %s cancelled", ask.group_id)
+        except (NarrationRefused, RephraseRefused) as refused:
+            self._finish(run, {"state": "failed", "error": refused.message})
+        except Exception:  # a failed rephrase must never kill the app
+            logger.exception("rephrase of memory %s failed", ask.group_id)
+            self._finish(run, {"state": "failed",
+                               "error": "The AI did not answer. Nothing changed."})
+        else:
+            self._finish(run, {"state": "done", "result": proposal.as_json()})
+
+    def _finish(self, run: int, outcome: dict) -> None:
+        with self.lock:
+            if self.run == run:
+                kept = {name: self.state[name] for name in ("job", "key", "language")}
+                self.state = kept | outcome
 
 
 def _context_photo_ids(messages: list[dict]) -> set[int]:
@@ -228,6 +359,10 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.feed_run = 0
     # At most ONE film waits behind the running one; a second Regenerate replaces it.
     app.state.feed_queued = None
+    # One voice-model call at a time in this process: a film narration and a voice test
+    # take turns on it (§2.16 E, D52).
+    app.state.voice_calls = threading.Lock()
+    app.state.rephrases = RephraseJobs(context)
 
     def await_feed_build() -> None:
         thread = app.state.feed_build_thread
@@ -255,6 +390,7 @@ def create_app(settings: Settings) -> FastAPI:
         drain_pass(context(), vocab)
 
     register_upload_api(app, context, drain_now)
+    register_voices_api(app, context, templates)
 
     def _filter_where(ctx: AppContext, params: dict[str, str]) -> tuple[str, list]:
         # EXIF facets AND model tags AND date range AND the optional dupes flag.
@@ -402,12 +538,19 @@ def create_app(settings: Settings) -> FastAPI:
         return JSONResponse(snap)
 
     def _repush_slots(client, reported: dict, selected: dict) -> None:
-        if not reported or reported == selected:
+        # `voice` is automatic: the service routes it per request (VoxCPM2 for a saved
+        # voice, Silero for ru) while `selected` holds only the profile default, so
+        # comparing or pushing it would unload the routed voice child on every poll.
+        manual = {
+            slot: key for slot, key in selected.items()
+            if model_catalog.is_switchable(slot, settings.profile)
+        }
+        if not reported or not manual:
             return
-        if not any(model_catalog.is_switchable(slot, settings.profile) for slot in selected):
+        if all(reported.get(slot) == key for slot, key in manual.items()):
             return
         try:
-            client.set_slots(selected)
+            client.set_slots(manual)
         except Exception:  # noqa: BLE001 - best effort; the next poll tries again
             logger.warning("could not push model slots to the models service")
 
@@ -490,8 +633,8 @@ def create_app(settings: Settings) -> FastAPI:
         chosen_slot, _, chosen_key = (select or "").partition(":")
 
         sections = []
-        # `voice` is deliberately absent: which voice narrates a film follows from its
-        # language and the memory's mood (§11.1), so there is nothing to choose.
+        # `voice` is deliberately absent: the film's language picks the voice MODEL (§11.1).
+        # The narrator is chosen per film on /feed, not here.
         for slot in (s for s in model_catalog.SLOTS if s not in model_catalog.AUTOMATIC_SLOTS):
             title, blurb = _SLOT_META[slot]
             switchable = model_catalog.is_switchable(slot, ctx.settings.profile)
@@ -585,9 +728,11 @@ def create_app(settings: Settings) -> FastAPI:
         # The DB is the source of truth; a service that refuses or is down is
         # re-pushed by the next resources poll, so this never rolls back the switch.
         try:
-            ctx.settings.build_models_client().set_slots(
-                model_slots.resolve_keys(ctx.conn, ctx.settings)
-            )
+            ctx.settings.build_models_client().set_slots({
+                slot: key
+                for slot, key in model_slots.resolve_keys(ctx.conn, ctx.settings).items()
+                if model_catalog.is_switchable(slot, ctx.settings.profile)
+            })
         except Exception:  # noqa: BLE001
             logger.warning("model slots stored but not pushed; the next poll retries")
         return _settings_response(request, None)
@@ -640,6 +785,50 @@ def create_app(settings: Settings) -> FastAPI:
         target = f"/photo/{photo_id}" + (f"?{back}" if back else "")
         return RedirectResponse(target, status_code=303)
 
+    def _film_block(key: str, states: dict[str, FilmState], drafts: list[str]) -> dict:
+        """One memory card's film rows, its Retell note, and whether the block polls
+        (§11.1, D36). The first matching state wins; the narrator comes from the film's
+        own cast, never from the current choice. `drafts`: the languages with an edited
+        narration, which a retelling also deletes (D118)."""
+        building, queued = app.state.feed_building, app.state.feed_queued
+        rows = []
+        for code in LANGUAGES:
+            name = language_name(code)
+            state = states.get(code)
+            if building == (key, code):
+                label, text = f"Open {name} film", "being made…"
+            elif queued == (key, code):
+                label, text = f"Open {name} film", "waiting to be made…"
+            elif state is not None and state.ready:
+                label = f"▶ Play {name} film"
+                if state.narrator is None:
+                    text = "ready · voice not recorded"
+                else:
+                    chooser = "your choice" if state.narrator.chosen_by == "user" else "auto"
+                    text = f"ready · {state.narrator.name} ({chooser})"
+            elif state is None:
+                label, text = f"Prepare {name} film", "not made yet"
+            elif state.status == "failed":
+                label, text = f"Prepare {name} film", "the last try failed"
+            elif state.status == "running":
+                label, text = f"Prepare {name} film", "interrupted"
+            else:
+                label, text = f"Prepare {name} film", "no voice"
+            rows.append({"href": f"/feed/{key}?lang={code}", "label": label, "state": text})
+        retell = "Rewrites the title, description and photo order. Makes no film. "
+        if states:
+            retell += f"Deletes the films in: {', '.join(language_name(code) for code in states)}."
+        else:
+            retell += "No film to delete."
+        if drafts:
+            retell += (" Deletes your edited narration in: "
+                       f"{', '.join(language_name(code) for code in drafts)}.")
+        return {
+            "rows": rows,
+            "retell": retell,
+            "polling": any(work is not None and work[0] == key for work in (building, queued)),
+        }
+
     @app.get("/organize", response_class=HTMLResponse)
     def organize(
         request: Request, by: str | None = None, grain: str | None = None
@@ -669,6 +858,7 @@ def create_app(settings: Settings) -> FastAPI:
         # PERSON rather than from the pipeline — hiding them in the player would mean
         # you can only find them by playing the film again.
         notes_by_key: dict[str, list] = {}
+        films_by_key: dict[str, dict] = {}
         if is_memories:
             for album in albums:
                 group_id = group_id_for_album_key(ctx.conn, owner_id, album.key)
@@ -676,12 +866,16 @@ def create_app(settings: Settings) -> FastAPI:
                     found = read_notes(ctx.conn, group_id)
                     if found:
                         notes_by_key[album.key] = found
+                    films_by_key[album.key] = _film_block(album.key, film_states(ctx.conn, group_id),
+                                                         draft_languages(ctx.conn, group_id))
         response = templates.TemplateResponse(
             request,
             "organize.html",
             {
                 "organizers": [(o.name, o.label) for o in ORGANIZERS.values()],
                 "notes_by_key": notes_by_key,
+                # Each memory's films, one row per language, and what Retell deletes (§11.1).
+                "films_by_key": films_by_key,
                 # A memory is being retold: no second one may start while it runs.
                 "retelling": app.state.memories_building,
                 "active": organizer.name,
@@ -798,6 +992,11 @@ def create_app(settings: Settings) -> FastAPI:
         # replaces it.
         building = app.state.feed_building == (key, language)
         queued = app.state.feed_queued == (key, language)
+        states = film_states(ctx.conn, group_id)
+        ready = (presentation is not None and presentation.status == "ready"
+                 and presentation.narration_key is not None
+                 and not building and not queued)
+        narration = narration_rows(ctx.conn, group_id, language)
         return templates.TemplateResponse(
             request,
             "feed.html",
@@ -806,7 +1005,14 @@ def create_app(settings: Settings) -> FastAPI:
                 "title": row["name"],
                 "description": row["description"],
                 "language": language,
-                "languages": [(code, LANGUAGE_DISPLAY[code]) for code in LANGUAGES],
+                # (code, label, done): ✓ on each language whose film plays now (D36).
+                "languages": [
+                    (code, LANGUAGE_DISPLAY[code],
+                     code in states and states[code].ready
+                     and (key, code) not in (app.state.feed_building, app.state.feed_queued))
+                    for code in LANGUAGES
+                ],
+                "language_name": language_name(language),
                 # §13.1 rule 4: close is history.back(); this is only the deep-link
                 # fallback for a feed opened cold from a pasted URL.
                 "origin_url": "/organize?by=memories",
@@ -829,13 +1035,18 @@ def create_app(settings: Settings) -> FastAPI:
                     # make the page unreadable and the tests lie about what it contains.
                     ensure_ascii=False,
                 ).replace("</", "<\\/"),
+                # The film's narration as editable rows, or the user's draft of it
+                # (§11.3); the same `</` rule as the notes.
+                "narration": narration,
+                "narration_json": json.dumps(
+                    narration.as_json(), ensure_ascii=False).replace("</", "<\\/"),
                 # A film with no voice is not a film (§11.1). That holds for STORED
                 # rows too, not just for new builds: rows written before narration
                 # became mandatory are silent, and some carry an English script under a
                 # Russian film. They are offered for re-preparing rather than played.
-                "ready": (presentation is not None and presentation.status == "ready"
-                          and presentation.narration_key is not None
-                          and not building and not queued),
+                "ready": ready,
+                # Who narrates THIS film, from its own cast (D42); None = not recorded.
+                "this_film": film_narrator(presentation.decisions) if ready else None,
                 "has_music": bool(presentation and presentation.music_key),
                 "has_narration": bool(presentation and presentation.narration_key),
                 # Keyed by (key, language) so preparing English does not make Russian
@@ -843,6 +1054,10 @@ def create_app(settings: Settings) -> FastAPI:
                 "building": building or queued,
                 # Set when Regenerate was refused because another film is being made.
                 "busy": busy,
+                # Who narrates the next film (D18): Automatic, a preset or a saved voice.
+                # A stored choice that cannot narrate is one more option, still selected —
+                # never shown as Automatic (D33, D38).
+                "picker": _narrator_picker(ctx, group_id, language),
                 # What a READY film is missing and why (no music), so a silent film
                 # explains itself instead of looking broken.
                 "missing": (presentation.error
@@ -855,6 +1070,121 @@ def create_app(settings: Settings) -> FastAPI:
                 ),
             },
         )
+
+    def _blocked_label(voice: SavedVoice, problem: str, language: str) -> str:
+        """The picker label of a saved voice that cannot narrate a `language` film, as
+        `film_take`'s problem names it (§11.1)."""
+        name = voice.name
+        if problem == "language":
+            return f"«{name}» — no {language_name(language)} take"
+        if problem == "waiting" and app.state.voice_hearings.hears(voice.id):
+            return f"«{name}» — hearing its words"
+        if problem == "waiting":
+            return f"«{name}» — words not heard yet (open it under Voices)"
+        if problem == "unusable":
+            return f"«{name}» — no {language_name(language)} take with usable words"
+        return f"«{name}» — being deleted"
+
+    def _narrator_picker(ctx: AppContext, group_id: int, language: str) -> dict:
+        """The narrator select of both feed forms (§11.1, D78): the presets of the
+        language, the saved voices ready for it, every other saved voice as a disabled
+        option with its reason, the selected value ("" = Automatic), the stored choice
+        that cannot narrate now as `(group, value, label)` or None, the voice that needs a
+        take for this film as `(id, name)` or None, and whether voice copy speaks the
+        language here. Decided from the catalog, this app's profile and the stored takes —
+        no call to the models service."""
+        owner_id = ctx.settings.owner_id
+        clones = cloning_entry_for(ctx.settings.profile, language) is not None
+        cast = castable_takes(ctx.conn, owner_id, language) if clones else []
+        narrating = {voice.id for voice, _ in cast}
+        blocked = [
+            (str(voice.id), _blocked_label(
+                voice, film_take(ctx.conn, owner_id, voice.id, language).problem, language))
+            for voice in (list_voices(ctx.conn, owner_id) if clones else [])
+            if not voice.deleting and voice.id not in narrating
+        ]
+        picker = {
+            "presets": [(f"preset:{speaker.name}",
+                         f"{speaker.name} — {speaker.gender}, {speaker.register}: {speaker.note}")
+                        for speaker in offered(language)],
+            "saved": [(str(voice.id), voice.name) for voice, _ in cast],
+            "saved_blocked": blocked,
+            "selected": "",
+            "unavailable": None,
+            "needs_take": None,
+            "voice_copy": clones,
+        }
+        choice = read_narrator(ctx.conn, group_id, language)
+        if choice is None:
+            return picker
+        if choice.preset_speaker is not None:
+            found = resolve(language, choice.preset_speaker)
+            if found is not None:
+                return picker | {"selected": f"preset:{found}"}
+            value = f"preset:{choice.preset_speaker}"
+            return picker | {"selected": value, "unavailable": (
+                "preset", value,
+                f"«{choice.preset_speaker}» — not offered for {language_name(language)} films")}
+        voice = (get_voice(ctx.conn, owner_id, choice.voice_id)
+                 if choice.voice_id is not None else None)
+        if voice is None:
+            unavailable = ("deleted", "A deleted saved voice")
+        elif voice.deleting:
+            unavailable = (str(voice.id), f"«{voice.name}» — being deleted")
+        elif not clones:
+            unavailable = (str(voice.id),
+                           f"«{voice.name}» — voice copy is not available on this device")
+        elif voice.id not in narrating:
+            # The stored choice stays selected, once, with the label of its disabled option.
+            problem = film_take(ctx.conn, owner_id, voice.id, language).problem
+            unavailable = (str(voice.id), _blocked_label(voice, problem, language))
+            picker = picker | {
+                "saved_blocked": [option for option in blocked if option[0] != str(voice.id)],
+                "needs_take": (voice.id, voice.name) if problem != "deleting" else None,
+            }
+        else:
+            return picker | {"selected": str(voice.id)}
+        return picker | {"selected": unavailable[0], "unavailable": ("saved", *unavailable)}
+
+    def _store_narrator(group_id: int, language: str, narrator: str) -> None:
+        """Validate and store the posted narrator, BEFORE any build starts or queues.
+        "" = Automatic, "preset:<name>" = a catalog speaker, else a saved voice id, which
+        must be ready for the language (`film_take`, §11.1). Raises 404/409
+        with the reason the feed form shows (D38): the film failure's own text."""
+        ctx = context()
+        owner_id = ctx.settings.owner_id
+        if narrator == "":
+            set_narrator(ctx.conn, group_id, language, None)
+            return
+        if narrator.startswith("preset:"):
+            name = narrator.removeprefix("preset:").strip()
+            found = resolve(language, name)
+            if found is not None:
+                set_narrator(ctx.conn, group_id, language, preset_speaker=found)
+                return
+            if name and any(resolve(code, name) for code in LANGUAGES if code != language):
+                raise HTTPException(status_code=409, detail=(
+                    f"«{name}» cannot narrate in {language_name(language)}. "
+                    "Choose another narrator."))
+            raise HTTPException(status_code=404, detail="Unknown preset voice.")
+        if narrator == "deleted":
+            raise HTTPException(status_code=409, detail=(
+                "The saved voice chosen for this film was deleted. Choose another narrator."))
+        voice = get_voice(ctx.conn, owner_id, int(narrator)) if narrator.isascii() and narrator.isdigit() else None
+        if voice is None:
+            raise HTTPException(status_code=404, detail="Unknown saved voice.")
+        if cloning_entry_for(ctx.settings.profile, language) is None:
+            raise HTTPException(status_code=409, detail=(
+                f"«{voice.name}» cannot narrate: voice copy is not available on this device."))
+        problem = film_take(ctx.conn, owner_id, voice.id, language).problem
+        if problem is not None:
+            raise HTTPException(status_code=409,
+                                detail=_cannot_narrate(voice.name, problem, language))
+        try:
+            set_narrator(ctx.conn, group_id, language, voice.id)
+        except VoiceDeleting as error:  # deleted in the gap since the checks above
+            raise HTTPException(status_code=409, detail=_cannot_narrate(
+                voice.name, "deleting", language)) from error
 
     def _stale_reason(presentation) -> str | None:
         """Why this film is not being played, or None when it is fine.
@@ -919,6 +1249,128 @@ def create_app(settings: Settings) -> FastAPI:
         delete_note(ctx.conn, _memory_group(key), note_id)
         return RedirectResponse(f"/feed/{key}", status_code=303)
 
+    _REFUSAL_STATUS = {"stale": 409, "missing": 404, "empty": 400, "empty_text": 400,
+                       "bracket": 400, "too_long": 400}
+
+    def _narration_reply(change: Callable[[], NarrationRows]) -> JSONResponse:
+        """The whole payload after a narration change, or the refusal (§2.19 D, D114)."""
+        try:
+            rows = change()
+        except NarrationRefused as refused:
+            return JSONResponse(
+                {"saved": False, "error": refused.code, "message": refused.message},
+                status_code=_REFUSAL_STATUS[refused.code])
+        return JSONResponse({"saved": True, **rows.as_json()})
+
+    @app.get("/feed/{key}/narration")
+    def feed_narration(key: str, lang: str | None = None) -> JSONResponse:
+        """The narration rows the panel shows; "Load the current narration" reads it."""
+        group_id = _memory_group(key)
+        return JSONResponse(narration_rows(context().conn, group_id, _language(lang)).as_json())
+
+    @app.post("/feed/{key}/narration/{n:int}")
+    def feed_narration_save(
+        key: str, n: int, lang: str | None = Form(default=None), source: str = Form(default=""),
+        draft: str = Form(default=""), revision: int = Form(default=0),
+        text: str = Form(default=""),
+    ) -> JSONResponse:
+        """Change the words of passage `n`; an empty text removes it. JSON, like a note,
+        so the film keeps its place."""
+        group_id = _memory_group(key)
+        return _narration_reply(lambda: save_passage(
+            context().conn, group_id, _language(lang), n, text,
+            source=source, draft=draft, revision=revision))
+
+    @app.post("/feed/{key}/narration/{n:int}/delete")
+    def feed_narration_delete(
+        key: str, n: int, lang: str | None = Form(default=None), source: str = Form(default=""),
+        draft: str = Form(default=""), revision: int = Form(default=0),
+    ) -> JSONResponse:
+        group_id = _memory_group(key)
+        return _narration_reply(lambda: remove_passage(
+            context().conn, group_id, _language(lang), n,
+            source=source, draft=draft, revision=revision))
+
+    @app.post("/feed/{key}/narration/discard")
+    def feed_narration_discard(
+        key: str, lang: str | None = Form(default=None), source: str = Form(default=""),
+        draft: str = Form(default=""), revision: int = Form(default=0),
+    ) -> JSONResponse:
+        """"Write a new story": drop the edited narration; the next build tells anew."""
+        group_id = _memory_group(key)
+        return _narration_reply(lambda: discard_draft(
+            context().conn, group_id, _language(lang),
+            source=source, draft=draft, revision=revision))
+
+    @app.post("/feed/{key}/narration/rewrite")
+    def feed_narration_rewrite(
+        key: str, lang: str | None = Form(default=None), source: str = Form(default=""),
+        draft: str = Form(default=""), revision: int = Form(default=0),
+        changes: str = Form(default="[]"),
+    ) -> JSONResponse:
+        """Use this: the proposal's whole patch, in one write or none (§11.3)."""
+        group_id = _memory_group(key)
+        try:
+            patch = read_changes(changes)
+        except RephraseRefused as refused:
+            return JSONResponse({"saved": False, "error": "unreadable",
+                                 "message": refused.message}, status_code=400)
+        return _narration_reply(lambda: rewrite_passages(
+            context().conn, group_id, _language(lang), patch,
+            source=source, draft=draft, revision=revision))
+
+    @app.post("/feed/{key}/narration/rephrase")
+    def feed_narration_rephrase(
+        key: str, lang: str | None = Form(default=None), source: str = Form(default=""),
+        draft: str = Form(default=""), revision: int = Form(default=0),
+        request: str = Form(default=""), history: str = Form(default="[]"),
+        proposal: str = Form(default="[]"),
+    ) -> JSONResponse:
+        """Start one rephrase and answer at once (§11.3). It writes nothing."""
+        ctx = context()
+        group_id = _memory_group(key)
+        language = _language(lang)
+        if (key, language) in (app.state.feed_building, app.state.feed_queued):
+            return JSONResponse(
+                {"error": "building",
+                 "message": "This film is being made. Ask again when it is ready."},
+                status_code=409)
+        posted = (source, draft, revision)
+        try:
+            _check_fresh(narration_rows(ctx.conn, group_id, language), posted)
+            ask = Ask(group_id, language, posted, clean_request(request),
+                      read_history(history), read_changes(proposal), planner_model())
+        except NarrationRefused as refused:
+            return JSONResponse({"error": refused.code, "message": refused.message},
+                                status_code=_REFUSAL_STATUS[refused.code])
+        except RephraseRefused as refused:
+            return JSONResponse({"error": "unreadable", "message": refused.message},
+                                status_code=400)
+        return JSONResponse({"job": app.state.rephrases.start(key, ask)}, status_code=202)
+
+    @app.get("/feed/{key}/narration/rephrase/{job}")
+    def feed_narration_rephrase_state(key: str, job: str) -> JSONResponse:
+        """The job's stage and percent, then its result. A result is compared with the
+        current rows on every read, so an old answer never looks current."""
+        group_id = _memory_group(key)
+        state = app.state.rephrases.snapshot(key, job)
+        if state is None:
+            raise HTTPException(status_code=404)
+        result = state.get("result")
+        if result is not None:
+            base = result["base"]
+            current = narration_rows(context().conn, group_id, state["language"]).triple
+            state["outdated"] = (base["source"], base["draft"], base["revision"]) != current
+        return JSONResponse(state)
+
+    @app.post("/feed/{key}/narration/rephrase/{job}/cancel")
+    def feed_narration_rephrase_cancel(key: str, job: str) -> JSONResponse:
+        """Drop the job for the page. Never waits: the model call cannot be stopped."""
+        _memory_group(key)
+        if not app.state.rephrases.cancel(key, job):
+            raise HTTPException(status_code=404)
+        return JSONResponse({"cancelled": True})
+
     @app.post("/feed/{key}/rebuild")
     def feed_rebuild(key: str) -> RedirectResponse:
         """Retell THIS memory: a new title, description and photo order (§11).
@@ -975,9 +1427,23 @@ def create_app(settings: Settings) -> FastAPI:
         return Response(ctx.audio.read(blob), media_type="audio/wav")
 
     @app.post("/feed/{key}/prepare")
-    def feed_prepare(key: str, lang: str = Form(default="")) -> RedirectResponse:
+    async def feed_prepare(request: Request, key: str) -> RedirectResponse:
+        # The raw form, not `narrator: str | None = Form(None)`: FastAPI turns an EMPTY
+        # form value into the default, so "" (Automatic) and an absent field (no picker
+        # on the page: keep the stored choice, D18) would both arrive as None.
+        form = await request.form()
+        lang = form.get("lang", "")
+        narrator = form.get("narrator")
+        return await run_in_threadpool(
+            _prepare, key, lang if isinstance(lang, str) else "",
+            narrator if isinstance(narrator, str) or narrator is None else "",
+        )
+
+    def _prepare(key: str, lang: str, narrator: str | None) -> RedirectResponse:
         language = _language(lang)
-        _memory_group(key)          # 404 early rather than inside the thread
+        group_id = _memory_group(key)   # 404 early rather than inside the thread
+        if narrator is not None:
+            _store_narrator(group_id, language, narrator)
         if app.state.feed_building is None:
             _start_film(key, language)
             return RedirectResponse(f"/feed/{key}?lang={language}", status_code=303)
@@ -1017,7 +1483,9 @@ def create_app(settings: Settings) -> FastAPI:
                 build_presentation(ctx.conn, client, ctx.audio, owner_id, group_id,
                                    language=language, planner_model=model,
                                    progress=on_progress,
-                                   cancelled=lambda: app.state.feed_run != run_id)
+                                   cancelled=lambda: app.state.feed_run != run_id,
+                                   voices=ctx.voices, voice_lock=app.state.voice_calls,
+                                   profile=ctx.settings.profile)
             except Cancelled:
                 logger.info("film for %s (%s) cancelled", key, language)
             except NarrationFailed as exc:
@@ -1034,6 +1502,12 @@ def create_app(settings: Settings) -> FastAPI:
                 # ...but it IS the thread that just released the GPU, so it hands off
                 # to anything queued either way. Cancel leaves nothing queued; a
                 # Regenerate-while-busy queues itself and starts here.
+                # A build may leave a replaced conditioning blob (§2.7): drain it now,
+                # not at the next delete or restart.
+                try:
+                    app.state.voice_drain.wake()
+                except Exception:  # a cleanup must never block the queued film
+                    logger.exception("waking the voice drain after %s (%s) failed", key, language)
                 queued = app.state.feed_queued
                 app.state.feed_queued = None
                 if queued is not None:
@@ -1755,10 +2229,30 @@ def create_app(settings: Settings) -> FastAPI:
     return app
 
 
+def log_albums_to(path: Path) -> list[logging.Handler]:
+    """Send the `albums` loggers (the memories build) to the terminal AND `path`.
+
+    A build runs on a background thread, so its skip reasons only exist as log
+    lines; the file keeps them after the terminal has scrolled away. The stream
+    handler is needed too — once `albums` has any handler, Python's last-resort
+    stderr output no longer applies to it.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handlers: list[logging.Handler] = [logging.StreamHandler(), logging.FileHandler(path)]
+    albums = logging.getLogger("albums")
+    for handler in handlers:
+        handler.setFormatter(logging.Formatter("%(asctime)s %(name)s: %(message)s"))
+        albums.addHandler(handler)
+    albums.setLevel(logging.WARNING)
+    return handlers
+
+
 def app_factory() -> FastAPI:
     from config import get_settings
 
-    return create_app(get_settings())
+    settings = get_settings()
+    log_albums_to(settings.data_dir / "memories.log")
+    return create_app(settings)
 
 
 

@@ -65,7 +65,8 @@ def seed_candidates(
     sub-city movement — or on a capture gap of more than 6 h at home / 36 h while
     staying in the same region away from home, so a multi-day trip is ONE candidate
     and ordinary days at home stay separate. Photos with no GPS never force a
-    split; they extend the current run. Runs shorter than `min_size` are dropped.
+    split; they extend the current run. Photos with no date pool by upload folder
+    instead. Runs shorter than `min_size` are dropped.
     """
     rows = conn.execute(
         "SELECT id, shot_at, gps_lat, gps_lon FROM photos"
@@ -95,6 +96,31 @@ def seed_candidates(
         if cell is not None:
             last_cell = cell
 
+    runs.extend(_undated_runs(conn, owner_id))
     candidates = [Candidate(ids) for ids in runs if len(ids) >= min_size]
     candidates.sort(key=lambda c: c.photo_ids[0], reverse=True)  # newest first
     return candidates
+
+
+def _undated_runs(conn: sqlite3.Connection, owner_id: int) -> list[list[int]]:
+    """Captioned photos with NO capture date, one run per upload folder.
+
+    Pooling only bounds context (§11), so a photo with no EXIF date — a scan, a
+    stripped export — must not be kept out of every memory. Its folder is the one
+    grouping the owner gave it; a photo uploaded from several folders goes by its
+    first source.
+    """
+    rows = conn.execute(
+        "SELECT p.id, (SELECT s.rel_path FROM photo_sources s WHERE s.photo_id = p.id"
+        "              ORDER BY s.id LIMIT 1) AS rel_path"
+        " FROM photos p"
+        " WHERE p.owner_id = ? AND p.thumb_key IS NOT NULL"
+        " AND p.shot_at IS NULL AND p.caption IS NOT NULL"
+        " ORDER BY p.id",
+        (owner_id,),
+    ).fetchall()
+    folders: dict[str, list[int]] = {}
+    for row in rows:
+        folder = (row["rel_path"] or "").rpartition("/")[0]
+        folders.setdefault(folder, []).append(row["id"])
+    return list(folders.values())

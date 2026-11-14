@@ -1,6 +1,16 @@
 """The director (design §11.1) — pure, deterministic, no model, no I/O."""
 
-from feed.director import GRADES, direct, with_lines
+from itertools import pairwise
+
+import feed.director
+from feed.director import (
+    GRADES,
+    direct,
+    with_arrangement,
+    with_lines,
+    with_narration_timing,
+    with_script,
+)
 from feed.signals import ShotSignal
 
 
@@ -254,3 +264,42 @@ def test_a_burst_frame_gets_a_single_beat():
 
     for shot in direct([sig(1), sig(2), sig(3)]).shots:
         assert len(shot.beats) <= effects.MAX_BEATS
+
+
+def test_with_script_keeps_the_told_order_and_drops_an_index_out_of_range():
+    edit = direct(LAND)
+    script = ((2, "a"), (0, "b"), (2, "c"), (9, "gone"), (1, "d"))
+    assert [s.photo_id for s in with_script(edit, script).shots] == [3, 1, 3, 2]
+
+
+def test_nothing_sorts_the_passages_into_memory_order():
+    assert not hasattr(feed.director, "_in_memory_order")
+
+
+# A conductor that would reorder the film: shot numbers 2, 4, 1, 3, with times that
+# overlap.
+SHUFFLED = [{"shot": n, "at": at, "seconds": 2.0}
+            for n, at in ((2, 0.0), (4, 0.5), (1, 9.0), (3, 1.0))]
+
+
+def _monotonic(shots):
+    return all(b.at >= a.at + a.seconds - 1e-6 for a, b in pairwise(shots))
+
+
+def test_keep_order_keeps_the_shots_where_the_story_put_them():
+    edit = direct(LAND)
+    shots = with_arrangement(edit, SHUFFLED, keep_order=True).shots
+    assert [s.photo_id for s in shots] == [1, 2, 3, 4]
+    assert _monotonic(shots)
+
+
+def test_without_keep_order_the_conductor_may_reorder_a_film_with_no_script():
+    shots = with_arrangement(direct(LAND), SHUFFLED).shots
+    assert [s.photo_id for s in shots] == [2, 4, 1, 3]
+
+
+def test_keep_timing_keeps_the_order_and_the_voices_clock():
+    timed = with_narration_timing(direct(LAND), [{"start": t} for t in (0, 2, 5, 7)], 10.0)
+    shots = with_arrangement(timed, SHUFFLED, keep_timing=True).shots
+    assert [s.photo_id for s in shots] == [1, 2, 3, 4]
+    assert [(s.at, s.seconds) for s in shots] == [(0, 2), (2, 3), (5, 2), (7, 3)]

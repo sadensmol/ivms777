@@ -19,20 +19,30 @@
   <div class="album-info">
     <h2>{{ album.title }}</h2>
     <p class="album-desc">{{ album.description }}</p>
-    {% if play_url %}
-      {# The feed is a LEAF under this grid (§13.1): a plain <a>, never boosted, so
-         history stays [grid, leaf] and close can restore the grid from bfcache. #}
-      <a class="album-play" href="{{ play_url }}">▶ Play</a>
-      {# Retell THIS memory — a new description and a better ORDER for its photographs
-         (§11). It belongs here, on the memory, not on the film screen: it changes the
-         memory, and every film made of it follows. #}
-      <form class="album-retell" method="post" action="/feed/{{ album.key }}/rebuild">
-        <button type="submit" {{ 'disabled' if retelling else '' }}
-                title="Rebuild this memory: a new description and a better order for
-its photos. Its film must then be prepared again.">
-          {{ '↻ Retelling…' if retelling else '↻ Rebuild' }}
-        </button>
-      </form>
+    {% if play_url and films %}
+      {# One keyed block per memory (§11.1, D36): the film rows, Retell and its note.
+         It refreshes in place — it polls while a film of this memory is being made or
+         waits, and organize.html swaps it after a bfcache return — so the grid keeps
+         its scroll and its open notes. The notes stay outside it. #}
+      <div class="album-film-block" id="films-{{ album.key }}"
+           {% if films.polling %}hx-get="/organize?by=memories" hx-select="#films-{{ album.key }}"
+           hx-trigger="every 1500ms" hx-swap="outerHTML"{% endif %}>
+        {# Each film is a LEAF under this grid (§13.1): a plain <a>, never boosted, so
+           history stays [grid, leaf] and close can restore the grid from bfcache. #}
+        <ul class="album-films">
+          {% for row in films.rows %}
+            <li><a class="album-film" href="{{ row.href }}">{{ row.label }}</a> · <span class="album-film-state">{{ row.state }}</span></li>
+          {% endfor %}
+        </ul>
+        {# Retell THIS memory (§11). It belongs on the memory, not on the film screen:
+           it changes the memory, and every film made of it follows. #}
+        <form class="album-retell" method="post" action="/feed/{{ album.key }}/rebuild">
+          <button type="submit" {{ 'disabled' if retelling else '' }}>
+            {{ '↻ Retelling…' if retelling else '↻ Retell memory' }}
+          </button>
+        </form>
+        <p class="album-retell-note">{{ films.retell }}</p>
+      </div>
     {% endif %}
     {% if notes %}
       {# What the VIEWER said about this memory, typed while watching (§11.3). Shown

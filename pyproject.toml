@@ -43,6 +43,18 @@ models = [
     # replaced Stable Audio Open, whose SDE sampler drives `torchsde` into
     # non-terminating recursion on this torch/Python stack (see audio/musicgen.py).
     "kokoro>=0.9.2",
+    # kokoro's English G2P (misaki) loads this spaCy model, and when it is missing it
+    # INSTALLS it at runtime (`uv pip install`) from inside the voice child — which
+    # the next `uv sync` then removes, because the lockfile never knew it. The child
+    # died mid-load on every restart ("could not speak en (EOFError)"). Declared, so
+    # sync installs it and keeps it. The version follows spaCy's 3.8 compatibility.
+    "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
+    # Voice copy (design §4.1): VoxCPM2 speaks a SAVED voice from its example clip.
+    # Pinned: the child's conditioning blobs are bound to this exact version. mac/cloud only.
+    "voxcpm==2.0.3",
+    # The speaker-similarity meter (design §4.1): ECAPA-TDNN of a saved voice's takes and
+    # a test. Pinned: `audio/speaker_embed.py` loads through this version's fetch API.
+    "speechbrain==1.1.2",
 ]
 
 [dependency-groups]
@@ -56,6 +68,10 @@ dev = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+# The spaCy model in the `models` extra is a wheel URL (it is not on PyPI).
+[tool.hatch.metadata]
+allow-direct-references = true
+
 # Flat layout: the source lives at the repo root (no package folder), so ship
 # each top-level package plus the config module explicitly.
 [tool.hatch.build.targets.wheel]
@@ -68,3 +84,7 @@ addopts = "-m 'not slow'"
 
 [tool.ruff]
 line-length = 100
+
+# voxcpm declares funasr, which pulls kaldiio (an evaluation-only licence); voxcpm 2.0.3 never imports funasr.
+[tool.uv]
+override-dependencies = ["funasr; sys_platform == 'never'"]

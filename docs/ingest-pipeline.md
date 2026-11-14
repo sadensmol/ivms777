@@ -111,7 +111,8 @@ listed in the UI. One bad file never stalls the queue.
 **A backend outage never blocks the GPU-free stages, and never fails an upload.** A
 drain pass (`ingest/pipeline.py::drain_pass`, shared by the `worker` loop and the
 app's inline drain) runs in two groups: first the **GPU/inference-free** stages —
-thumbnail, EXIF place facets, folder deletions — then the **embedder/inference**
+thumbnail, EXIF place facets, folder deletions, saved-voice deletions
+(`process_voice_deletions`, §6) — then the **embedder/inference**
 stages (embed, taxonomy, caption, and the batched caption_embed). The embedder (`RemoteEmbedder`, an HTTP shim over
 the `models` service, §5.1) is built **inside the pass**, not eagerly at process
 start; if a call through it fails — e.g. the `models` service is unreachable, or its

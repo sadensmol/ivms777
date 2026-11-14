@@ -76,10 +76,14 @@ initChat();
 // a frozen (bfcache) snapshot of this page — which can be stale or empty. Chat
 // history is authoritative in the DB and re-rendered server-side, so on a restored
 // back-navigation, reload to show the real current conversation, never a snapshot.
-// Register once on window so a boosted re-run of this script does not stack it.
+// Register once on window so a boosted re-run of this script does not stack it. The
+// listener outlives a boosted move to another page, so it reloads only the CHAT page:
+// Organize restores from bfcache with its scroll and open notes.
 if (!window.__chatPageshowWired) {
   window.__chatPageshowWired = true;
-  window.addEventListener("pageshow", (e) => { if (e.persisted) location.reload(); });
+  window.addEventListener("pageshow", (e) => {
+    if (e.persisted && document.getElementById("chat-q")) location.reload();
+  });
 }
 
 // One assistant turn: a bubble that starts as a processing indicator and is

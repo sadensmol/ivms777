@@ -74,8 +74,13 @@ class ShotSignal:
         return " · ".join(parts)
 
 
-def digest(signals: list["ShotSignal"]) -> str:
+def digest(signals: list["ShotSignal"], *, guesses: bool = True) -> str:
     """What the MEMORY as a whole is, in a few lines.
+
+    `guesses=False` keeps only the hard facts — count, time, place, camera — and drops
+    the zero-shot labels. The story WRITER gets that version: the labels are guesses at
+    0.2-0.6 confidence, and it narrated them as facts ("it rained", "it was boring")
+    over photographs that showed neither (§11.1).
 
     The per-shot briefs say what each photograph contains; this says what the day was.
     A writer given only three captions writes three captions — it needs to know that
@@ -98,7 +103,7 @@ def digest(signals: list["ShotSignal"]) -> str:
     where = ", ".join(places + [c for c in countries if c not in places])
     if where:
         lines.append(f"Where: {where}.")
-    for dimension, label in (
+    for dimension, label in () if not guesses else (
         ("occasion", "What kind of occasion"), ("vibe", "Mood"),
         ("emotion", "Feeling"), ("season_weather", "Season and weather"),
         ("light", "Light"), ("setting", "Setting"), ("subject", "Mostly of"),

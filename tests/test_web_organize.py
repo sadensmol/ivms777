@@ -1,3 +1,5 @@
+import re
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -68,3 +70,19 @@ def test_choosing_an_organization_type_shows_its_albums(client):
 
 def test_unknown_type_falls_back_to_default(client):
     assert client.get("/organize?by=nonsense").status_code == 200
+
+
+def test_organize_no_longer_links_to_voices(client):
+    body = client.get("/organize").text
+    head = body[body.index('<div class="organize-head">'):body.index("</form>", body.index(
+        '<div class="organize-head">'))]
+    assert "/organize/voices" not in body
+    assert 'href="/voices"' not in head
+
+
+def test_the_nav_lists_five_destinations_in_order(client):
+    body = client.get("/library").text
+    nav = body[body.index('<nav class="nav"'):body.index("</nav>")]
+    assert re.findall(r'<a href="(/[a-z]+)">', nav) == [
+        "/upload", "/library", "/chat", "/organize", "/voices"]
+    assert 'id="settings-open"' in nav

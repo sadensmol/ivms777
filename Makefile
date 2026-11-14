@@ -72,10 +72,15 @@ MODELS_PORT  ?= 9100
 # what made Russian narration "not work" long after the code was right. The watch list
 # is scoped rather than the whole repo so an edit to web/ or feed/ does not drop the
 # resident models mid-generation.
-models: ## Pre-fetch the SELECTED slots' weights into the shared cache (idempotent)
+models: ## Download every model the app needs (idempotent); a failed download stops `make up`
 	@echo "  syncing the models extra (torch/transformers) for the native models service…"
 	@uv sync --extra models
-	@uv run --no-sync python -m scripts.fetch_models
+	@# Same data dir and profile as `up`: a URL model (Silero) lands in DATA_DIR/models,
+	@# and without these it went to the container default /data — absent on a Mac, so the
+	@# download failed and Russian narration had no voice.
+	@IVMS777_PROFILE="$${IVMS777_PROFILE:-mac}" \
+	 IVMS777_DATA_DIR="$${IVMS777_DATA_DIR:-$$HOME/.ivms777}" \
+	 uv run --no-sync python -m scripts.fetch_models
 
 up: llama-mac models ## Ensure host llama-server + weights, then run models + worker + app NATIVELY → http://localhost:8000
 	@mkdir -p "$$HOME/.ivms777"
@@ -112,7 +117,7 @@ llama-mac: ## Build (if needed) + start the host-native llama-server (Metal) on 
 	  echo "  reusing cached llama-server ($(LLAMA_BIN)) — no build."; \
 	fi
 	@for PORT in $(LLAMA_PORT) $(MODELS_PORT); do \
-	  HOLDER=$$(lsof -nP -iTCP:$$PORT -sTCP:LISTEN 2>/dev/null | awk 'NR==2 {print $$1" (pid "$$2")"}'); \
+	  HOLDER=$$(lsof +c 0 -nP -iTCP:$$PORT -sTCP:LISTEN 2>/dev/null | awk 'NR==2 {print $$1" (pid "$$2")"}'); \
 	  if [ -n "$$HOLDER" ] && ! echo "$$HOLDER" | grep -q llama-server; then \
 	    echo "  port $$PORT is already held by $$HOLDER."; \
 	    echo "  Free it, or run: make up LLAMA_PORT=<free> MODELS_PORT=<free>"; \

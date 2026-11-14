@@ -1,0 +1,38 @@
+{# The Voices grid's cards (design §13). GET /voices/list and POST /voices answer this
+   fragment; voices.js swaps it in for #voice-cards. A voice being deleted is a <div>
+   with `data-deleting` and no link — the grid polls /voices/list every 2 s while one is
+   shown. The card of a voice just created carries `data-created`. Each card names its
+   takes per language and the languages it is ready for (§11.1); no card names a take for
+   films. #}
+<div id="voice-cards" class="voice-cards">
+  {% if not voices %}
+    <p class="hint">No voices yet.</p>
+  {% endif %}
+  {% for voice in voices %}
+    {% if voice.deleting %}
+      <div class="voice-card voice-pending" data-voice-id="{{ voice.id }}" data-deleting>
+        <span class="voice-card-name">{{ voice.name }}</span>
+        <span class="voice-deleting">deleting…</span>
+      </div>
+    {% else %}
+      <a class="voice-card" href="/voices/{{ voice.id }}" data-voice-id="{{ voice.id }}"{% if created == voice.id %} data-created{% endif %}>
+        <span class="voice-card-name">{{ voice.name }}</span>
+        {% set kept = voice.examples|rejectattr('deleting')|list %}
+        {% for code, language in all_languages %}
+          {% set takes = kept|selectattr('language', 'equalto', code)|list %}
+          {% if takes %}
+            <span class="voice-card-line">{{ language }} · {{ (takes|sum(attribute='seconds'))|clock }} · {{ takes|length }} take{{ 's' if takes|length != 1 else '' }}</span>
+          {% endif %}
+        {% endfor %}
+        {% if not kept %}
+          <span class="voice-card-line muted">No takes yet</span>
+        {% endif %}
+        {% if ready[voice.id] %}
+          <span class="voice-card-ready">For films: {{ ready[voice.id]|join(', ') }}</span>
+        {% else %}
+          <span class="voice-card-ready voice-card-unready">Not ready for films yet</span>
+        {% endif %}
+      </a>
+    {% endif %}
+  {% endfor %}
+</div>

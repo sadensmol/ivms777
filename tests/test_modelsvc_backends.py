@@ -403,3 +403,678 @@ def test_composite_passes_the_whole_score_to_the_music_backend():
     backend.music(sections=[{"brief": "piano", "seconds": 4}], temperature=1.2, guidance=4.0)
     assert music.calls[0]["sections"] == [{"brief": "piano", "seconds": 4}]
     assert music.calls[0]["temperature"] == 1.2 and music.calls[0]["guidance"] == 4.0
+
+
+_REFS = {"saved:1": {"audio": b"RIFF", "sha256": "ab", "language": "en",
+                     "transcript": None, "conditioning": []}}
+_VOXCPM_REVISION = "32279effe8c19989596f05d353d1447f51d9e915"
+
+
+class _CloningVoice:
+    """A voice sub-backend that answers as the given model + revision."""
+
+    def __init__(self, model="voxcpm2", revision=_VOXCPM_REVISION):
+        self.reply = {"audio": b"RIFF", "sample_rate": 48000, "model": model,
+                      "revision": revision, "conditioning": {}}
+        self.calls = []
+
+    def speak(self, text, voice, segments=None, voices=None, references=None):
+        self.calls.append((text, voice, segments, voices, references))
+        return self.reply
+
+
+class _CloningSlots:
+    """A SlotManager stub that routes a saved voice to `voxcpm2`, or to nothing."""
+
+    def __init__(self, can: bool = True):
+        self.can = can
+        self.asked: list[tuple[str, bool]] = []
+
+    def has_unit(self, unit):
+        return True
+
+    def ensure_voice_for(self, language, *, cloning=False):
+        self.asked.append((language, cloning))
+        return self.can
+
+    def entry(self, slot):
+        from models import catalog
+
+        return catalog.get("voice", "voxcpm2")
+
+
+def test_a_saved_voice_routes_to_the_cloning_entry_on_the_voice_unit_at_batch():
+    from modelsvc.scheduler import Priority
+
+    voice, slots, scheduler = _CloningVoice(), _CloningSlots(), _RecordingScheduler()
+    backend = CompositeBackend(embed=None, voice=voice, slots=slots, scheduler=scheduler)
+    result = backend.speak("hi", "ru", "saved:1", ["hi"], ["saved:1"], references=_REFS)
+    assert result["model"] == "voxcpm2"
+    assert slots.asked == [("ru", True)]
+    assert scheduler.seen == [(("voice",), Priority.BATCH)]
+    assert voice.calls == [("hi", "saved:1", ["hi"], ["saved:1"], _REFS)]
+
+
+def test_a_preset_request_still_routes_without_the_cloning_flag():
+    slots = _CloningSlots()
+    backend = CompositeBackend(embed=None, voice=_Voice(), slots=slots,
+                               scheduler=_RecordingScheduler())
+    backend.speak("hi", "en")
+    assert slots.asked == [("en", False)]
+
+
+def test_no_voice_copy_for_the_language_is_cloning_unavailable():
+    from modelsvc.backends.base import CloningUnavailable
+
+    voice = _CloningVoice()
+    backend = CompositeBackend(embed=None, voice=voice, slots=_CloningSlots(can=False),
+                               scheduler=_RecordingScheduler(), profile="jetson")
+    with pytest.raises(CloningUnavailable, match="no voice-copy model speaks en on jetson"):
+        backend.speak("hi", "en", "saved:1", references=_REFS)
+    assert voice.calls == []
+
+
+@pytest.mark.parametrize(("model", "revision"), [
+    ("kokoro-82m", None),                 # a preset child answered
+    ("voxcpm2", "0" * 40),                # another Hub commit answered
+    ("voxcpm2", None),
+])
+def test_a_reply_from_another_model_or_revision_is_refused(model, revision):
+    backend = CompositeBackend(embed=None, voice=_CloningVoice(model, revision),
+                               slots=_CloningSlots(), scheduler=_RecordingScheduler())
+    with pytest.raises(RuntimeError, match="voice identity mismatch"):
+        backend.speak("hi", "en", "saved:1", references=_REFS)
+
+
+def test_without_a_slot_manager_references_pass_straight_to_the_voice():
+    voice = _CloningVoice(model="anything", revision=None)
+    backend = CompositeBackend(embed=None, voice=voice)
+    assert backend.speak("hi", "en", "saved:1", references=_REFS)["model"] == "anything"
+    assert voice.calls[0][4] is _REFS
+
+
+def test_voice_backend_sends_references_only_when_given():
+    from modelsvc.backends.voice_backend import VoiceBackend
+
+    worker = _RecordingWorker()
+    backend = VoiceBackend(lambda: worker)
+    backend.speak("hi", "af_heart", ["hi"], [None])
+    backend.speak("hi", "saved:1", ["hi"], ["saved:1"], _REFS)
+    assert worker.calls == [
+        ("speak", ("hi", "af_heart", ["hi"], [None])),
+        ("speak", ("hi", "saved:1", ["hi"], ["saved:1"], _REFS)),
+    ]
+
+
+@pytest.mark.parametrize(("language", "preset"), [("en", "kokoro-82m"), ("ru", "silero-v4-ru")])
+def test_fake_backend_never_speaks_a_preset_with_a_cloning_entry(language, preset):
+    fake = FakeBackend("mac")
+    fake.set_slots({"voice": "voxcpm2"})
+    fake.speak("hi", language)
+    assert fake.resources()["slots"]["voice"] == preset
+
+
+def test_fake_backend_speaks_saved_voices_without_touching_the_slot():
+    from storage.wav import duration_seconds
+
+    fake = FakeBackend("mac")
+    result = fake.speak("hi", "ru", "saved:1", references=_REFS)
+    assert duration_seconds(result["audio"]) > 0
+    assert result["model"] == "fake-voice" and result["revision"] is None
+    assert result["conditioning"]["saved:1"]["state"] == "built"
+    assert isinstance(result["conditioning"]["saved:1"]["blob"], bytes)
+    assert fake.resources()["slots"]["voice"] == "kokoro-82m"
+
+
+def _bakes():
+    from modelsvc.activity import Activity
+    from modelsvc.voice_bakes import VoiceBakes
+
+    return VoiceBakes(slots=None, registry=None, governor=None, scheduler=None,
+                      activity=Activity(), bake_root="unused", profile="mac")
+
+
+def _drains(gate) -> bool:
+    import threading
+
+    gate.close()
+    draining = threading.Thread(target=gate.drain, daemon=True)
+    draining.start()
+    draining.join(1.0)
+    return not draining.is_alive()
+
+
+def test_speak_raises_bake_running_while_the_gate_is_closed():
+    from modelsvc.voice_bakes import BakeRunning
+
+    bakes = _bakes()
+    voice = _CloningVoice()
+    backend = CompositeBackend(embed=None, voice=voice, bakes=bakes)
+    bakes.gate.close()
+    with pytest.raises(BakeRunning, match=r"a voice is being baked \(0%\)"):
+        backend.speak("hi")
+    with pytest.raises(BakeRunning):
+        backend.speak("hi", "en", "saved:1", references=_REFS)
+    assert voice.calls == []
+
+
+def test_a_speak_that_raised_leaves_the_gate():
+    class _Failing:
+        def speak(self, *args):
+            raise RuntimeError("the voice child died")
+
+    bakes = _bakes()
+    backend = CompositeBackend(embed=None, voice=_Failing(), bakes=bakes)
+    with pytest.raises(RuntimeError, match="died"):
+        backend.speak("hi")
+    assert _drains(bakes.gate)
+
+
+def test_model_unload_goes_through_the_governor_which_refuses_a_leased_unit():
+    from modelsvc.governor import UnitLeased
+
+    reg, gov, sched, log = _conveyor({"voice_train": 1000, "music": 100})
+    gov.acquire(["voice_train", "music"])
+    backend = CompositeBackend(embed=None, registry=reg, governor=gov, scheduler=sched)
+    with gov.lease("voice_train"), pytest.raises(UnitLeased):
+        backend.model_unload("voice_train")
+    backend.model_unload("music")
+    assert ("free", "voice_train") not in log
+    assert ("free", "music") in log
+
+
+class _StrictRecorder:
+    """Records every method called on it, whatever its name."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __getattr__(self, name):
+        def record(*args, **kwargs):
+            self.calls.append(name)
+
+        return record
+
+
+class _StageBakes:
+    """The two things `CompositeBackend` reads from the bakes, frozen at one stage."""
+
+    def __init__(self, *, active: bool, gate_closed: bool):
+        from modelsvc.voice_bakes import VoiceGate
+
+        self._active = active
+        self.gate = VoiceGate()
+        if gate_closed:
+            self.gate.close()
+
+    def active(self) -> bool:
+        return self._active
+
+
+@pytest.mark.parametrize("bakes", [
+    pytest.param(lambda: None, id="no-bakes"),
+    pytest.param(lambda: _StageBakes(active=False, gate_closed=False), id="inactive"),
+    pytest.param(lambda: _StageBakes(active=True, gate_closed=False), id="prepare"),
+    pytest.param(lambda: _StageBakes(active=True, gate_closed=True), id="drain"),
+    pytest.param(lambda: _StageBakes(active=True, gate_closed=True), id="teardown"),
+])
+@pytest.mark.parametrize("dependency", ["scheduler", "registry"])
+def test_voice_train_ensure_always_raises_bake_only_and_touches_nothing(bakes, dependency):
+    from modelsvc.voice_bakes import BakeOnly
+
+    recorder = _StrictRecorder()
+    backend = CompositeBackend(embed=None, bakes=bakes(), **{dependency: recorder})
+    with pytest.raises(BakeOnly, match="voice_train is loaded only by a bake"):
+        backend.model_ensure("voice_train")
+    assert recorder.calls == []
+
+
+def test_without_bakes_a_bake_is_not_offered():
+    from modelsvc.voice_bakes import BakeNotOffered
+
+    backend = CompositeBackend(embed=None)
+    with pytest.raises(BakeNotOffered):
+        backend.bake_start({"clips": []})
+    assert backend.bake_current() is None
+    assert backend.bake_status("x") is None
+    assert backend.bake_delete("x") is False
+
+
+def test_the_fake_scripted_bake_walks_from_running_to_done_and_returns_its_bytes():
+    from modelsvc.backends.fake import FAKE_BAKE_ADAPTER
+    from modelsvc.voice_bakes import BakeRunning
+
+    fake = FakeBackend("mac")
+    bake_id = fake.bake_start({"clips": [{}], "tag": {"check": "me"}})["id"]
+    with pytest.raises(BakeRunning):
+        fake.bake_adapter(bake_id)
+    states = [fake.bake_status(bake_id)["state"] for _ in range(3)]
+    assert states == ["running", "running", "done"]
+    assert fake.bake_adapter(bake_id) == FAKE_BAKE_ADAPTER
+    assert fake.bake_current()["tag"] == {"check": "me"}
+    assert fake.bake_delete(bake_id) is True
+    assert fake.bake_current() is None
+
+
+def test_the_fake_bake_can_be_cancelled_and_is_not_offered_on_jetson():
+    from modelsvc.voice_bakes import BakeNotOffered
+
+    fake = FakeBackend("mac")
+    bake_id = fake.bake_start({"clips": [{}]})["id"]
+    assert fake.bake_cancel(bake_id)["state"] == "cancelled"
+    assert fake.bake_status(bake_id)["state"] == "cancelled"
+    with pytest.raises(BakeNotOffered):
+        FakeBackend("jetson").bake_start({"clips": [{}]})
+
+
+def test_build_backend_wires_the_bakes_and_sweeps_their_old_folders(tmp_path):
+    from modelsvc.voice_bakes import VoiceBakes
+
+    leftover = tmp_path / "voice-bakes" / "0123abcd" / "clips"
+    leftover.mkdir(parents=True)
+    backend = build_backend(Settings(data_dir=tmp_path, profile="mac"))
+    assert isinstance(backend._bakes, VoiceBakes)
+    assert backend._gate is backend._bakes.gate
+    assert list((tmp_path / "voice-bakes").iterdir()) == []
+
+
+def test_the_fake_speaks_a_model_only_reference_with_no_conditioning():
+    fake = FakeBackend("mac")
+    refs = {"saved:1": {"language": "ru", "adapter": {"blob": b"lora", "sha256": "cd"},
+                        "use_clip": False},
+            "saved:2": _REFS["saved:1"]}
+    result = fake.speak("hi", "ru", "saved:1", voices=["saved:2"], references=refs)
+    assert set(result["conditioning"]) == {"saved:2"}
+    assert result["conditioning"]["saved:2"]["state"] == "built"
+    assert result["adapters"] == {"saved:1": {"state": "loaded", "sha256": "cd"}}
+
+
+_WHISPER_REV = "41f01f3fe87f28c78e2fbf8b568835947dd65ed9"
+
+
+class _AsrChild:
+    def __init__(self, revision=_WHISPER_REV):
+        self.revision = revision
+        self.calls = []
+
+    def call(self, method, *args):
+        self.calls.append((method, *args))
+        return {"text": " heard words ", "revision": self.revision, "device": "mps",
+                "seconds": 6.0, "elapsed_s": 0.5}
+
+
+class _AsrSlots:
+    def __init__(self, child, offered=True):
+        self.child, self.offered = child, offered
+
+    def has_unit(self, unit):
+        return self.offered and unit == "asr"
+
+    def worker(self, unit):
+        assert unit == "asr"
+        return self.child
+
+
+class _AsrRegistry:
+    def __init__(self, resident=()):
+        self.resident = set(resident)
+
+    def is_resident(self, name):
+        return name in self.resident
+
+
+class _AsrGovernor:
+    def __init__(self, states):
+        self.states = list(states)
+
+    def state(self):
+        import types
+
+        resident, free_mb = self.states.pop(0) if len(self.states) > 1 else self.states[0]
+        return types.SimpleNamespace(resident=list(resident), free_mb=free_mb)
+
+
+class _LoadingScheduler(_RecordingScheduler):
+    """Makes the needed units resident before the op, as the conveyor does."""
+
+    def __init__(self, registry):
+        super().__init__()
+        self.registry = registry
+
+    def run(self, needed, priority, fn):
+        self.registry.resident.update(needed)
+        return super().run(needed, priority, fn)
+
+
+def _asr_backend(*, child=None, offered=True, resident=(), states=(((), 20000.0),),
+                 bakes=None, profile="mac"):
+    registry = _AsrRegistry(resident)
+    scheduler = _LoadingScheduler(registry)
+    backend = CompositeBackend(embed=None, slots=_AsrSlots(child or _AsrChild(), offered),
+                               registry=registry, governor=_AsrGovernor(states),
+                               scheduler=scheduler, bakes=bakes, profile=profile)
+    return backend, scheduler, registry
+
+
+def test_transcribe_runs_the_asr_unit_at_batch_and_names_the_entry():
+    from modelsvc.scheduler import Priority
+
+    child = _AsrChild()
+    backend, scheduler, _ = _asr_backend(child=child)
+
+    result = backend.transcribe(b"take", "ru")
+
+    assert scheduler.seen == [(("asr",), Priority.BATCH)]
+    assert child.calls == [("transcribe", b"take", "ru")]
+    assert result == {"text": " heard words ", "model": "whisper-large-v3-turbo",
+                      "revision": _WHISPER_REV, "seconds": 6.0, "elapsed_s": 0.5}
+
+
+def test_transcribe_with_the_gate_closed_is_bake_running_and_never_scheduled():
+    from modelsvc.voice_bakes import BakeRunning
+
+    bakes = _bakes()
+    backend, scheduler, _ = _asr_backend(bakes=bakes)
+    bakes.gate.close()
+    with pytest.raises(BakeRunning, match="a voice is being baked"):
+        backend.transcribe(b"take", "en")
+    assert scheduler.seen == []
+
+
+def test_a_transcribe_that_raised_leaves_the_gate():
+    class _Dying(_AsrChild):
+        def call(self, method, *args):
+            raise RuntimeError("Whisper weights for x are not on disk: run `make models`")
+
+    bakes = _bakes()
+    backend, _, _ = _asr_backend(child=_Dying(), bakes=bakes)
+    with pytest.raises(RuntimeError, match="not on disk"):
+        backend.transcribe(b"take", "en")
+    assert _drains(bakes.gate)
+
+
+def test_a_reply_of_another_revision_is_an_identity_mismatch():
+    backend, _, _ = _asr_backend(child=_AsrChild(revision="other"))
+    with pytest.raises(RuntimeError, match="asr identity mismatch"):
+        backend.transcribe(b"take", "en")
+
+
+@pytest.mark.parametrize(("offered", "profile"), [(False, "mac"), (True, "jetson")])
+def test_no_asr_unit_is_transcribe_not_offered(offered, profile):
+    from modelsvc.backends.base import TranscribeNotOffered
+
+    backend, scheduler, _ = _asr_backend(offered=offered, profile=profile)
+    with pytest.raises(TranscribeNotOffered, match="not offered on this device yet"):
+        backend.transcribe(b"take", "en")
+    assert scheduler.seen == []
+
+
+def test_no_slot_manager_is_transcribe_not_offered():
+    from modelsvc.backends.base import TranscribeNotOffered
+
+    with pytest.raises(TranscribeNotOffered):
+        CompositeBackend(embed=None).transcribe(b"take", "en")
+
+
+def test_a_language_the_entry_does_not_list_is_refused_before_any_load():
+    from modelsvc.backends.base import TranscribeRefused
+
+    backend, scheduler, _ = _asr_backend()
+    with pytest.raises(TranscribeRefused, match="'de'"):
+        backend.transcribe(b"take", "de")
+    assert scheduler.seen == []
+
+
+_FORBIDDEN = ("cost", "drop", "measured")
+
+
+def test_a_call_that_loads_the_child_logs_its_net_free_memory_change(caplog):
+    backend, _, _ = _asr_backend(states=((["voice"], 20000.0), (["voice", "asr"], 16500.0)))
+    with caplog.at_level("INFO", logger="modelsvc.backends.composite"):
+        backend.transcribe(b"take", "en")
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("asr ")]
+    assert lines == [("asr whisper-large-v3-turbo@41f01f3 loaded by this request: "
+                      "free_mb 20000 → 16500, net change -3500 MB; evicted: none")]
+    assert not any(word in lines[0] for word in _FORBIDDEN)
+
+
+def test_the_load_line_names_the_units_the_governor_evicted(caplog):
+    backend, _, _ = _asr_backend(
+        states=((["voice", "music"], 9000.0), (["voice", "asr"], 7000.0)))
+    with caplog.at_level("INFO", logger="modelsvc.backends.composite"):
+        backend.transcribe(b"take", "en")
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("asr ")]
+    assert len(lines) == 1
+    assert "loaded by this request" in lines[0]
+    assert "net change -2000 MB" in lines[0]
+    assert lines[0].endswith("evicted: music")
+    assert not any(word in lines[0] for word in _FORBIDDEN)
+
+
+def test_a_call_to_a_resident_child_logs_nothing(caplog):
+    backend, _, _ = _asr_backend(resident={"asr"})
+    with caplog.at_level("INFO", logger="modelsvc.backends.composite"):
+        backend.transcribe(b"take", "en")
+    assert not [r for r in caplog.records if r.getMessage().startswith("asr ")]
+
+
+def test_a_manual_asr_ensure_enters_the_gate():
+    from modelsvc.voice_bakes import BakeRunning
+
+    bakes = _bakes()
+    scheduler = _RecordingScheduler()
+    backend = CompositeBackend(embed=None, scheduler=scheduler, bakes=bakes)
+
+    entered = []
+    real_enter = bakes.gate.enter
+    bakes.gate.enter = lambda: (entered.append(True), real_enter())[1]
+    backend.model_ensure("asr")
+    assert entered == [True] and len(scheduler.seen) == 1
+    assert _drains(bakes.gate)
+
+    with pytest.raises(BakeRunning):
+        backend.model_ensure("asr")
+    assert len(scheduler.seen) == 1
+
+
+def test_the_fake_transcribes_a_scripted_text_per_take():
+    import hashlib
+    import io
+    import wave
+
+    from modelsvc.backends.base import TranscribeNotOffered, TranscribeRefused
+
+    def take(sample: bytes) -> bytes:
+        buffer = io.BytesIO()
+        with wave.open(buffer, "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(48000)
+            handle.writeframes(sample * 48000 * 6)
+        return buffer.getvalue()
+
+    fake = FakeBackend("mac")
+    scripted, other = take(b"\x01\x00"), take(b"\x02\x00")
+    fake.transcripts[hashlib.sha256(scripted).hexdigest()] = "♪"
+    assert fake.transcribe(scripted, "ru") == {
+        "text": "♪", "model": "fake-asr", "revision": "fake", "seconds": 6.0, "elapsed_s": 0.0}
+    assert fake.transcribe(other, "en")["text"] == "fake words"
+    with pytest.raises(TranscribeRefused):
+        fake.transcribe(other, "de")
+    with pytest.raises(TranscribeNotOffered):
+        FakeBackend("jetson").transcribe(other, "en")
+
+
+_ECAPA_REV = "0f99f2d0ebe89ac095bcc5903c4dd8f72b367286"
+
+
+class _SpeakerChild:
+    def __init__(self, reply=None):
+        self.reply = reply or {"vector": [0.5] * 192, "revision": _ECAPA_REV, "seconds": 40.0,
+                               "elapsed_s": 0.2, "pipeline": 1}
+        self.calls = []
+
+    def call(self, method, *args):
+        self.calls.append((method, *args))
+        return self.reply
+
+
+class _SpeakerSlots:
+    def __init__(self, child, offered=True):
+        self.child, self.offered = child, offered
+
+    def has_unit(self, unit):
+        return self.offered and unit == "speaker_embed"
+
+    def worker(self, unit):
+        assert unit == "speaker_embed"
+        return self.child
+
+
+def _speaker_backend(*, child=None, offered=True, bakes=None, profile="mac"):
+    scheduler = _RecordingScheduler()
+    backend = CompositeBackend(embed=None, slots=_SpeakerSlots(child or _SpeakerChild(), offered),
+                               scheduler=scheduler, bakes=bakes, profile=profile)
+    return backend, scheduler
+
+
+def test_embed_voice_runs_the_speaker_unit_at_batch_and_names_the_entry():
+    from modelsvc.scheduler import Priority
+
+    child = _SpeakerChild()
+    backend, scheduler = _speaker_backend(child=child)
+
+    result = backend.embed_voice(b"clip")
+
+    assert scheduler.seen == [(("speaker_embed",), Priority.BATCH)]
+    assert child.calls == [("embed", b"clip")]
+    assert result == {"vector": [0.5] * 192, "model": "ecapa-voxceleb", "revision": _ECAPA_REV,
+                      "seconds": 40.0, "elapsed_s": 0.2, "pipeline": 1}
+
+
+def test_embed_voice_with_the_gate_closed_is_bake_running_and_never_scheduled():
+    from modelsvc.voice_bakes import BakeRunning
+
+    bakes = _bakes()
+    assert _drains(bakes.gate)
+    backend, scheduler = _speaker_backend(bakes=bakes)
+
+    with pytest.raises(BakeRunning):
+        backend.embed_voice(b"clip")
+    assert scheduler.seen == []
+
+
+def test_embed_voice_is_counted_in_at_the_gate_and_leaves_it_when_it_raises():
+    class _Dying(_SpeakerChild):
+        def call(self, method, *args):
+            raise RuntimeError("the child died")
+
+    bakes = _bakes()
+    entered = []
+    real_enter = bakes.gate.enter
+    bakes.gate.enter = lambda: (entered.append(True), real_enter())[1]
+    backend, _ = _speaker_backend(child=_Dying(), bakes=bakes)
+
+    with pytest.raises(RuntimeError, match="the child died"):
+        backend.embed_voice(b"clip")
+
+    assert entered == [True]
+    assert _drains(bakes.gate)
+
+
+def test_a_refusal_of_the_child_is_speaker_embed_refused():
+    from modelsvc.backends.base import SpeakerEmbedRefused
+
+    child = _SpeakerChild({"refused": "the clip holds 0.20 s of voiced audio",
+                           "revision": _ECAPA_REV})
+    backend, _ = _speaker_backend(child=child)
+    with pytest.raises(SpeakerEmbedRefused, match="0.20 s of voiced audio"):
+        backend.embed_voice(b"clip")
+
+
+def test_another_revision_is_a_speaker_embed_identity_mismatch():
+    child = _SpeakerChild({"vector": [0.5] * 192, "revision": "other", "seconds": 6.0,
+                           "elapsed_s": 0.2, "pipeline": 1})
+    backend, _ = _speaker_backend(child=child)
+    with pytest.raises(RuntimeError, match="speaker_embed identity mismatch"):
+        backend.embed_voice(b"clip")
+
+
+def test_a_vector_of_another_size_is_an_error():
+    child = _SpeakerChild({"vector": [0.5] * 7, "revision": _ECAPA_REV, "seconds": 6.0,
+                           "elapsed_s": 0.2, "pipeline": 1})
+    backend, _ = _speaker_backend(child=child)
+    with pytest.raises(RuntimeError, match="7 values, not 192"):
+        backend.embed_voice(b"clip")
+
+
+@pytest.mark.parametrize(("offered", "profile"), [(False, "mac"), (True, "jetson")])
+def test_no_speaker_unit_is_speaker_embed_not_offered(offered, profile):
+    from modelsvc.backends.base import SpeakerEmbedNotOffered
+
+    backend, scheduler = _speaker_backend(offered=offered, profile=profile)
+    with pytest.raises(SpeakerEmbedNotOffered, match="not offered on this device yet"):
+        backend.embed_voice(b"clip")
+    assert scheduler.seen == []
+
+
+def test_a_manual_speaker_ensure_enters_the_gate():
+    from modelsvc.voice_bakes import BakeRunning
+
+    bakes = _bakes()
+    scheduler = _RecordingScheduler()
+    backend = CompositeBackend(embed=None, scheduler=scheduler, bakes=bakes)
+
+    entered = []
+    real_enter = bakes.gate.enter
+    bakes.gate.enter = lambda: (entered.append(True), real_enter())[1]
+    backend.model_ensure("speaker_embed")
+    assert entered == [True] and len(scheduler.seen) == 1
+    assert _drains(bakes.gate)
+
+    with pytest.raises(BakeRunning):
+        backend.model_ensure("speaker_embed")
+    assert len(scheduler.seen) == 1
+
+
+def _clip(sample: bytes, seconds: int = 40) -> bytes:
+    import io
+    import wave
+
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(48000)
+        handle.writeframes(sample * 48000 * seconds)
+    return buffer.getvalue()
+
+
+def test_the_fake_embeds_each_clip_stably_with_no_30_s_cap():
+    fake = FakeBackend("mac")
+    first, other = _clip(b"\x01\x00"), _clip(b"\x02\x00")
+
+    result = fake.embed_voice(first)
+
+    assert len(result["vector"]) == 192
+    assert result["seconds"] == 40.0
+    assert (result["model"], result["revision"], result["pipeline"]) == ("fake-speaker", "fake", 1)
+    assert fake.embed_voice(first)["vector"] == result["vector"]
+    assert fake.embed_voice(other)["vector"] != result["vector"]
+
+
+def test_the_fake_answers_a_scripted_vector_or_refusal_per_clip():
+    import hashlib
+
+    from modelsvc.backends.base import SpeakerEmbedNotOffered, SpeakerEmbedRefused
+
+    fake = FakeBackend("mac")
+    scripted, refused = _clip(b"\x01\x00", 6), _clip(b"\x02\x00", 6)
+    fake.speaker_vectors[hashlib.sha256(scripted).hexdigest()] = [1.0] * 192
+    fake.speaker_refusals[hashlib.sha256(refused).hexdigest()] = "too little voiced audio"
+
+    assert fake.embed_voice(scripted)["vector"] == [1.0] * 192
+    with pytest.raises(SpeakerEmbedRefused, match="too little voiced audio"):
+        fake.embed_voice(refused)
+    with pytest.raises(SpeakerEmbedNotOffered):
+        FakeBackend("jetson").embed_voice(scripted)

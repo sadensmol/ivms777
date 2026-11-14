@@ -44,6 +44,7 @@ def cloud_client(tmp_path, monkeypatch):
     service = _service_client("cloud")
     monkeypatch.setattr(Settings, "build_models_client", lambda self: service)
     with TestClient(create_app(settings)) as tc:
+        tc.service = service
         yield tc
 
 
@@ -205,6 +206,61 @@ def test_the_resources_poll_does_not_push_when_they_already_agree(client):
     original = client.service.set_slots
     client.service.set_slots = lambda slots, **kw: (pushed.append(slots), original(slots, **kw))[1]
     client.get("/api/resources")
+    assert pushed == []
+
+
+# `voice` is automatic: the service routes it per request (design §4.1), so a
+# routed voice differs from the app's resolved default and must never be pushed back.
+ROUTED_VOICES = ["voxcpm2", "silero-v4-ru"]
+
+
+def _record_pushes(service) -> list[dict]:
+    pushed = []
+    original = service.set_slots
+    service.set_slots = lambda slots, **kw: (pushed.append(slots), original(slots, **kw))[1]
+    return pushed
+
+
+@pytest.mark.parametrize("voice", ROUTED_VOICES)
+def test_the_resources_poll_leaves_a_routed_voice_alone(client, voice):
+    client.service.set_slots({"voice": voice})
+    pushed = _record_pushes(client.service)
+    client.get("/api/resources")
+    client.get("/api/resources")
+    assert pushed == []
+    assert client.service.models_state()["slots"]["voice"] == voice
+
+
+@pytest.mark.parametrize("voice", ROUTED_VOICES)
+def test_the_resources_poll_restores_a_lost_caption_but_not_the_voice(client, voice):
+    client.post("/settings/models", data={"slot": "caption", "key": "qwen3-vl-4b"})
+    client.service.set_slots({"caption": "gemma4-E2B", "voice": voice})
+    pushed = _record_pushes(client.service)
+    client.get("/api/resources")
+    slots = client.service.models_state()["slots"]
+    assert slots["caption"] == "qwen3-vl-4b"
+    assert slots["voice"] == voice
+    assert len(pushed) == 1
+    assert "voice" not in pushed[0]
+
+
+@pytest.mark.parametrize("voice", ROUTED_VOICES)
+def test_a_settings_switch_does_not_push_the_voice(client, voice):
+    client.service.set_slots({"voice": voice})
+    pushed = _record_pushes(client.service)
+    client.post("/settings/models", data={"slot": "caption", "key": "qwen3-vl-4b"})
+    assert len(pushed) == 1
+    assert pushed[0]["caption"] == "qwen3-vl-4b"
+    assert "voice" not in pushed[0]
+    assert client.service.models_state()["slots"]["voice"] == voice
+
+
+@pytest.mark.parametrize("voice", ROUTED_VOICES)
+def test_the_resources_poll_never_pushes_on_cloud(cloud_client, voice):
+    cloud_client.service.set_slots({"voice": voice})
+    pushed = _record_pushes(cloud_client.service)
+    cloud_client.get("/api/resources")
+    cloud_client.get("/api/resources")
     assert pushed == []
 
 

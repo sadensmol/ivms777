@@ -287,3 +287,97 @@ def test_unknown_source_type_is_a_programming_error(tmp_path):
     d = _downloads(tmp_path)
     with pytest.raises(TypeError):
         d.start(dataclasses.replace(GGUF, source="s3://somewhere"))
+
+
+PINNED = catalog.get("voice", "voxcpm2")
+
+
+def test_a_pinned_entry_snapshots_and_probes_at_its_revision(tmp_path):
+    fetched, probed = [], []
+    d = _downloads(
+        tmp_path,
+        hf=lambda repo, progress, **kw: fetched.append((repo, kw)),
+        hf_present=lambda repo, **kw: probed.append((repo, kw)) or False,
+    )
+    assert d.status(PINNED)["state"] == "absent"
+    d.start(PINNED)
+    pin = {"revision": PINNED.source.revision}
+    assert fetched == [(PINNED.source.repo, pin)]
+    assert probed and all(call == (PINNED.source.repo, pin) for call in probed)
+
+
+def test_a_pinned_entry_is_ready_only_at_its_revision(tmp_path):
+    d = _downloads(
+        tmp_path, hf_present=lambda repo, **kw: kw.get("revision") == PINNED.source.revision
+    )
+    assert d.status(PINNED)["state"] == "ready"
+
+
+def test_a_pinned_source_id_carries_the_revision():
+    assert Downloads._source_id(PINNED) == (
+        f"hf:{PINNED.source.repo}@{PINNED.source.revision}"
+    )
+    assert Downloads._source_id(HF) == f"hf:{HF.source.repo}"   # unpinned: unchanged
+
+
+def test_hf_fetch_sizes_and_snapshots_a_pinned_repo_at_its_revision(tmp_path):
+    (tmp_path / "blobs").mkdir()
+    calls = []
+
+    def snapshot(repo, **kw):
+        calls.append(("snapshot", repo, kw))
+        (tmp_path / "blobs" / "b").write_bytes(b"q" * 3)
+
+    def total(repo, **kw):
+        calls.append(("total", repo, kw))
+        return 3
+
+    _hf_fetch(
+        "some/repo", lambda done, total: None, revision="abc123",
+        snapshot=snapshot, cache_dir=lambda repo: tmp_path, total_bytes=total, interval=0.01,
+    )
+    assert ("total", "some/repo", {"revision": "abc123"}) in calls
+    assert ("snapshot", "some/repo", {"revision": "abc123"}) in calls
+
+
+def test_hf_fetch_of_an_unpinned_repo_passes_no_revision(tmp_path):
+    (tmp_path / "blobs").mkdir()
+    calls = []
+    _hf_fetch(
+        "some/repo", lambda done, total: None,
+        snapshot=lambda repo, **kw: calls.append(kw), cache_dir=lambda repo: tmp_path,
+        total_bytes=lambda repo, **kw: calls.append(kw) or 0, interval=0.01,
+    )
+    assert calls == [{}, {}]
+
+
+def test_the_real_hub_helpers_pass_the_revision_to_huggingface_hub(monkeypatch):
+    # A fake `huggingface_hub`: the helpers import it lazily, so nothing touches the
+    # network or the developer's cache.
+    import sys
+    import types
+
+    from modelsvc.downloads import _hf_present, _hf_snapshot, _hf_total_bytes
+
+    calls = []
+    hub = types.ModuleType("huggingface_hub")
+    hub.snapshot_download = lambda repo, **kw: calls.append(("snapshot", repo, kw))
+
+    class HfApi:
+        def model_info(self, repo, **kw):
+            calls.append(("info", repo, kw))
+            return types.SimpleNamespace(siblings=[types.SimpleNamespace(size=5)])
+
+    hub.HfApi = HfApi
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+
+    _hf_snapshot("o/r", "rev1")
+    assert _hf_present("o/r", "rev1") is True
+    assert _hf_total_bytes("o/r", "rev1") == 5
+    _hf_snapshot("o/r")
+    assert calls == [
+        ("snapshot", "o/r", {"revision": "rev1"}),
+        ("snapshot", "o/r", {"local_files_only": True, "revision": "rev1"}),
+        ("info", "o/r", {"files_metadata": True, "revision": "rev1"}),
+        ("snapshot", "o/r", {}),
+    ]

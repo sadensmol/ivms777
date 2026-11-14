@@ -34,12 +34,14 @@ def build_backend(settings) -> ModelBackend:
 
     from inference.client import OpenAICompatClient
     from models import slots as slot_defaults
+    from modelsvc.activity import Activity
     from modelsvc.downloads import Downloads
     from modelsvc.governor import MemoryGovernor
     from modelsvc.llm_process import build_llm_process
     from modelsvc.registry import ModelRegistry
     from modelsvc.scheduler import Scheduler
     from modelsvc.slots import SlotManager
+    from modelsvc.voice_bakes import VoiceBakes
 
     inf = OpenAICompatClient(settings.inference_base_url or "")
     registry = ModelRegistry()
@@ -62,6 +64,14 @@ def build_backend(settings) -> ModelBackend:
     scheduler = Scheduler(
         governor, concurrency=settings.gpu_concurrency, idle_ttl_s=settings.llm_idle_ttl_s
     )
+    activity = Activity()
+    bakes = VoiceBakes(
+        slots=manager, registry=registry, governor=governor, scheduler=scheduler,
+        activity=activity, bake_root=settings.data_dir / "voice-bakes",
+        profile=settings.profile,
+    )
+    # A restart ended any bake; its folder still holds copies of a person's takes (§5.1).
+    bakes.sweep()
 
     # cloud keeps the OpenAI `/embeddings` path for caption text and hosts no
     # in-process text embedder, so its text unit is never registered.
@@ -92,6 +102,8 @@ def build_backend(settings) -> ModelBackend:
         slots=manager,
         downloads=Downloads(settings.data_dir / "models"),
         profile=settings.profile,
+        activity=activity,
+        bakes=bakes,
     )
 
 

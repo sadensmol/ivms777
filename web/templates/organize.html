@@ -47,10 +47,38 @@
          library, with no story to narrate and nothing stored to prepare. #}
       {% set play_url = ('/feed/' + album.key) if active == 'memories' else None %}
       {% set notes = (notes_by_key or {}).get(album.key) %}
+      {% set films = (films_by_key or {}).get(album.key) %}
       {% include "_album_card.html" %}
     {% endfor %}
   </div>
 {% else %}
   <p class="muted">No albums for this organization yet — upload photos, or try another type.</p>
 {% endif %}
+{# Close on /feed is history.back(), so this grid returns from bfcache with the film
+   rows as they were before the film was made. Refresh ONLY the film blocks, never the
+   page: one fetch, each #films-<key> swapped (§11.1). Registered once on window, so a
+   boosted return to Organize does not stack listeners. #}
+<script>
+  if (!window.__filmBlocksWired) {
+    window.__filmBlocksWired = true;
+    window.addEventListener("pageshow", async (e) => {
+      if (!e.persisted || !document.querySelector(".album-film-block")) return;
+      let html;
+      try {
+        const response = await fetch(location.href, { cache: "no-store" });
+        if (!response.ok) return;
+        html = await response.text();
+      } catch (_) {
+        return;  // keep the old rows; the next return tries again
+      }
+      const fresh = new DOMParser().parseFromString(html, "text/html");
+      for (const block of document.querySelectorAll(".album-film-block")) {
+        const next = fresh.getElementById(block.id);
+        if (!next) continue;
+        block.outerHTML = next.outerHTML;
+        htmx.process(document.getElementById(block.id));
+      }
+    });
+  }
+</script>
 {% endblock %}

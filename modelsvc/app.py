@@ -8,14 +8,34 @@ it only calls `backend`.
 """
 
 import base64
+import binascii
+import hashlib
 import json
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt
 
-from modelsvc.backends.base import ModelBackend, SlotOff
+from audio.whisper_asr import MAX_SECONDS as TRANSCRIBE_MAX_SECONDS
+from modelsvc.backends.base import (
+    CloningUnavailable,
+    ModelBackend,
+    SlotOff,
+    SpeakerEmbedNotOffered,
+    SpeakerEmbedRefused,
+    TranscribeNotOffered,
+    TranscribeRefused,
+)
+from modelsvc.governor import UnitLeased
+from modelsvc.voice_bakes import (
+    MAX_CLIP_BYTES,
+    BakeNotOffered,
+    BakeOnly,
+    BakeRefused,
+    BakeRunning,
+    _wav_seconds,
+)
 
 
 class ImageEmbedRequest(BaseModel):
@@ -48,6 +68,58 @@ class CaptionResponse(BaseModel):
     model: str
 
 
+# The limits of one saved-voice request (§2.3). A film casts a narrator and a few
+# bracket voices; an example is a 5-30 s mono PCM-16 clip at 48 kHz (< 3 MiB).
+MAX_REFERENCES = 8
+MAX_REFERENCE_BYTES = 4 * 1024 * 1024
+# References with a baked voice model, per request; the estimate of one is ≈ 18 MB.
+MAX_ADAPTERS = 4
+MAX_ADAPTER_BYTES = 64 * 1024 * 1024
+
+
+class VoiceConditioning(BaseModel):
+    """What a cloning model built from one example, stored by `app` and sent back so the
+    child can skip the encode. Valid only for the model + revision that made it."""
+
+    model: str
+    revision: str
+    blob: str             # base64; opaque to everyone except the child that made it
+
+
+class VoiceAdapter(BaseModel):
+    """A saved voice's baked model (§5.1 `/voice/bakes`)."""
+
+    blob: str             # base64 of the safetensors file a bake wrote
+    sha256: str           # of the decoded bytes
+
+
+class VoiceControls(BaseModel):
+    """Generation settings of one reference, for `voice_bake_check.py --sweep` only (§5.1).
+    Forbidding extras matters: an ignored field would speak at the fixed values."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cfg_value: StrictFloat = Field(ge=1.5, le=3.0)
+    inference_timesteps: StrictInt = Field(ge=10, le=20)
+
+
+class VoiceReference(BaseModel):
+    """ONE saved example of a saved voice (§11.1), or its baked model alone (D76)."""
+
+    # Both are required unless `use_clip` is false: the adapter alone needs no take.
+    audio: str | None = None   # base64 PCM-16 WAV
+    sha256: str | None = None  # hex sha256 of the decoded WAV bytes
+    language: str
+    # The heard words of the take. VoxCPM2 clones from the clip AND these words when
+    # present, which keeps the person's pace; without them, timbre only.
+    transcript: str | None = None
+    conditioning: list[VoiceConditioning] = []
+    adapter: VoiceAdapter | None = None
+    # False speaks from the adapter alone, with no prompt take; only with an adapter.
+    use_clip: bool = True
+    controls: VoiceControls | None = None
+
+
 class SpeakRequest(BaseModel):
     text: str
     language: str = "en"
@@ -62,6 +134,10 @@ class SpeakRequest(BaseModel):
     # is spoken in parts and merged: mostly its own narrator, with a different one for
     # the moments that asked for it. `None`, or a shorter list, falls back to `voice`.
     voices: list[str | None] | None = None
+    # SAVED voices (§11.1): voice token ("saved:<voice_id>") -> its example. When given,
+    # `voice` and every named passage voice must be a token of this map — one film never
+    # mixes saved voices and preset speakers (D17). `None` = preset speakers, as before.
+    references: dict[str, VoiceReference] | None = None
 
 
 class MusicSection(BaseModel):
@@ -99,6 +175,17 @@ class AudioResponse(BaseModel):
     # child knows how long each sentence took to say, so it has to travel with the
     # audio. Empty for music, and for a voice that cannot report it.
     segments: list[dict] = []
+    # The Hub commit the voice ran at. None for Kokoro, Silero and music.
+    revision: str | None = None
+    # Saved voices only: token -> {state: "built"|"restored", model, revision, reason,
+    # blob: base64 | None}. A `built` blob is new; `restored` has none.
+    conditioning: dict[str, dict] = {}
+    # Saved voices only: token -> {state: "loaded"|"kept"|"none", sha256}, the state of
+    # the token's last run.
+    adapters: dict[str, dict] = {}
+    # Only tokens that set `controls`: token -> {cfg_value, inference_timesteps}, the values
+    # the child spoke with.
+    controls: dict[str, dict] = {}
 
 
 class TextCompleteRequest(BaseModel):
@@ -149,6 +236,49 @@ class EmbedSpecResponse(BaseModel):
     generation: int
 
 
+class BakeClip(BaseModel):
+    audio: str            # base64 mono PCM-16 WAV at 48000 Hz
+    sha256: str
+    text: str
+    language: str
+
+
+class BakeRequest(BaseModel):
+    # The entry that bakes on this profile when left out; any other key is a 422.
+    model: str | None = None
+    clips: list[BakeClip]
+    config: dict[str, Any] | None = None
+    tag: dict[str, Any] | None = None
+
+
+class TranscribeRequest(BaseModel):
+    audio: str            # base64 mono PCM-16 WAV at 48000 Hz, at most 30 s: one take
+    sha256: str
+    language: str         # the take's own label; it forces the decoding language
+
+
+class TranscribeResponse(BaseModel):
+    text: str             # as the model decoded it; `app` alone judges the words
+    model: str
+    revision: str
+    seconds: float
+    elapsed_s: float
+
+
+class VoiceEmbedRequest(BaseModel):
+    audio: str            # base64 mono PCM-16 WAV at 48000 Hz: one take or one test
+    sha256: str
+
+
+class VoiceEmbedResponse(BaseModel):
+    vector: list[float]   # raw; `app` normalises and compares
+    model: str
+    revision: str
+    seconds: float
+    elapsed_s: float
+    pipeline: int
+
+
 class SetSlotsRequest(BaseModel):
     slots: dict[str, str]
 
@@ -192,12 +322,127 @@ class ModelsStateResponse(BaseModel):
 
 
 def _audio_response(result: dict) -> "AudioResponse":
+    conditioning = {
+        token: entry | {"blob": None if entry.get("blob") is None  # pragma: allowlist secret
+                        else base64.b64encode(entry["blob"]).decode()}
+        for token, entry in (result.get("conditioning") or {}).items()
+    }
     return AudioResponse(
         audio=base64.b64encode(result["audio"]).decode(),
         sample_rate=result["sample_rate"],
         model=result["model"],
         segments=result.get("segments", []),
+        revision=result.get("revision"),
+        conditioning=conditioning,
+        adapters=result.get("adapters", {}),
+        controls=result.get("controls", {}),
     )
+
+
+def _b64(value: str, what: str) -> bytes:
+    try:
+        return base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"{what} is not valid base64") from exc
+
+
+def _decode_references(req: SpeakRequest) -> dict:
+    """The request's saved-voice examples as the backend takes them (bytes, not
+    base64), after every check of §2.3. Raises `ValueError` with the reason."""
+    references = req.references or {}
+    if len(references) > MAX_REFERENCES:
+        raise ValueError(f"at most {MAX_REFERENCES} references, got {len(references)}")
+    # The narrator itself must be a key; only the per-passage names may be empty.
+    if not req.voice or req.voice not in references:
+        raise ValueError(f"the voice {req.voice!r} must be one of the references")
+    for name in req.voices or []:
+        if name and name not in references:
+            raise ValueError(f"voice {name!r} has no reference: a request never mixes "
+                             "saved voices and preset speakers")
+    adapters = sum(ref.adapter is not None for ref in references.values())
+    if adapters > MAX_ADAPTERS:
+        raise ValueError(f"at most {MAX_ADAPTERS} references with an adapter, got {adapters}")
+    decoded = {}
+    for token, ref in references.items():
+        if not ref.use_clip and ref.adapter is None:
+            raise ValueError(f"use_clip=false needs an adapter, and {token!r} has none")
+        if ref.audio is None and not ref.use_clip:
+            # The adapter alone (D76): no take, so no audio and no conditioning.
+            decoded[token] = {"language": ref.language,
+                              "adapter": _adapter(ref.adapter, token), "use_clip": False}
+            if ref.controls is not None:
+                decoded[token]["controls"] = ref.controls.model_dump()
+            continue
+        # Audio sent with use_clip=false is still checked, and the child does not use it.
+        if ref.audio is None or ref.sha256 is None:
+            raise ValueError(f"the reference of {token!r} needs its audio")
+        audio = _b64(ref.audio, f"the audio of {token!r}")
+        if len(audio) > MAX_REFERENCE_BYTES:
+            raise ValueError(f"the audio of {token!r} is {len(audio)} bytes; "
+                             f"the limit is {MAX_REFERENCE_BYTES}")
+        if hashlib.sha256(audio).hexdigest() != ref.sha256.lower():
+            raise ValueError(f"the audio of {token!r} does not match its sha256")
+        decoded[token] = {
+            "audio": audio,
+            "sha256": ref.sha256,
+            "language": ref.language,
+            "transcript": ref.transcript,
+            "conditioning": [
+                {"model": c.model, "revision": c.revision,
+                 "blob": _b64(c.blob, f"a conditioning blob of {token!r}")}
+                for c in ref.conditioning
+            ],
+        }
+        # Only a reference with an adapter carries the two keys, so a plain one reaches
+        # the voice child exactly as before.
+        if ref.adapter is not None:
+            decoded[token] |= {"adapter": _adapter(ref.adapter, token), "use_clip": ref.use_clip}
+        if ref.controls is not None:
+            decoded[token]["controls"] = ref.controls.model_dump()
+    return decoded
+
+
+def _adapter(adapter: VoiceAdapter, token: str) -> dict:
+    blob = _b64(adapter.blob, f"the adapter of {token!r}")
+    if len(blob) > MAX_ADAPTER_BYTES:
+        raise ValueError(f"the adapter of {token!r} is {len(blob)} bytes; "
+                         f"the limit is {MAX_ADAPTER_BYTES}")
+    if hashlib.sha256(blob).hexdigest() != adapter.sha256.lower():
+        raise ValueError(f"the adapter of {token!r} does not match its sha256")
+    return {"blob": blob, "sha256": adapter.sha256}
+
+
+def _decode_take(req: TranscribeRequest) -> bytes:
+    """The take of a transcribe request, after every check of §5.1, before any load.
+    Raises `ValueError` with the reason."""
+    audio = _b64(req.audio, "the take")
+    if len(audio) > MAX_CLIP_BYTES:
+        raise ValueError(f"the take is {len(audio)} bytes; the limit is {MAX_CLIP_BYTES}")
+    if hashlib.sha256(audio).hexdigest() != req.sha256.lower():
+        raise ValueError("the take does not match its sha256")
+    try:
+        seconds = _wav_seconds(audio, 0)
+    except BakeRefused as exc:  # the `/voice/bakes` take checks, named for one take
+        raise ValueError(str(exc).replace("take 0:", "the take:", 1)) from exc
+    if seconds > TRANSCRIBE_MAX_SECONDS:
+        raise ValueError(f"the take is {seconds:.1f} s long; "
+                         f"the limit is {TRANSCRIBE_MAX_SECONDS:.0f} s")
+    return audio
+
+
+def _decode_clip(req: VoiceEmbedRequest) -> bytes:
+    """The clip of an embed request, after every check of §5.1, before any load. It has
+    no 30 s cap, unlike a take to hear. Raises `ValueError` with the reason."""
+    audio = _b64(req.audio, "the clip")
+    if len(audio) > MAX_CLIP_BYTES:
+        raise ValueError(f"the clip is {len(audio)} bytes; the limit is {MAX_CLIP_BYTES}")
+    if hashlib.sha256(audio).hexdigest() != req.sha256.lower():
+        raise ValueError("the clip does not match its sha256")
+    try:
+        _wav_seconds(audio, 0)
+    except BakeRefused as exc:  # the `/voice/bakes` take checks, named for one clip
+        raise ValueError(str(exc).replace("take 0:", "the clip:", 1)) from exc
+    return audio
 
 
 def create_models_app(backend: ModelBackend) -> FastAPI:
@@ -232,11 +477,24 @@ def create_models_app(backend: ModelBackend) -> FastAPI:
         # same answer (§4.1). Anything else is a 500 that CARRIES THE MODEL'S OWN
         # MESSAGE: narration is mandatory (§11.1), so this text is shown to the user
         # on the failed film. Losing it is what made "no Russian voice" unreadable.
+        # A malformed saved-voice request is the caller's error: 422 with the reason.
+        args = (req.text, req.language, req.voice, req.segments, req.voices)
         try:
-            result = backend.speak(req.text, req.language, req.voice, req.segments,
-                                   req.voices)
+            references = None if req.references is None else _decode_references(req)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        try:
+            # `references=` only when the request has them, so a preset request reaches
+            # the backend exactly as it always did.
+            result = (backend.speak(*args) if references is None
+                      else backend.speak(*args, references=references))
+        except CloningUnavailable as exc:
+            raise HTTPException(status_code=503,
+                                detail=f"voice copy is not available: {exc}") from exc
         except SlotOff as exc:
             raise HTTPException(status_code=503, detail=f"voice slot is off: {exc}") from exc
+        except BakeRunning as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except Exception as exc:  # reported, never swallowed
             raise HTTPException(status_code=500, detail=str(exc) or type(exc).__name__) from exc
         return _audio_response(result)
@@ -319,12 +577,102 @@ def create_models_app(backend: ModelBackend) -> FastAPI:
 
     @app.post("/models/{name}/ensure")
     def model_ensure(name: str) -> dict:
-        backend.model_ensure(name)
+        try:
+            backend.model_ensure(name)
+        except (BakeRunning, BakeOnly) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {}
 
     @app.post("/models/{name}/unload")
     def model_unload(name: str) -> dict:
-        backend.model_unload(name)
+        try:
+            backend.model_unload(name)
+        except UnitLeased as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {}
 
+    # --- voice bakes (§5.1). `current` is registered before `{bake_id}`.
+    @app.post("/voice/bakes", status_code=202)
+    def bake_start(req: BakeRequest) -> dict:
+        try:
+            return backend.bake_start(req.model_dump())
+        except BakeRunning as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except BakeRefused as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except BakeNotOffered as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    @app.get("/voice/bakes/current")
+    def bake_current() -> dict:
+        return _found(backend.bake_current())
+
+    @app.get("/voice/bakes/{bake_id}")
+    def bake_status(bake_id: str) -> dict:
+        return _found(backend.bake_status(bake_id))
+
+    @app.post("/voice/bakes/{bake_id}/cancel")
+    def bake_cancel(bake_id: str) -> dict:
+        return _found(backend.bake_cancel(bake_id))
+
+    @app.get("/voice/bakes/{bake_id}/adapter")
+    def bake_adapter(bake_id: str) -> Response:
+        try:
+            blob = backend.bake_adapter(bake_id)
+        except BakeRunning as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return Response(content=_found(blob), media_type="application/octet-stream")
+
+    @app.delete("/voice/bakes/{bake_id}", status_code=204)
+    def bake_delete(bake_id: str) -> Response:
+        try:
+            deleted = backend.bake_delete(bake_id)
+        except BakeRunning as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if not deleted:
+            raise HTTPException(status_code=404, detail="no such bake")
+        return Response(status_code=204)
+
+    @app.post("/voice/transcribe", response_model=TranscribeResponse)
+    def transcribe(req: TranscribeRequest) -> TranscribeResponse:
+        try:
+            audio = _decode_take(req)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        try:
+            result = backend.transcribe(audio, req.language)
+        except TranscribeNotOffered as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except TranscribeRefused as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except BakeRunning as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:  # a load or model error, with its own message
+            raise HTTPException(status_code=500, detail=str(exc) or type(exc).__name__) from exc
+        return TranscribeResponse(**result)
+
+    @app.post("/voice/embed", response_model=VoiceEmbedResponse)
+    def voice_embed(req: VoiceEmbedRequest) -> VoiceEmbedResponse:
+        try:
+            audio = _decode_clip(req)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        try:
+            result = backend.embed_voice(audio)
+        except SpeakerEmbedNotOffered as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except SpeakerEmbedRefused as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except BakeRunning as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:  # a load or model error, with its own message
+            raise HTTPException(status_code=500, detail=str(exc) or type(exc).__name__) from exc
+        return VoiceEmbedResponse(**result)
+
     return app
+
+
+def _found(value):
+    if value is None:
+        raise HTTPException(status_code=404, detail="no such bake")
+    return value

@@ -13,6 +13,7 @@ write under a photograph.
 import json
 import logging
 import re
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 
 from feed.director import Edit
@@ -137,14 +138,15 @@ STORY_SCHEMA: dict = {
         "narration": {"type": "string"},
         # The film's own narrator, chosen from the speakers offered in the prompt.
         "narrator": {"type": "string"},
-        # `[{"shot": <1-based index>, "text": "..."}]` — only the beats worth titling,
-        # NOT one per shot.
+        # `[{"sentence": <1-based sentence>, "text": "..."}]` — only the beats worth
+        # titling, NOT one per sentence. A sentence, not a photograph: one photograph can
+        # carry two passages.
         "cards": {
             "type": "array",
             "items": {
                 "type": "object",
-                "properties": {"shot": {"type": "integer"}, "text": {"type": "string"}},
-                "required": ["shot", "text"],
+                "properties": {"sentence": {"type": "integer"}, "text": {"type": "string"}},
+                "required": ["sentence", "text"],
             },
         },
         "music_prompt": {"type": "string"},
@@ -193,7 +195,7 @@ def _is_in_language(text: str, language: str) -> bool:
 @dataclass(frozen=True)
 class Story:
     narration: str
-    cards: tuple[tuple[int, str], ...]   # (0-based shot index, text)
+    cards: tuple[tuple[int, str], ...]   # (0-based passage index, text)
     music_prompt: str
     # The speaker the whole film is read by, and per passage an optional different one.
     # Validated against the catalog before use (`feed/voice.py`).
@@ -212,6 +214,17 @@ class Story:
     # plan for the score (§11.1); empty when it did not make one, in which case
     # `feed/score.py` splits the film evenly instead.
     score: tuple[tuple[int, str], ...] = ()
+
+    # Whether the final photographs are introduced in the memory's order (§11.1), "kept"
+    # or "broken". A diagnostic: nothing acts on it.
+    memory_order: str = "kept"
+
+    # False when stage 2's photographs came from `_even`, not from the model's match.
+    matched: bool = True
+
+    # Per passage, the 0-based photograph its own matching call chose; None when it gave
+    # no vote and the passage kept the photograph it came with.
+    votes: tuple[int | None, ...] = ()
 
     @property
     def chunks(self) -> list[str]:
@@ -233,17 +246,21 @@ def write_story(
     client, model: str, *, title: str, description: str, edit: Edit,
     shots: list[str] | None = None, language: str = DEFAULT, digest: str = "",
     notes: str = "", directions: str = "", speakers: str = "",
-    context_tokens: int | None = None,
+    context_tokens: int | None = None, photos: list[str] | None = None,
+    facts: str = "", cancelled: Callable[[], bool] | None = None,
 ) -> Story:
     """The film's words, in TWO STAGES (design §11.1).
 
     1. **Tell the story** — prose, in the film's language, with a beginning, a middle
        and an end, carrying every note. Nothing else: no photographs to number, no
        cards, no cast. One job, which is the only way this model writes a story rather
-       than a caption per picture.
+       than a caption per picture. It is WRITTEN FROM `photos` — what each photograph
+       shows, in the memory's order — plus `facts` (the digest without its guessed
+       labels). `digest`, labels and all, goes to stage 2 only.
     2. **Cut it to the pictures and dress the film** — a second call gives each SENTENCE
        its photograph and adds the title cards, the narrator, any per-passage voice and
-       the score plan. It never rewrites a word: the story is already written.
+       the score plan. It never rewrites a word: the story is already written. Each
+       sentence's photograph is then asked for again, on its own (`match_photographs`).
 
     Between the two, the story is checked and repaired against what was asked for — the
     film's language, its length, and every one of the viewer's notes.
@@ -251,7 +268,9 @@ def write_story(
     NEVER raises: a film with no words still plays.
     """
     low, high = narration_words(len(edit.shots), _note_count(notes))
-    prose = _tell(client, model, title, description, digest, notes, language, low, high)
+    known = "\n".join([f"{i}. {text}" for i, text in enumerate(photos or [], 1)]
+                      + ([facts] if facts else []))
+    prose = _tell(client, model, title, description, known, notes, language, low, high)
     if prose and not _is_in_language(prose, language):
         # Composing in a second language is hard for a small model; TRANSLATING text it
         # can already see is much easier, so the fallback is a translation pass rather
@@ -267,21 +286,37 @@ def write_story(
     # told that and still copies one into its first sentence, which the voice then reads
     # aloud — "суровый мужской голос" spoken over the opening shot. Stripped here, where
     # it cannot be forgotten.
+    count = len(edit.shots)
     told = [text for text in
-            (_BRACKET.sub(" ", part).strip() for part in sentences(prose)) if text]
-    told = _long_enough(client, model, told, title, digest, language, low)
+            (_BRACKET.sub(" ", part).strip()
+             for part in sentences(prose, at_least=count)) if text]
+    told = _long_enough(client, model, told, title, known, language, low)
+    told = _enough_passages(client, model, told, title, known, language, count)
     told = _with_uncovered(client, model, told, notes, language)
     told = _in_place(told, notes)
     return _dress(client, model, told, title, description, edit, shots, language,
-                  digest, notes, directions, speakers, context_tokens)
+                  digest, notes, directions, speakers, context_tokens, photos, cancelled)
+
+
+def introduces_in_order(photos: Sequence[int]) -> bool:
+    """Whether each photograph first appears only after every lower-numbered one has.
+    A return to an earlier photograph is always allowed."""
+    first = list(dict.fromkeys(photos))
+    return first == sorted(first)
 
 
 def _dress(client, model: str, told: list[str], title: str, description: str, edit: Edit,
            shots: list[str] | None, language: str, digest: str, notes: str,
-           directions: str, speakers: str, context_tokens: int | None) -> Story:
+           directions: str, speakers: str, context_tokens: int | None,
+           photos: list[str] | None = None,
+           cancelled: Callable[[], bool] | None = None) -> Story:
     """Stage 2: which photograph carries each sentence, plus the cards, the cast and the
     score plan. Asked ONCE, then repaired — and repaired hard, because the story itself
-    is already safe: the worst a bad answer here can do is show the wrong picture."""
+    is already safe: the worst a bad answer here can do is show the wrong picture.
+
+    Each sentence is then matched to its photograph on its own. The result is only
+    recorded against the memory's order and its photographs, never changed for them
+    (§11.1)."""
     story = _attempt(client, model, title, description, edit, shots, language,
                      digest, notes, directions, speakers, insist=False,
                      context_tokens=context_tokens, told=told)
@@ -303,7 +338,73 @@ def _dress(client, model: str, told: list[str], title: str, description: str, ed
         )
         if second.script and any(v.strip() for v in second.voices):
             story = second
+    story = match_photographs(client, model, story,
+                              photos or shots or [shot.line for shot in edit.shots],
+                              len(edit.shots), context_tokens, cancelled)
+    final = [index for index, _text in story.script]
+    left_out = sorted(set(range(len(edit.shots))) - set(final))
+    if left_out:
+        logger.info("no sentence is about photographs %s; they are left out", left_out)
+    if story.memory_order == "broken":
+        logger.info("the photographs %s are out of the memory's order; they stand", final)
     return story
+
+
+_MATCH_SCHEMA: dict = {
+    "type": "object", "properties": {"photo": {"type": "integer"}}, "required": ["photo"],
+}
+MATCH_OUTPUT_TOKENS = 32
+# NO ORDER CLAUSE: a call sees one sentence, so it has no position to judge an order from,
+# and an untested clause can bias a 2B model towards low numbers (§11.1).
+_MATCH_PROMPT = ("These are the numbered photographs of a film:\n{listing}\n\n"
+                 "This sentence is spoken over one of them.\n"
+                 "Sentence: {sentence}\n\n"
+                 "Which numbered photograph does this sentence describe? "
+                 'Return JSON: {{"photo": <the photograph\'s number>}}')
+
+
+def match_photographs(client, model: str, story: Story, texts: list[str], shot_count: int,
+                      context_tokens: int | None,
+                      cancelled: Callable[[], bool] | None = None) -> Story:
+    """Each passage's photograph, asked for on its own (§11.1): one call, one sentence.
+
+    Stage 2 picks every photograph in one sampled answer beside everything else it is
+    asked for, which is how two cats ended up on the picture of one. A usable answer sets
+    its passage's photograph, and it stands: a return, an out-of-order match and a
+    photograph left out are all allowed. Anything else keeps the photograph the passage
+    came with: stage 2's, or an edited narration's stored one. Only photographs change, so
+    the voices, cards and score stay on their passages. `memory_order` is read from the
+    final photographs. NEVER raises.
+    """
+    votes: list[int | None] = [None] * len(story.script)
+    for at, (_index, text) in enumerate(story.script):
+        # Up to MAX_PASSAGES calls of up to two minutes each: Cancel must not wait for them.
+        if cancelled is not None and cancelled():
+            break
+        fixed = len(_MATCH_PROMPT.format(listing="", sentence=text))
+        listing = _listing(texts, shot_count, brief_chars(shot_count, fixed, context_tokens))
+        try:
+            raw = client.text_complete(
+                model,
+                [{"role": "user",
+                  "content": _MATCH_PROMPT.format(listing=listing, sentence=text)}],
+                json_schema=_MATCH_SCHEMA, temperature=0, max_tokens=MATCH_OUTPUT_TOKENS,
+            )
+        except Exception:
+            logger.exception("matching passage %d failed; the photographs it came with "
+                             "stand from there on", at)
+            break
+        try:
+            photo = _loads(raw).get("photo")
+        except ValueError:
+            continue
+        if type(photo) is int and 1 <= photo <= shot_count:
+            votes[at] = photo - 1
+    script = tuple((index if vote is None else vote, text)
+                   for vote, (index, text) in zip(votes, story.script))
+    in_order = introduces_in_order([index for index, _text in script])
+    return replace(story, script=script, votes=tuple(votes),
+                   memory_order="kept" if in_order else "broken")
 
 
 # --- STAGE 1: THE STORY, and nothing else (§11.1) ------------------------------------
@@ -324,8 +425,8 @@ _TELL_PROMPT = {
            "из фотографий одного дня. Это ЧУЖОЕ воспоминание — ты рассказываешь его "
            "человеку, который его прожил.\n\n"
            "ЧТО ЭТО ЗА ДЕНЬ: {title}. {description}\n\n"
-           "ЧТО ИЗВЕСТНО ПРО ЭТОТ ДЕНЬ (это ФОН, а не список фактов для "
-           "перечисления):\n{digest}\n\n"
+           "ЧТО НА ФОТОГРАФИЯХ, по порядку дня. Это ФАКТЫ — рассказ строится на них; "
+           "не добавляй того, чего здесь нет (погоды, людей, событий):\n{known}\n\n"
            "{notes}"
            "Напиши {low}-{high} слов по-русски. ЭТО РАССКАЗ, А НЕ ПОДПИСИ К ФОТО: "
            "у него есть начало, середина и КОНЕЦ — последнее предложение закрывает "
@@ -340,8 +441,9 @@ _TELL_PROMPT = {
            "day's photographs. It is SOMEONE ELSE'S memory — you are telling it back "
            "to the person who lived it.\n\n"
            "WHAT THE DAY WAS: {title}. {description}\n\n"
-           "WHAT IS KNOWN ABOUT IT (this is BACKGROUND, not a list of facts to "
-           "recite):\n{digest}\n\n"
+           "WHAT THE PHOTOGRAPHS SHOW, in the order of the day. These are the FACTS the "
+           "story is built on; add nothing that is not here (no weather, people or "
+           "events):\n{known}\n\n"
            "{notes}"
            "Write {low}-{high} words in English. THIS IS A STORY, NOT PHOTO CAPTIONS: "
            "it has a beginning, a middle and an END — the last sentence closes it. "
@@ -366,14 +468,14 @@ _TELL_NOTES = {
 }
 
 
-def _tell(client, model: str, title: str, description: str, digest: str, notes: str,
+def _tell(client, model: str, title: str, description: str, known: str, notes: str,
           language: str, low: int, high: int) -> str:
     """The story. One call, one job, no bookkeeping. "" when it could not be written."""
     template = _TELL_PROMPT.get(language, _TELL_PROMPT[DEFAULT])
     note_block = (_TELL_NOTES.get(language, _TELL_NOTES[DEFAULT]).format(notes=notes)
                   if notes.strip() else "")
     prompt = template.format(title=title, description=description,
-                             digest=digest or "-", notes=note_block, low=low, high=high)
+                             known=known or "-", notes=note_block, low=low, high=high)
     try:
         payload = _loads(client.text_complete(
             model, [{"role": "user", "content": prompt}],
@@ -397,16 +499,34 @@ _SENTENCE = re.compile(r"[^.!?…]+[.!?…]*", re.DOTALL)
 _MIN_SENTENCE_CHARS = 45
 
 
-def sentences(text: str) -> list[str]:
-    """The story, split into the passages a film can cut on."""
+def sentences(text: str, at_least: int = 0) -> list[str]:
+    """The story, split into the passages a film can cut on.
+
+    A join STOPS once the passage is long enough. Because a passage is what carries a
+    photograph, the story is never cut into fewer than `at_least` passages while it has
+    sentences to spare: every photograph should have one to be matched to (§11.1).
+    """
     parts = [part.strip() for part in _SENTENCE.findall(text) if part.strip()]
-    merged: list[str] = []
+    groups: list[list[str]] = []
     for part in parts:
-        if merged and len(part) < _MIN_SENTENCE_CHARS:
-            merged[-1] = f"{merged[-1]} {part}"
+        if groups and len(" ".join(groups[-1])) < _MIN_SENTENCE_CHARS:
+            groups[-1].append(part)
         else:
-            merged.append(part)
-    return merged[:MAX_PASSAGES]
+            groups.append([part])
+    # A short last sentence is a cut two seconds before the end; it closes the passage
+    # before it instead.
+    if len(groups) > 1 and len(" ".join(groups[-1])) < _MIN_SENTENCE_CHARS:
+        groups[-2].extend(groups.pop())
+    # Fewer passages than photographs: undo the longest joins first.
+    while len(groups) < at_least:
+        joined = [i for i, group in enumerate(groups) if len(group) > 1]
+        if not joined:
+            break
+        at = max(joined, key=lambda i: len(" ".join(groups[i])))
+        group = groups[at]
+        half = len(group) // 2
+        groups[at:at + 1] = [group[:half], group[half:]]
+    return [" ".join(group) for group in groups][:MAX_PASSAGES]
 
 
 # --- keeping the story honest, BEFORE any photograph is attached to it ---------------
@@ -456,13 +576,29 @@ def _long_enough(client, model: str, told: list[str], title: str, digest: str,
     return _expand(client, model, told, title, digest, language, low)
 
 
+def _enough_passages(client, model: str, told: list[str], title: str, digest: str,
+                     language: str, photos: int) -> list[str]:
+    """A photograph needs a passage to be shown, so a story with fewer sentences than the
+    memory has photographs is asked for the missing ones (§11.1). A longer story is the
+    price of giving every picture its chance, and it is paid."""
+    if not told or len(told) >= photos:
+        return told
+    logger.info("the story has %d passages for %d photographs; asking for more",
+                len(told), photos)
+    return _expand(client, model, told, title, digest, language, 0,
+                   count=photos - len(told))
+
+
 def _expand(client, model: str, told: list[str], title: str, digest: str,
-            language: str, wanted: int) -> list[str]:
-    """One follow-up call for more story. Returns what it had if it cannot be had."""
+            language: str, wanted: int, count: int | None = None) -> list[str]:
+    """One follow-up call for more story. Returns what it had if it cannot be had.
+
+    `count` is how many sentences to ask for; without it, enough to reach `wanted`
+    words."""
     template = _EXPAND_PROMPT.get(language, _EXPAND_PROMPT[DEFAULT])
     words = sum(len(text.split()) for text in told)
     prompt = template.format(story=" ".join(told), title=title, digest=digest or "-",
-                             count=max(2, min(6, (wanted - words) // 20)))
+                             count=count or max(2, min(6, (wanted - words) // 20)))
     try:
         payload = _loads(client.text_complete(
             model, [{"role": "user", "content": prompt}],
@@ -482,7 +618,7 @@ def _expand(client, model: str, told: list[str], title: str, digest: str,
     # check would let it through.
     said = [_normalised(text) for text in told]
     extra = []
-    for text in sentences(more):
+    for text in sentences(more, at_least=count or 0):
         key = _normalised(text)
         if any(key in seen or seen in key for seen in said):
             logger.info("dropped a repeated sentence from the extension: %r", text[:60])
@@ -801,94 +937,99 @@ def _attempt(client, model, title, description, edit, shots, language, digest=""
         payload = {}
     if not isinstance(payload, dict):
         payload = {}
-    script = _script(payload.get("script"), len(edit.shots), told)
+    script, voices, matched = _script(payload.get("script"), len(edit.shots), told)
     # `narration` is what the story SAYS; it is the script joined, so the two can never
     # disagree — and with a story already written, the words are ours, not the model's.
     narration = (" ".join(text for _, text in script) if script
                  else " ".join(told or []) or str(payload.get("narration") or ""))
     return Story(
         narration=narration,
-        cards=_cards(payload.get("cards"), len(edit.shots)),
+        cards=_cards(payload.get("cards"), len(script)),
         music_prompt=str(payload.get("music_prompt") or "") or _fallback_music(title),
         script=script,
         narrator=str(payload.get("narrator") or "").strip(),
-        voices=_voices(payload.get("script"), len(script)),
+        voices=voices,
         score=_score(payload.get("score"), len(script)),
+        matched=matched,
     )
 
 
-# A story told in fewer passages than this is not a story; more than this and the
-# picture is changing faster than anyone can follow.
-MAX_PASSAGES = 24
+# More passages than this and the picture is changing faster than anyone can follow.
+# It is the director's `max_shots`, so the cap is never what drops a photograph the
+# director kept (§11.1).
+MAX_PASSAGES = 40
 
 
-def _voices(raw, length: int) -> tuple[str, ...]:
-    """The per-passage speaker names, positionally matching the script.
+def _script(
+    raw, shot_count: int, told: list[str] | None = None,
+) -> tuple[tuple[tuple[int, str], ...], tuple[str, ...], bool]:
+    """Parse the story into `(photo index, what is said over it)` passages, each with its
+    own speaker, and whether any came from the model's match.
 
-    NOT validated here — `feed/build.py` runs every one through `voice.resolve` against
-    the catalog, because this module has no business knowing which speakers exist.
-    """
-    if not isinstance(raw, list):
-        return ()
-    names = []
-    for item in raw[:length]:
-        names.append(str(item.get("voice") or "").strip()
-                     if isinstance(item, dict) else "")
-    return tuple(names + [""] * (length - len(names)))
-
-
-def _script(raw, shot_count: int, told: list[str] | None = None) -> tuple[tuple[int, str], ...]:
-    """Parse the story into `(photo index, what is said over it)`, in TELLING ORDER.
+    With `told`, the passages are in TOLD ORDER: passage `i` is sentence `i`, whatever
+    order the model listed them in. Each item is parsed once — its sentence, its
+    photograph and its voice — so a voice can never slide onto another sentence. An
+    item is accepted when it names a sentence not yet given and a photograph that
+    exists; the first accepted one for a sentence wins.
 
     The story is the first citizen, so this deliberately does NOT require every
     photograph to be used, nor forbid one from being used twice: a passage that returns
-    to a face already seen is a thing films do, and a photograph the story has no use
-    for is better left out than forced in. Only the words are mandatory.
+    to a face already seen is a thing films do. Only the words are mandatory.
 
-    A passage naming a photograph that does not exist keeps its text and falls back to
-    the previous picture — losing a line of the story to a bad index would be much
-    worse than holding a shot a moment longer.
+    The speaker names are NOT validated here — `feed/build.py` runs every one through
+    `voice.resolve` against the catalog, because this module has no business knowing
+    which speakers exist.
     """
+    if told is not None:
+        # A story already written: the model only says which photograph and which voice
+        # go with each numbered sentence.
+        photos: dict[int, int] = {}
+        cast: dict[int, str] = {}
+        for item in raw[:MAX_PASSAGES] if isinstance(raw, list) else []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                which = int(item["sentence"]) - 1
+                index = int(item["shot"]) - 1
+            except (KeyError, TypeError, ValueError):
+                continue
+            if 0 <= which < len(told) and which not in photos and 0 <= index < shot_count:
+                photos[which] = index
+                cast[which] = str(item.get("voice") or "").strip()
+        if not photos:
+            # Nothing to match from. Laid out evenly, and marked as such, because an even
+            # layout is always in the memory's order and must not pass for a real match.
+            return _even(told, shot_count), ("",) * len(told), False
+        # EVERY SENTENCE IS IN THE FILM. One the matching call forgot is not dropped — the
+        # story was already written; it just needs a picture: the one before it, or for an
+        # opening sentence the first one the model did place.
+        previous = photos[min(photos)]
+        placed: list[tuple[int, str]] = []
+        for which, text in enumerate(told):
+            previous = photos.get(which, previous)
+            placed.append((previous, text))
+        return tuple(placed), tuple(cast.get(i, "") for i in range(len(told))), True
     if not isinstance(raw, list):
-        return _even(told, shot_count) if told else ()
+        return (), (), False
     passages: list[tuple[int, str]] = []
-    seen: set[int] = set()
+    voices: list[str] = []
     for item in raw[:MAX_PASSAGES]:
         if not isinstance(item, dict):
             continue
-        if told is not None:
-            # The words come from the story pass; this call only says which photograph
-            # goes under which sentence.
-            try:
-                which = int(item["sentence"]) - 1
-            except (KeyError, TypeError, ValueError):
-                continue
-            if not 0 <= which < len(told) or which in seen:
-                continue
-            seen.add(which)
-            text = told[which]
-        else:
-            text = str(item.get("text") or "").strip()
+        text = str(item.get("text") or "").strip()
         if not text:
             continue
         try:
             index = int(item["shot"]) - 1
         except (KeyError, TypeError, ValueError):
             index = -1
+        # A bad index keeps its text and holds the previous picture — losing a line of
+        # the story would be much worse than holding a shot a moment longer.
         if not 0 <= index < shot_count:
             index = passages[-1][0] if passages else 0
         passages.append((index, text))
-    if told is not None:
-        # EVERY SENTENCE IS IN THE FILM. One the matching call forgot is not dropped —
-        # the story was already written and approved; it just needs a picture.
-        missing = [i for i in range(len(told)) if i not in seen]
-        for which in missing:
-            at = min(which, len(passages))
-            shot = passages[at - 1][0] if at else (passages[0][0] if passages else 0)
-            passages.insert(at, (shot, told[which]))
-        if not passages:
-            return _even(told, shot_count)
-    return tuple(passages)
+        voices.append(str(item.get("voice") or "").strip())
+    return tuple(passages), tuple(voices), bool(passages)
 
 
 def _even(told: list[str], shot_count: int) -> tuple[tuple[int, str], ...]:
@@ -900,11 +1041,12 @@ def _even(told: list[str], shot_count: int) -> tuple[tuple[int, str], ...]:
                  for i, text in enumerate(told))
 
 
-def _cards(raw, shot_count: int) -> tuple[tuple[int, str], ...]:
+def _cards(raw, passage_count: int) -> tuple[tuple[int, str], ...]:
     """Parse the title cards, dropping anything malformed rather than failing.
 
-    The model is asked for 1-based shot numbers because that is how the prompt lists
-    them; they are converted here so nothing downstream has to remember."""
+    The model is asked for 1-based sentence numbers because that is how the prompt
+    lists them; they are converted to 0-based passages here so nothing downstream has
+    to remember. A sentence past the last passage is dropped."""
     if not isinstance(raw, list):
         return ()
     cards: list[tuple[int, str]] = []
@@ -912,11 +1054,11 @@ def _cards(raw, shot_count: int) -> tuple[tuple[int, str], ...]:
         if not isinstance(item, dict):
             continue
         try:
-            index = int(item["shot"]) - 1
+            index = int(item["sentence"]) - 1
         except (KeyError, TypeError, ValueError):
             continue
         text = str(item.get("text") or "").strip()
-        if text and 0 <= index < shot_count:
+        if text and 0 <= index < passage_count:
             cards.append((index, text))
     return tuple(cards)
 
@@ -1045,6 +1187,13 @@ def _assemble(
     name = _LANGUAGE_NAME.get(language, _LANGUAGE_NAME[DEFAULT])
     told = "\n".join(f"{i + 1}. {text}" for i, text in enumerate(told or []))
     minutes = max(1, round(edit.seconds / 60))
+    # A chosen narrator reads every passage, so only a film with speakers casts from a
+    # bracket (§11.1).
+    bracket_voice = (
+        ": '[страшным хриплым голосом]' asks for a frightening, hoarse, male delivery, "
+        "so cast a speaker like that for THAT passage." if speakers else
+        ". The narrator was chosen by the person and reads ALL passages, so a bracket "
+        "about the voice casts no one.")
     # The language demand goes FIRST and is repeated at the end: buried in the middle
     # of a long prompt, a small model drops it and answers in English.
     header = f"Write every word of your answer in {name}.\n\n"
@@ -1090,9 +1239,8 @@ def _assemble(
            f"for every note you were given, so writing them in fully is what the "
            f"length is FOR — never leave one out to stay short.\n"
            f"- ANYTHING IN [SQUARE BRACKETS] IS AN INSTRUCTION, NOT A SENTENCE. Never "
-           f"narrate it — obey it. It may be in either language, in any wording: "
-           f"'[страшным хриплым голосом]' asks for a frightening, hoarse, male "
-           f"delivery, so cast a speaker like that for THAT passage. A bracket about "
+           f"narrate it — obey it. It may be in either language, in any wording"
+           f"{bracket_voice} A bracket about "
            f"the music belongs in `music_prompt`; one about the picture or its length "
            f"is handled elsewhere and you may ignore it.\n"
            f"- Each is marked with where in the film it was written and WHICH "
@@ -1142,9 +1290,6 @@ def _assemble(
         "  `shot` is whichever photograph best ILLUSTRATES that sentence — it is on "
         "screen exactly while those words are spoken, so if the sentence mentions the "
         "cat, give it the cat's photograph.\n"
-        "  The photographs serve the story, not the reverse. You may show the same "
-        "photograph again when the story returns to it, and you may leave a photograph "
-        "out entirely if it adds nothing.\n"
         '- "narration": leave it empty. The story above IS the narration.\n'
         + (f'- "narrator": WHO READS THIS FILM. One name from the list below, chosen '
            f"for the memory — the mood, the occasion, who is in it. This voice reads "
@@ -1158,10 +1303,10 @@ def _assemble(
            f"  Use these names EXACTLY. Anything not on this list is discarded.\n"
            if speakers else "")
         + f'- "cards": at most {MAX_TITLE_CARDS} title cards for the WHOLE film, as '
-        'objects {"shot": <1-based shot number>, "text": "..."}. These are chapter '
-        "markers, not captions — put them where the film turns (a new place, a new "
-        "part of the day), and leave every other shot with no text at all. A few "
-        "words each.\n"
+        'objects {"sentence": <1-based sentence number>, "text": "..."}, each on the '
+        "sentence where the film turns. These are chapter markers, not captions — a "
+        "new place, a new part of the day — and every other sentence has no text at "
+        "all. A few words each.\n"
         + ('- "score": WHERE THE MUSIC CHANGES. Two to four objects '
            '{"from": <1-based passage number>, "brief": "..."}, in order, the first '
            'one starting at passage 1. Each `brief` is one English sentence saying '

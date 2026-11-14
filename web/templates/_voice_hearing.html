@@ -1,0 +1,20 @@
+{# The hearing job as the page of one voice shows it (design §11.1 "The words of a take
+   are heard right after it is saved", §13): `/voices/hearing?voice=<id>` answers it, and
+   voices.js polls it every 1 s while the takes of that voice are heard ("running") or wait
+   for another voice ("queued"); at the end the page refreshes its body. `data-run` names
+   the pass and `data-voice-id` the voice. A failure of this voice shows its reason until
+   Close; Hear the words tries again. #}
+<div id="voice-hearing-job" class="voice-hearing-job" data-state="{{ hearing.state }}" data-run="{{ hearing.run }}"
+     data-voice-id="{{ hearing.voice_id or '' }}"{% if page_voice is defined and hearing.voice_id != page_voice %} hidden{% endif %}>
+  {% if hearing.state == 'running' %}
+    <p class="hearing-step">{{ hearing.stage }} · {{ hearing.percent }}%</p>
+    <div class="preview-bar"><span style="width: {{ hearing.percent }}%"></span></div>
+    <button type="button" class="voice-hearing-cancel">Cancel</button>
+  {% elif hearing.state == 'queued' %}
+    <p class="hearing-step">waiting to hear the words, after another voice</p>
+    <button type="button" class="voice-hearing-cancel">Cancel</button>
+  {% elif hearing.state == 'failed' %}
+    <p class="hearing-error">{{ hearing.error }}</p>
+    <button type="button" class="voice-hearing-dismiss">Close</button>
+  {% endif %}
+</div>

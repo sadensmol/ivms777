@@ -20,6 +20,34 @@ class SlotOff(RuntimeError):
     """
 
 
+class CloningUnavailable(SlotOff):
+    """No voice-copy model speaks the language on this profile (§4.1, §11.1).
+
+    A `SlotOff`, so every caller that treats "no voice" as a 503 keeps doing so; the
+    HTTP layer gives it its own wording, because the film shows it to the user.
+    """
+
+
+class TranscribeNotOffered(RuntimeError):
+    """No speech-recognition model runs on this profile: the service has no `asr`
+    unit (`catalog.transcriber_for`, §4.1). The HTTP layer answers 503."""
+
+
+class TranscribeRefused(ValueError):
+    """A transcribe request the ASR entry cannot take (a language it does not list).
+    The HTTP layer answers 422 with the reason."""
+
+
+class SpeakerEmbedNotOffered(RuntimeError):
+    """No speaker model runs on this profile: the service has no `speaker_embed` unit
+    (`catalog.speaker_embedder_for`, §4.1). The HTTP layer answers 503."""
+
+
+class SpeakerEmbedRefused(ValueError):
+    """A clip the speaker model cannot score (too little voiced audio). The HTTP layer
+    answers 422 with the reason."""
+
+
 class ModelBackend(Protocol):
     def embed_image(self, images: list[bytes]) -> list[list[float]]:
         """SigLIP image embeddings (ingest `embed`, "similar")."""
@@ -62,13 +90,20 @@ class ModelBackend(Protocol):
 
     def speak(self, text: str, language: str = "en", voice: str | None = None,
               segments: list[str] | None = None,
-              voices: list[str | None] | None = None) -> dict:
+              voices: list[str | None] | None = None,
+              references: dict | None = None) -> dict:
         """One narration clip for a memory film (design §11.1).
 
         Returns `{audio: bytes (WAV), sample_rate: int, model: str}`. Raises `SlotOff`
         when the `voice` slot holds `off`, or when the selected voice does not list
         `language` in its catalog `languages` (§4.1) — the film is then prepared
         without speech rather than narrated in the wrong language.
+
+        `references` speaks SAVED voices: `{token: {audio: bytes, sha256, language,  # pragma: allowlist secret
+        transcript, conditioning: [{model, revision, blob: bytes}]}}`. It routes to the
+        cloning entry for `language` and raises `CloningUnavailable` when there is none.
+        The reply then also carries `revision` and `conditioning`
+        (`{token: {state, model, revision, reason, blob: bytes | None}}`).  # pragma: allowlist secret
         """
         ...
 
@@ -148,11 +183,65 @@ class ModelBackend(Protocol):
         ...
 
     def model_ensure(self, name: str) -> None:
-        """Make a managed model resident now (evicting others to fit)."""
+        """Make a managed model resident now (evicting others to fit).
+
+        `voice`, `asr` and `speaker_embed` are counted in at the voice gate like a speak
+        (`BakeRunning` while a bake runs); `voice_train` always raises `BakeOnly` (only a
+        bake loads it)."""
         ...
 
     def model_unload(self, name: str) -> None:
-        """Unload a managed model now, freeing its memory."""
+        """Unload a managed model now, freeing its memory. A leased unit raises
+        `UnitLeased`."""
+        ...
+
+    def bake_start(self, request: dict) -> dict:
+        """Start baking a saved voice into a LoRA adapter (design §5.1 `/voice/bakes`)
+        and return its status at once. Raises `BakeRunning`, `BakeRefused` (with the
+        reason) or `BakeNotOffered`."""
+        ...
+
+    def bake_status(self, bake_id: str) -> dict | None:
+        """The bake's status, or None for an unknown id."""
+        ...
+
+    def bake_current(self) -> dict | None:
+        """The running bake, else the last ended one not yet deleted, else None."""
+        ...
+
+    def bake_cancel(self, bake_id: str) -> dict | None:
+        """Ask the bake to stop; its status, or None for an unknown id."""
+        ...
+
+    def bake_adapter(self, bake_id: str) -> bytes | None:
+        """The safetensors file of a `done` bake (`BakeRunning` before that), or None
+        for an unknown id."""
+        ...
+
+    def bake_delete(self, bake_id: str) -> bool:
+        """Remove an ended bake and its work folder; False for an unknown id,
+        `BakeRunning` while it runs."""
+        ...
+
+    def transcribe(self, audio: bytes, language: str) -> dict:
+        """The words of one take, as the bake's speech-recognition model decoded them
+        (design §5.1 `/voice/transcribe`). `audio` is a checked mono PCM-16 WAV at
+        48000 Hz of at most 30 s; `language` forces the decoding language.
+
+        Returns `{text, model, revision, seconds, elapsed_s}`. Raises
+        `TranscribeNotOffered` (no ASR on this profile), `TranscribeRefused` (a
+        language the entry does not list) or `BakeRunning` (the voice gate is closed).
+        """
+        ...
+
+    def embed_voice(self, audio: bytes) -> dict:
+        """The speaker embedding of one clip (design §5.1 `/voice/embed`). `audio` is a
+        checked mono PCM-16 WAV.
+
+        Returns `{vector, model, revision, seconds, elapsed_s, pipeline}`. Raises
+        `SpeakerEmbedNotOffered` (no speaker model on this profile), `SpeakerEmbedRefused`
+        (too little voiced audio) or `BakeRunning` (the voice gate is closed).
+        """
         ...
 
     def catalog(self) -> dict:

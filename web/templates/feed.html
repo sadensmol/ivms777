@@ -14,19 +14,124 @@
     <link rel="stylesheet" href="/static/feed.css?v={{ static_v('feed.css') }}">
     <script src="/static/htmx.min.js?v={{ static_v('htmx.min.js') }}"></script>
   </head>
+  {# The narrator select of BOTH film forms (D18, D40, D78): Automatic, the presets of the
+     language from the catalog, the saved voices ready for it (§11.1), and
+     every other saved voice as a disabled option with its reason. A stored choice that
+     cannot narrate now is one more option in its group, selected, so the page never
+     shows Automatic in place of the user's choice; when it needs a take, a line
+     links to its voice page. Its help lines live here, so each page shows them once. #}
+  {% macro narrator_picker() %}
+    <label class="feed-narrator">Narrator for the next film
+      <select name="narrator">
+        <option value="" {{ 'selected' if picker.selected == '' else '' }}>Automatic — the app picks a voice for this memory</option>
+        <optgroup label="Preset voices">
+          {% for value, label in picker.presets %}
+            <option value="{{ value }}" {{ 'selected' if picker.selected == value else '' }}>{{ label }}</option>
+          {% endfor %}
+          {% if picker.unavailable and picker.unavailable[0] == 'preset' %}
+            <option value="{{ picker.unavailable[1] }}" selected>{{ picker.unavailable[2] }}</option>
+          {% endif %}
+        </optgroup>
+        {% set saved_unavailable = picker.unavailable and picker.unavailable[0] == 'saved' %}
+        {% if picker.saved or picker.saved_blocked or saved_unavailable or not picker.voice_copy %}
+          <optgroup label="Saved voices">
+            {% for value, label in picker.saved %}
+              <option value="{{ value }}" {{ 'selected' if picker.selected == value else '' }}>{{ label }}</option>
+            {% endfor %}
+            {% for value, label in picker.saved_blocked %}
+              <option value="{{ value }}" disabled>{{ label }}</option>
+            {% endfor %}
+            {% if saved_unavailable %}
+              <option value="{{ picker.unavailable[1] }}" selected>{{ picker.unavailable[2] }}</option>
+            {% endif %}
+            {% if not picker.voice_copy %}
+              <option disabled>Voice copy not available on this device</option>
+            {% endif %}
+          </optgroup>
+        {% endif %}
+      </select>
+    </label>
+    {% if picker.needs_take %}
+      {% set voice_id, voice_name = picker.needs_take %}
+      <p class="feed-note">«{{ voice_name }}» needs a {{ language_name }} take with heard words for {{ language_name }} films: <a href="/voices/{{ voice_id }}">open «{{ voice_name }}» in Voices</a>.</p>
+    {% endif %}
+    {% if picker.voice_copy %}
+      <p class="feed-note">The story picks the voice: a preset voice or one of your saved voices ready for {{ language_name }}. Otherwise the memory's mood picks a preset voice.</p>
+    {% else %}
+      <p class="feed-note">The story picks a preset voice; otherwise the memory's mood guides the choice.</p>
+    {% endif %}
+    {% if picker.voice_copy %}
+      <p class="feed-note">Add a voice under <a href="/voices">Voices</a>.</p>
+    {% endif %}
+    {% if picker.selected %}
+      <p class="feed-note">The chosen narrator reads the whole film.</p>
+    {% else %}
+      {# An edited narration runs no story pass, so a [voice] note can only keep a voice
+         the story already gave (D124); `feed-notes.js` switches the twins after a reply. #}
+      <p class="feed-note" data-narration="no-draft" {{ 'hidden' if narration.state == 'draft' else '' }}>A [voice] note can request another voice for one passage: another preset when a preset narrates, another saved voice when a saved voice narrates.</p>
+      <p class="feed-note" data-narration="draft" {{ '' if narration.state == 'draft' else 'hidden' }}>With your edited narration, a [voice] note cannot ask for a new voice: it keeps the voice the story already gave the passage it points at.</p>
+    {% endif %}
+  {% endmacro %}
   <body class="feed-body{{ ' is-building' if building else '' }}"
         data-key="{{ key }}" data-lang="{{ language }}">
-    <button class="feed-close" type="button" data-origin="{{ origin_url }}"
-            aria-label="Close">×</button>
-
-    {# Each language is prepared and cached separately (§11.1), so switching offers
-       its own Prepare rather than discarding the other. #}
-    <form class="feed-lang" method="get" action="/feed/{{ key }}">
-      {% for code, label in languages %}
-        <button type="submit" name="lang" value="{{ code }}"
-                class="{{ 'is-current' if code == language else '' }}">{{ label }}</button>
-      {% endfor %}
-    </form>
+    {# The page's controls, in ONE header — the only positioned element among them
+       (D43). The action row wraps; the settings region of a ready film scrolls inside
+       its own bounded height. No control has a fixed offset from another. #}
+    <header class="feed-head">
+      <div class="feed-actions">
+        {# Each language is prepared and cached separately (§11.1), so switching offers
+           its own Prepare rather than discarding the other. ✓ = its film plays now. #}
+        <form class="feed-lang" method="get" action="/feed/{{ key }}">
+          <span class="feed-lang-label">Film language</span>
+          {% for code, label, done in languages %}
+            <button type="submit" name="lang" value="{{ code }}"
+                    class="{{ 'is-current' if code == language else '' }}">{{ label }}{{ ' ✓' if done else '' }}</button>
+          {% endfor %}
+        </form>
+        {% if ready %}
+          {# Recorded from the canvas and the audio bus the player is already using, so
+             the file IS the film you just watched (§11.2). Real time, hence the warning:
+             there is no way to mux a faster-than-realtime audio track without shipping a
+             muxer. #}
+          <button class="feed-download" id="download" type="button"
+                  title="Record this film to a video file. Plays it through once in real
+time — leave the tab visible while it records.">
+            <span class="feed-download-text">↓ Download</span>
+          </button>
+        {% endif %}
+        <button class="feed-close" type="button" data-origin="{{ origin_url }}"
+                aria-label="Close">×</button>
+      </div>
+      {% if ready %}
+        <div class="feed-settings">
+          {# A prepared film must still be re-makeable: the story pass is sampled, so a
+             second run genuinely differs, and a run that lost its music or voice needs a
+             retry without deleting anything by hand (§11.1). #}
+          <form class="feed-regen" method="post" action="/feed/{{ key }}/prepare">
+            <input type="hidden" name="lang" value="{{ language }}">
+            {% if this_film %}
+              <p class="feed-this-film">This film: {{ language_name }} · narrated by {{ this_film.label }} —
+                {%- if this_film.chosen_by == 'user' %} your choice
+                {%- elif this_film.chosen_by == 'story' %} picked automatically by the story
+                {%- elif this_film.chosen_by == 'mood' %} picked automatically using the memory's mood
+                {%- else %} picked automatically{% endif %}
+                {%- if this_film.model %} · {{ this_film.model }}{% endif %}</p>
+              {% if this_film.others %}
+                <p class="feed-other-voices">Other voices:
+                  {%- for passage, label in this_film.others %} passage {{ passage }} → {{ label }}{{ ';' if not loop.last }}{% endfor %}</p>
+              {% endif %}
+            {% else %}
+              <p class="feed-this-film">This film: {{ language_name }} · Voice not recorded</p>
+            {% endif %}
+            {{ narrator_picker() }}
+            <button type="submit"
+                    title="{{ 'Speak your edited narration, and score this memory again' if narration.state == 'draft' else 'Write and score this memory again, using your notes' }}"
+                    data-title-draft="Speak your edited narration, and score this memory again"
+                    data-title-no-draft="Write and score this memory again, using your notes">↻ Regenerate</button>
+          </form>
+        </div>
+      {% endif %}
+    </header>
 
     {% if busy %}
       {# Regenerate was refused: one film is made at a time per process (§3.2). Saying
@@ -36,22 +141,6 @@
     {% endif %}
 
     {% if ready %}
-      {# A prepared film must still be re-makeable: the story pass is sampled, so a
-         second run genuinely differs, and a run that lost its music or voice needs a
-         retry without deleting anything by hand (§11.1). #}
-      <form class="feed-regen" method="post" action="/feed/{{ key }}/prepare">
-        <input type="hidden" name="lang" value="{{ language }}">
-        <button type="submit"
-                title="Write and score this memory again, using your notes">↻ Regenerate</button>
-      </form>
-      {# Recorded from the canvas and the audio bus the player is already using, so the
-         file IS the film you just watched (§11.2). Real time, hence the warning: there
-         is no way to mux a faster-than-realtime audio track without shipping a muxer. #}
-      <button class="feed-download" id="download" type="button"
-              title="Record this film to a video file. Plays it through once in real
-time — leave the tab visible while it records.">
-        <span class="feed-download-text">↓ Download</span>
-      </button>
       <canvas class="feed-stage" id="stage"></canvas>
       <p class="feed-text" id="feed-text"></p>
       <button class="feed-start" id="start" type="button">
@@ -138,7 +227,11 @@ time — leave the tab visible while it records.">
         {% else %}
           <form method="post" action="/feed/{{ key }}/prepare">
             <input type="hidden" name="lang" value="{{ language }}">
-            <button type="submit">Prepare this memory</button>
+            {{ narrator_picker() }}
+            <button type="submit"
+                    {% if narration.state == 'draft' %}title="Speak your edited narration, and score this memory again"{% endif %}
+                    data-title-draft="Speak your edited narration, and score this memory again"
+                    data-title-no-draft="">Prepare this memory</button>
           </form>
           <p class="feed-note">
             Writes the edit, the narration and a soundtrack on this machine. It runs
@@ -158,6 +251,9 @@ time — leave the tab visible while it records.">
        escaped every quote and backslash, and the server neutralises `</` so the
        payload cannot close this tag early. #}
     <script id="notes" type="application/json">{{ notes_json | safe }}</script>
+    {# The film's narration rows (§11.3), the same `| safe` rule. NEVER id="narration":
+       that is the audio element the player reads. #}
+    <script id="narration-data" type="application/json">{{ narration_json | safe }}</script>
       {# Every note on this memory, editable, plus a new one at wherever the film
          is standing — or at 0:00 on the Prepare screen, where a note is about the
          film as a whole. #}
@@ -173,18 +269,64 @@ time — leave the tab visible while it records.">
           <span class="feed-notes-chevron" aria-hidden="true">▾</span>
         </button>
         <div class="feed-notes-body" id="notes-body">
+        {# Which narration the next film speaks. One line per state; `feed-notes.js`
+           shows the one of the current rows after every reply (§11.3, D119, D120). #}
+        {% set draft = narration.state == 'draft' %}
+        <p class="feed-narration-state" data-state="film" {{ '' if narration.state == 'film' else 'hidden' }}>The film's narration is in this list with your notes. Change its words, and ↻ Regenerate speaks them as written. With no change, ↻ Regenerate writes a new story.</p>
+        <p class="feed-narration-state" data-state="draft-changed" {{ '' if draft and narration.changed else 'hidden' }}>Your edited narration. ↻ Regenerate speaks it as written.</p>
+        <p class="feed-narration-state" data-state="draft-unchanged" {{ '' if draft and not narration.changed else 'hidden' }}>This film speaks your edited narration. ↻ Regenerate speaks it again as written.</p>
+        <p class="feed-narration-state" data-state="draft" {{ '' if draft else 'hidden' }}>Notes cannot rewrite these words or provide a new voice or music interpretation. Existing voice choices still pass current note gating and validation. Effect instructions reach the conductor; matched speech fixes shot timing.
+          <button class="feed-narration-undo" type="button"
+                  data-confirm="Stop using your edited narration? The next Prepare or Regenerate writes a new story.">Write a new story</button></p>
+        <p class="feed-narration-state" data-state="legacy" {{ '' if narration.state == 'legacy' else 'hidden' }}>This older film has no timed narration text. ↻ Regenerate makes a new film whose narration you can edit here.</p>
+        <p class="feed-narration-error" role="alert" hidden
+           data-offline="Not saved: the app did not answer. Your text stays in its row.">
+          <span class="feed-narration-message"></span>
+          <span data-error-tail hidden>Copy any text you want to keep, then load the current narration.</span>
+          <button type="button" data-error-reload hidden>Load the current narration</button>
+        </p>
         <ul class="feed-notes-list" id="notes-list"></ul>
+        {# The AI proposes, the viewer decides (§11.3): nothing changes until Use this. The
+           transcript and the proposal are model text, so `feed-notes.js` only ever sets
+           them as text. Hidden with no rows; the script keeps that true after a reply. #}
+        <section class="feed-rephrase" id="rephrase" {{ '' if narration.state in ('film', 'draft') else 'hidden' }}
+                 data-unsaved="Not sent: an edit to the narration is not saved."
+                 data-unused="Not used: an edit to the narration is not saved."
+                 data-offline="The app did not answer. Nothing changed."
+                 data-lost="This did not finish. Ask again."
+                 data-cancelled="Cancelled.">
+          <h2 class="feed-rephrase-title">Ask AI to rephrase</h2>
+          <ol class="feed-rephrase-log" id="rephrase-log" aria-live="polite"></ol>
+          <div class="feed-rephrase-proposal" id="rephrase-proposal" hidden>
+            <p class="feed-rephrase-summary" id="rephrase-summary"></p>
+            <ul class="feed-rephrase-changes" id="rephrase-changes"></ul>
+            <p class="feed-rephrase-outdated" id="rephrase-outdated" hidden>These words were written for an older narration. Ask again.</p>
+            <button type="button" id="rephrase-use">Use this</button>
+            <button type="button" id="rephrase-dismiss">Dismiss</button>
+          </div>
+          <p class="feed-rephrase-progress" id="rephrase-progress" hidden>
+            <span id="rephrase-stage"></span>
+            <button type="button" id="rephrase-cancel">Cancel</button>
+          </p>
+          <p class="feed-rephrase-refused" id="rephrase-refused" role="alert" hidden></p>
+          <form class="feed-rephrase-form" id="rephrase-form">
+            <textarea id="rephrase-text" rows="1" maxlength="1000"
+                      placeholder="Ask for a change…"></textarea>
+            <button type="submit" id="rephrase-send">Send</button>
+          </form>
+        </section>
         {# Anything in [square brackets] is an INSTRUCTION rather than a sentence: it
            is lifted out and sent to whichever part of generation can act on it, and
            the rest of the note stays as prose (§11.3). The list is generated from the
            parser's own vocabulary, so it cannot drift from what actually works. #}
         <details class="feed-legend">
           <summary>Use [brackets] to direct it</summary>
-          <p class="feed-legend-lead">
+          <p class="feed-legend-lead" data-narration="no-draft" {{ 'hidden' if draft else '' }}>
             <code>[low man's voice] it was a bad day</code> — the words become
             narration, the bracket becomes an instruction. Add a number for a length:
             <code>[hold 5s]</code>.
           </p>
+          <p class="feed-legend-lead" data-narration="draft" {{ '' if draft else 'hidden' }}>With your edited narration, a note's words are not narrated and cannot change its words, voices or music. Effect brackets still reach the conductor; matched speech fixes shot timing.</p>
           {% for kind, blurb, words in legend %}
             <p class="feed-legend-row">
               <strong>{{ kind }}</strong> <span>{{ blurb }}</span><br>
@@ -218,7 +360,9 @@ time — leave the tab visible while it records.">
         close.addEventListener('click', leave);
         document.addEventListener('keydown', (event) => {
           if (event.key !== 'Escape') { return; }
-          // The FILM gets first refusal: a recording to cancel or a playback to stop is
+          // A running rephrase is a level of its own, above the film (§13.1 rule 7).
+          if (window.feedNotes && window.feedNotes.escape()) { return; }
+          // The FILM gets the next refusal: a recording to cancel or a playback to stop is
           // "one level" of its own, and closing the page out from under either is not
           // what Esc was asked to do. It answers false when there is nothing to undo.
           if (window.feedFilm && window.feedFilm.escape()) { return; }
@@ -240,13 +384,40 @@ time — leave the tab visible while it records.">
           });
         }
         for (const form of document.querySelectorAll('form[action$="/prepare"]')) {
+          const refuse = (detail) => {
+            let line = form.nextElementSibling;
+            if (!line || !line.classList.contains('feed-refused')) {
+              line = document.createElement('p');
+              line.className = 'feed-failed feed-refused';
+              line.setAttribute('role', 'alert');
+              form.after(line);
+            }
+            line.textContent = detail;
+          };
           form.addEventListener('submit', async (event) => {
             event.preventDefault();
-            await fetch(form.getAttribute('action'), {
+            // The build reads the edited narration when it starts, so every passage
+            // save must have landed first; an unsaved or refused edit starts nothing (D123).
+            if (window.feedNotes && !(await window.feedNotes.settled())) {
+              refuse('Not started: an edit to the narration is not saved. See Tell the story better.');
+              return;
+            }
+            const response = await fetch(form.getAttribute('action'), {
               method: 'POST',
               body: new FormData(form),
               redirect: 'manual',
-            }).catch(() => {});
+            }).catch(() => null);
+            // A refused narrator (409: being deleted, no example…) says why under the
+            // form, and the page stays. Every other reply reloads, as before.
+            if (response && response.status >= 400 && response.status < 500) {
+              let detail = `The film was not started (${response.status}).`;
+              try {
+                const body = await response.json();
+                if (body && typeof body.detail === 'string') { detail = body.detail; }
+              } catch (_) { /* not JSON */ }
+              refuse(detail);
+              return;
+            }
             const code = (new FormData(form)).get('lang') || '';
             location.replace(`${location.pathname}?lang=${code}`);
           });

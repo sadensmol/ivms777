@@ -69,14 +69,40 @@ def test_the_agent_can_request_context_then_answer(conn):
     assert len(client.calls) == 2  # one expand round, then the answer
 
 
-def test_dropping_below_two_photos_skips_the_memory(conn):
+def test_a_drop_list_that_would_empty_a_kept_memory_is_ignored(conn):
+    # keep=true with a title and story, yet every id in drop_photo_ids: the model
+    # contradicted itself (seen live with 6 undated forest photos). The keep wins.
+    for pid in range(1, 7):
+        _photo(conn, pid)
+    client = FakeInferenceClient([json.dumps({
+        "action": "answer", "keep": True, "title": "A trip to the woods",
+        "description": "Out in the forest.", "drop_photo_ids": [1, 2, 3, 4, 5, 6],
+        "order": [1],
+    })])
+    memory = compose_memory(conn, client, "planner", 1, Candidate([1, 2, 3, 4, 5, 6]),
+                            signature="s")
+    assert memory is not None
+    assert sorted(memory.photo_ids) == [1, 2, 3, 4, 5, 6]
+
+
+def test_a_drop_list_leaving_one_photo_is_ignored(conn):
     for pid in (1, 2):
         _photo(conn, pid)
     client = FakeInferenceClient([json.dumps({
         "action": "answer", "keep": True, "title": "T", "description": "d.",
         "drop_photo_ids": [2],
     })])
-    assert compose_memory(conn, client, "planner", 1, Candidate([1, 2]), signature="s") is None
+    memory = compose_memory(conn, client, "planner", 1, Candidate([1, 2]), signature="s")
+    assert memory is not None and memory.photo_ids == [1, 2]
+
+
+def test_a_single_photo_candidate_is_still_skipped(conn):
+    _photo(conn, 1)
+    client = FakeInferenceClient([json.dumps({
+        "action": "answer", "keep": True, "title": "T", "description": "d.",
+        "drop_photo_ids": [],
+    })])
+    assert compose_memory(conn, client, "planner", 1, Candidate([1]), signature="s") is None
 
 
 def test_unusable_model_output_is_skipped_not_raised(conn):
@@ -220,3 +246,36 @@ def test_a_failing_model_call_skips_the_candidate_instead_of_raising(conn):
 
     assert compose_memory(conn, Exploding(), "planner", 1,
                           Candidate([1, 2, 3]), signature="s") is None
+
+
+def test_a_skipped_candidate_logs_why_with_the_model_reply(conn, caplog):
+    # A rebuild that keeps nothing must say why — the reply is otherwise invisible.
+    for pid in (1, 2, 3):
+        _photo(conn, pid)
+    reply = json.dumps({"action": "answer", "keep": False})
+    client = FakeInferenceClient([reply])
+    with caplog.at_level("WARNING", logger="albums.compose"):
+        compose_memory(conn, client, "planner", 1, Candidate([1, 2, 3]), signature="s")
+    assert "keep=false" in caplog.text
+    assert reply in caplog.text
+
+
+def test_an_unparseable_reply_is_logged_verbatim(conn, caplog):
+    for pid in (1, 2, 3):
+        _photo(conn, pid)
+    client = FakeInferenceClient(["Sure! Here is a memory about the forest."])
+    with caplog.at_level("WARNING", logger="albums.compose"):
+        compose_memory(conn, client, "planner", 1, Candidate([1, 2, 3]), signature="s")
+    assert "unparseable" in caplog.text
+    assert "Here is a memory about the forest" in caplog.text
+
+
+def test_an_answer_missing_its_description_logs_why(conn, caplog):
+    for pid in (1, 2, 3):
+        _photo(conn, pid)
+    client = FakeInferenceClient([json.dumps(
+        {"action": "answer", "keep": True, "title": "Forest", "drop_photo_ids": []}
+    )])
+    with caplog.at_level("WARNING", logger="albums.compose"):
+        compose_memory(conn, client, "planner", 1, Candidate([1, 2, 3]), signature="s")
+    assert "description" in caplog.text

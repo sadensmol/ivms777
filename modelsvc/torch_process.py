@@ -14,6 +14,9 @@ defeat the point. The parent consequently never imports torch at all.
 from __future__ import annotations
 
 import multiprocessing as mp
+import os
+import sys
+import tempfile
 import threading
 from importlib import import_module
 from typing import Any
@@ -26,15 +29,24 @@ def _resolve(target: str):
     return getattr(import_module(module_path), attr)
 
 
-def _child_main(conn, target: str, args: tuple, warm: str | None) -> None:
-    """Build the hosted object, then answer `(method, args)` messages forever."""
+def _child_main(
+    conn, target: str, args: tuple, warm: str | None, load_log: str | None = None
+) -> None:
+    """Build the hosted object, then answer `(method, args)` messages forever.
+
+    While LOADING, fd 2 goes to `load_log`, so a child that dies mid-load (no message
+    ever sent) still leaves its reason for the parent to report. Restored after.
+    """
+    saved = _capture_stderr(load_log)
     try:
         obj = _resolve(target)(*args)
         if warm is not None:
             getattr(obj, warm)()
     except BaseException as exc:  # noqa: BLE001 - report the failure, then exit
+        _restore_stderr(saved)
         conn.send(("err", f"{type(exc).__name__}: {exc}"))
         return
+    _restore_stderr(saved)
     conn.send(("ok", None))  # ready handshake
     while True:
         try:
@@ -48,6 +60,44 @@ def _child_main(conn, target: str, args: tuple, warm: str | None) -> None:
             conn.send(("ok", getattr(obj, method)(*call_args)))
         except BaseException as exc:  # noqa: BLE001 - a bad call must not kill the host
             conn.send(("err", f"{type(exc).__name__}: {exc}"))
+
+
+def _capture_stderr(path: str | None) -> int | None:
+    if path is None:
+        return None
+    sys.stderr.flush()
+    saved = os.dup(2)
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND)
+    os.dup2(fd, 2)
+    os.close(fd)
+    return saved
+
+
+def _restore_stderr(saved: int | None) -> None:
+    if saved is None:
+        return
+    sys.stderr.flush()
+    os.dup2(saved, 2)
+    os.close(saved)
+
+
+def _drain(path: str) -> str:
+    """The child's load-time stderr, and the file removed."""
+    try:
+        with open(path, errors="replace") as handle:
+            return handle.read()
+    except OSError:
+        return ""
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _tail(text: str, lines: int = 15) -> str:
+    kept = [line for line in text.strip().splitlines() if line.strip()][-lines:]
+    return "\n".join(kept) if kept else "(no output)"
 
 
 class TorchWorker:
@@ -77,9 +127,11 @@ class TorchWorker:
                 return
             self._kill()
             parent, child = _CTX.Pipe()
+            handle, load_log = tempfile.mkstemp(prefix="ivms777-load-", suffix=".log")
+            os.close(handle)
             proc = _CTX.Process(
                 target=_child_main,
-                args=(child, self._target, self._args, self._warm),
+                args=(child, self._target, self._args, self._warm, load_log),
                 daemon=True,
             )
             proc.start()
@@ -87,8 +139,29 @@ class TorchWorker:
             self._proc, self._conn = proc, parent
             if not parent.poll(self._ready_timeout):
                 self._kill()
-                raise TimeoutError(f"{self._target} not ready in {self._ready_timeout}s")
-            kind, payload = parent.recv()
+                output = _drain(load_log)
+                raise TimeoutError(
+                    f"{self._target} not ready in {self._ready_timeout}s; its output:\n"
+                    f"{_tail(output)}"
+                )
+            try:
+                kind, payload = parent.recv()
+            except EOFError:
+                # The child died before it could report — a native crash or a library
+                # calling os._exit. A bare EOFError said nothing; the exit code tells a
+                # signal (negative) from an exit (positive), and its captured stderr
+                # says why.
+                proc.join(5)
+                code = proc.exitcode
+                self._kill()
+                output = _drain(load_log)
+                sys.stderr.write(output)
+                raise RuntimeError(
+                    f"{self._target} died while loading (exit code {code}); its output:\n"
+                    f"{_tail(output)}"
+                ) from None
+            output = _drain(load_log)
+            sys.stderr.write(output)  # the terminal still sees load-time warnings
             if kind != "ok":
                 self._kill()
                 raise RuntimeError(f"{self._target} failed to load: {payload}")

@@ -78,3 +78,36 @@ def test_uncaptioned_photos_are_ignored(conn):
               shot_at="2025-07-12T09:04:00")  # no caption
     cands = seed_candidates(conn, owner_id=1, min_size=3)
     assert cands[0].photo_ids == [1, 2, 3]
+
+
+def test_undated_photos_from_one_folder_are_one_candidate(conn):
+    # No EXIF date (a scan, a stripped export) must not keep a photo out of every
+    # memory: pooling only bounds context, so undated photos pool by upload folder.
+    for pid in (1, 2, 3):
+        _p(conn, pid, None, sources=(f"school/image{pid}.jpg",))
+    cands = seed_candidates(conn, owner_id=1, min_size=3)
+    assert [sorted(c.photo_ids) for c in cands] == [[1, 2, 3]]
+
+
+def test_undated_photos_from_different_folders_stay_apart(conn):
+    for pid in (1, 2, 3):
+        _p(conn, pid, None, sources=(f"school/image{pid}.jpg",))
+    for pid in (4, 5, 6):
+        _p(conn, pid, None, sources=(f"beach/image{pid}.jpg",))
+    cands = seed_candidates(conn, owner_id=1, min_size=3)
+    assert sorted(sorted(c.photo_ids) for c in cands) == [[1, 2, 3], [4, 5, 6]]
+
+
+def test_undated_photos_do_not_join_a_dated_run(conn):
+    for pid in (1, 2, 3):
+        _p(conn, pid, f"2025-07-12T1{pid}:00:00", sources=(f"school/image{pid}.jpg",))
+    for pid in (4, 5, 6):
+        _p(conn, pid, None, sources=(f"school/image{pid}.jpg",))
+    cands = seed_candidates(conn, owner_id=1, min_size=3)
+    assert sorted(sorted(c.photo_ids) for c in cands) == [[1, 2, 3], [4, 5, 6]]
+
+
+def test_an_undated_folder_below_min_size_is_dropped(conn):
+    for pid in (1, 2):
+        _p(conn, pid, None, sources=(f"school/image{pid}.jpg",))
+    assert seed_candidates(conn, owner_id=1, min_size=3) == []

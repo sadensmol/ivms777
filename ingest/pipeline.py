@@ -4,10 +4,10 @@ app's best-effort inline drain after an upload (`web.app`).
 The pass is split into two groups by dependency, so a failure of the heavy
 backend never blocks the light stage (§8, stages are independent):
 
-1. **GPU/inference-free** — thumbnails, EXIF place facets, folder deletions. These
-   are what make an uploaded photo *appear in the library* (the grid shows photos
-   with a `thumb_key`), so they must run even when the embedder or inference
-   backend is unavailable.
+1. **GPU/inference-free** — thumbnails, EXIF place facets, folder deletions,
+   saved-voice deletions. These are what make an uploaded photo *appear in the
+   library* (the grid shows photos with a `thumb_key`), so they must run even when
+   the embedder or inference backend is unavailable.
 2. **Embedder/inference** — embed, taxonomy, caption. If the SigLIP embedder cannot
    be built (e.g. the app/worker container cannot init CUDA on jetson — the
    observed `RuntimeError 801`), these are skipped THIS pass and retried on the
@@ -17,6 +17,7 @@ backend never blocks the light stage (§8, stages are independent):
 
 import logging
 
+from feed.saved_voices import process_voice_deletions
 from ingest.caption import (
     backfill_caption_embeds,
     backfill_caption_vectors,
@@ -54,6 +55,8 @@ def drain_pass(context, vocab, should_preempt=lambda: False) -> None:
         conn, context.originals, context.derived, settings.owner_id,
         settings.thumb_grid_px, settings.thumb_detail_px,
     )
+    # The saved-voice deletion outbox (D33). Never raises for one row (it logs it).
+    process_voice_deletions(conn, context.voices, settings.owner_id)
     drain(conn, {
         "thumbnail": thumbnail_handler(
             context.originals, context.derived,

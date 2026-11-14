@@ -22,6 +22,7 @@
   const canvas = document.getElementById('stage');
   const caption = document.getElementById('feed-text');
   const start = document.getElementById('start');
+  const playLabel = start.querySelector('.feed-start-play');
   const music = document.getElementById('music');
   const narration = document.getElementById('narration');
 
@@ -1036,6 +1037,13 @@
   };
 
   let edit = null, index = 0, playing = false, front = 0, mixed = false;
+  // Nothing starts before the first photograph is in its texture, or has been given up
+  // on: the draw loop starts there, so a film started earlier is sound over a canvas
+  // nothing paints.
+  let ready = false;
+  // The film could not load at all: Play stays dead, and saying Loading… would be a lie.
+  let unplayable = false;
+  const playText = playLabel.textContent;
   let fxShot = {}, fxTransition = {};
   // Only used before the first Play, and for the rare film with no audio at all: the
   // soundtrack is the clock everywhere else.
@@ -1313,7 +1321,10 @@
     body.classList.add('is-paused');
     showPanel(true);
   };
-  const toggle = () => (playing ? pause() : play());
+  const toggle = () => {
+    if (!ready) { if (!unplayable) { playLabel.textContent = 'Loading…'; } return; }
+    if (playing) { pause(); } else { play(); }
+  };
 
   // Stepping SEEKS the soundtrack, because the soundtrack is the clock. Moving the
   // picture alone would desync it from the voice on the very first press.
@@ -1416,8 +1427,11 @@
 
   // Opening the panel hands it the moment the film is standing at, so the stamp shown
   // beside the box is the one the note is saved with.
+  //
+  // `filmTime`, never `clock()`: `play()` calls this before it re-anchors `silentStart`,
+  // so the clock would count the time spent idle as film time.
   const showPanel = (open) => {
-    if (window.feedNotes) { window.feedNotes.open(open, clock()); }
+    if (window.feedNotes) { window.feedNotes.open(open, filmTime); }
   };
 
   // --- export (design §11.2) -------------------------------------------------------
@@ -1530,6 +1544,7 @@
   };
 
   const startExport = async () => {
+    if (!ready) { if (!unplayable) { playLabel.textContent = 'Loading…'; } return; }
     // A click WHILE IT WARMS UP means "never mind" — the recorder exists but has not
     // started, so `stopExport` would have nothing to stop and the film would begin
     // recording a moment later anyway.
@@ -1617,7 +1632,7 @@
 
   start.addEventListener('click', toggle);
   document.addEventListener('keydown', (e) => {
-    if (!edit || !edit.shots.length) return;
+    if (!ready) return;
     // Space is play/pause EXCEPT while writing a note, where it is a space.
     const typing = e.target instanceof HTMLElement
       && (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT');
@@ -1659,12 +1674,22 @@
 
   (async () => {
     resize();
-    edit = normalise(await (await fetch(`/feed/${key}/timeline.json?lang=${lang}`)).json());
-    if (!edit.shots || !edit.shots.length) return;
+    try {
+      edit = normalise(await (await fetch(`/feed/${key}/timeline.json?lang=${lang}`)).json());
+    } catch { edit = null; }
+    if (!edit || !edit.shots || !edit.shots.length) {
+      unplayable = true;
+      playLabel.textContent = playText;
+      return;
+    }
     fxShot = (edit.effects && edit.effects.shot) || {};
     fxTransition = (edit.effects && edit.effects.transition) || {};
-    await loadInto(slots[front], edit.shots[0].photo_id);
-    await loadInto(slots[1 - front], edit.shots[0].photo_id);
+    const bounded = (waiting) => Promise.race([
+      waiting, new Promise((resolve) => setTimeout(resolve, READY_TIMEOUT_MS))]);
+    await bounded(loadInto(slots[front], edit.shots[0].photo_id));
+    await bounded(loadInto(slots[1 - front], edit.shots[0].photo_id));
+    ready = true;
+    playLabel.textContent = playText;
     // The editor is hidden during PLAYBACK and shown whenever the film is not running
     // — the title card included. The title card is not playback: it is where you read
     // what you already said before deciding to watch or to prepare again.
