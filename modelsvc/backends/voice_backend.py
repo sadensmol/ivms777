@@ -15,5 +15,10 @@ class VoiceBackend:
 
     def speak(self, text: str, voice: str | None = None,
               segments: list[str] | None = None,
-              voices: list[str | None] | None = None) -> dict:
-        return self._provider().call("speak", text, voice, segments, voices)
+              voices: list[str | None] | None = None,
+              references: dict | None = None) -> dict:
+        # The fifth argument goes only to the voice-copy child: Kokoro and Silero take
+        # four, and a request without references must reach them exactly as before.
+        if references is None:
+            return self._provider().call("speak", text, voice, segments, voices)
+        return self._provider().call("speak", text, voice, segments, voices, references)

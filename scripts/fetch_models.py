@@ -1,4 +1,4 @@
-"""Pre-fetch the selected slots' model weights (design §4.1).
+"""Download every model the app needs, before `make up` starts it (design §4.1).
 
 `make up` already fetches the GGUF (`make llama-mac`) with a progress bar. This does
 the same for everything else, so a first run downloads visibly and UP FRONT instead of
@@ -6,9 +6,10 @@ stalling inside the first request that needs a model — where a missing or gate
 looks like a 503 rather than a download. That silent path is exactly how a
 licence-gated music model turned into "the film just has no music".
 
-Deliberately NEVER fails the build. A gated repo the user has not accepted, or no
-network at all, must still leave a startable app: that slot is simply silent, and the
-reason is printed once, here, where it is readable.
+A failed download FAILS the target, so `make up` stops instead of starting an app
+that is missing a model. It used to be swallowed: aimed at the container path `/data`,
+the Silero download failed on every Mac and the app started with no Russian voice.
+Every model is still tried first, so one run reports every failure at once.
 """
 
 from __future__ import annotations
@@ -39,9 +40,18 @@ def wanted(settings: Settings, conn=None) -> list[tuple[str, str]]:
             entries = [catalog.get(slot, key)]
         for entry in entries:
             if isinstance(entry.source, HfSource):
-                pairs.append((slot, entry.source.repo))
+                # A pinned entry is listed as `repo@revision`; a Hub repo id has no `@`.
+                repo, revision = entry.source.repo, entry.source.revision
+                pairs.append((slot, f"{repo}@{revision}" if revision else repo))
             elif isinstance(entry.source, UrlSource):
                 pairs.append((slot, entry.source.url))
+    # The speech recognition and the speaker-similarity meter are no slots (§4.1): each is
+    # fetched on every profile that offers it, so neither stalls on a download.
+    for unit, entry in (("asr", catalog.transcriber_for(settings.profile)),
+                        ("speaker_embed", catalog.speaker_embedder_for(settings.profile))):
+        if entry is not None:
+            source = entry.source
+            pairs.append((unit, f"{source.repo}@{source.revision}"))
     return pairs
 
 
@@ -51,7 +61,11 @@ def _fetch(target: str, settings: Settings) -> None:
         return
     from huggingface_hub import snapshot_download
 
-    snapshot_download(target)
+    repo, _, revision = target.partition("@")
+    if revision:
+        snapshot_download(repo, revision=revision)
+    else:
+        snapshot_download(repo)
 
 
 def _fetch_url(url: str, settings: Settings) -> None:
@@ -75,7 +89,7 @@ def _fetch_url(url: str, settings: Settings) -> None:
 
 
 def main(argv: list[str] | None = None, *, fetch=None) -> int:
-    parser = argparse.ArgumentParser(description="Pre-fetch selected model weights.")
+    parser = argparse.ArgumentParser(description="Download every model the app needs.")
     parser.add_argument("--profile", default=None)
     args = parser.parse_args(argv)
     settings = Settings(profile=args.profile) if args.profile else Settings()
@@ -93,7 +107,8 @@ def main(argv: list[str] | None = None, *, fetch=None) -> int:
     for target, reason in skipped:
         print(f"  ! skipped {target} — {reason}")
     if skipped:
-        print("  the app still starts; those slots stay silent until the weights land.")
+        print("  make up stops: every model above must download before the app starts.")
+        return 1
     return 0
 
 

@@ -55,10 +55,15 @@ def _http_fetch(url: str, dest: Path, progress: Progress) -> None:
     part.rename(dest)  # atomic: the file appears only when it is complete
 
 
-def _hf_snapshot(repo: str) -> None:
+def _pin(revision: str | None) -> dict:
+    """`revision=` only for a pinned entry, so an unpinned one makes today's calls."""
+    return {} if revision is None else {"revision": revision}
+
+
+def _hf_snapshot(repo: str, revision: str | None = None) -> None:
     from huggingface_hub import snapshot_download
 
-    snapshot_download(repo)
+    snapshot_download(repo, **_pin(revision))
 
 
 def _hf_cache_dir(repo: str) -> Path:
@@ -70,12 +75,12 @@ def _hf_cache_dir(repo: str) -> Path:
     return Path(HF_HUB_CACHE) / f"models--{repo.replace('/', '--')}"
 
 
-def _hf_total_bytes(repo: str) -> int:
+def _hf_total_bytes(repo: str, revision: str | None = None) -> int:
     """The repo's real size, so the bar has a true denominator instead of the
     catalog's rounded estimate."""
     from huggingface_hub import HfApi
 
-    info = HfApi().model_info(repo, files_metadata=True)
+    info = HfApi().model_info(repo, files_metadata=True, **_pin(revision))
     return sum(sibling.size or 0 for sibling in (info.siblings or ()))
 
 
@@ -99,9 +104,10 @@ def _hf_fetch(
     repo: str,
     progress: Progress,
     *,
-    snapshot: Callable[[str], None] = _hf_snapshot,
+    revision: str | None = None,
+    snapshot: Callable[..., None] = _hf_snapshot,
     cache_dir: Callable[[str], Path] = _hf_cache_dir,
-    total_bytes: Callable[[str], int] = _hf_total_bytes,
+    total_bytes: Callable[..., int] = _hf_total_bytes,
     interval: float = 1.0,
 ) -> None:
     """`snapshot_download` takes no progress callback and its internal tqdm classes
@@ -110,7 +116,7 @@ def _hf_fetch(
     indistinguishable from a stall (§4.1)."""
     directory = cache_dir(repo)
     try:
-        total = total_bytes(repo)
+        total = total_bytes(repo, **_pin(revision))
     except Exception:  # noqa: BLE001 - a metadata miss must not fail the download
         total = 0
     stop = threading.Event()
@@ -122,7 +128,7 @@ def _hf_fetch(
     watcher = threading.Thread(target=watch, daemon=True)
     watcher.start()
     try:
-        snapshot(repo)
+        snapshot(repo, **_pin(revision))
     finally:
         stop.set()
         watcher.join(timeout=5)
@@ -136,11 +142,11 @@ def _hf_cache_bytes(repo: str) -> int:
     return _blob_bytes(_hf_cache_dir(repo))
 
 
-def _hf_present(repo: str) -> bool:
+def _hf_present(repo: str, revision: str | None = None) -> bool:
     from huggingface_hub import snapshot_download
 
     try:
-        snapshot_download(repo, local_files_only=True)
+        snapshot_download(repo, local_files_only=True, **_pin(revision))
     except Exception:  # noqa: BLE001 - any miss means "not cached", which is not an error
         return False
     return True
@@ -156,8 +162,8 @@ class Downloads:
         model_dir: Path,
         *,
         http_fetch: Callable[[str, Path, Progress], None] = _http_fetch,
-        hf_fetch: Callable[[str, Progress], None] = _hf_fetch,
-        hf_present: Callable[[str], bool] = _hf_present,
+        hf_fetch: Callable[..., None] = _hf_fetch,
+        hf_present: Callable[..., bool] = _hf_present,
         hf_bytes: Callable[[str], int] = _hf_cache_bytes,
         spawn: Callable[[Callable[[], None]], None] = _spawn,
     ) -> None:
@@ -180,6 +186,10 @@ class Downloads:
         if isinstance(source, GgufSource):
             return f"gguf:{source.repo}/{source.file}+{source.mmproj_file or ''}"
         if isinstance(source, HfSource):
+            # A pinned entry is its own download: another commit of the same repo is
+            # not this one.
+            if source.revision is not None:
+                return f"hf:{source.repo}@{source.revision}"
             return f"hf:{source.repo}"
         raise TypeError(f"unknown source: {source!r}")
 
@@ -201,7 +211,7 @@ class Downloads:
         if isinstance(source, GgufSource):
             return all(dest.exists() for _, dest in self._files(entry))
         if isinstance(source, HfSource):
-            return self._hf_present(source.repo)
+            return self._hf_present(source.repo, **_pin(source.revision))
         raise TypeError(f"unknown source: {source!r}")
 
     def present_bytes(self, entry: ModelEntry) -> int:
@@ -282,7 +292,7 @@ class Downloads:
                 # the GGUF path uses, so it also gets the atomic `.part` rename.
                 self._http_fetch(source.url, self._dir / source.file, progress)
             else:
-                self._hf_fetch(source.repo, progress)
+                self._hf_fetch(source.repo, progress, **_pin(source.revision))
             error = None
         except Exception as exc:  # noqa: BLE001 - surfaced to the UI, not swallowed
             error = f"{type(exc).__name__}: {exc}"

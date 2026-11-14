@@ -4,21 +4,64 @@ embed/tag/caption/plan/chat call is an HTTP round trip through this client.
 """
 
 import base64
+import hashlib
 import json
 from collections.abc import Iterator
 
 import httpx
 
+# Saved-voice narration (D28): VoxCPM2's speed on MPS float32 is unmeasured, and a 2-3
+# minute narration plus a first load can outlast the preset voices' 300 s.
+SPEAK_TIMEOUT = 300.0
+SAVED_VOICE_SPEAK_TIMEOUT = 1800.0
+
+
+def _b64(data: bytes) -> str:
+    return base64.b64encode(data).decode()
+
 
 def _audio(body: dict) -> dict:
     """Decode a `/speak` or `/music` response: the wire carries base64, every caller
     wants bytes to write straight to storage."""
+    conditioning = {
+        token: entry | {"blob": None if entry.get("blob") is None  # pragma: allowlist secret
+                        else base64.b64decode(entry["blob"])}
+        for token, entry in (body.get("conditioning") or {}).items()
+    }
     return {
         "audio": base64.b64decode(body["audio"]),
         "sample_rate": body["sample_rate"],
         "model": body["model"],
         "segments": body.get("segments", []),
+        "revision": body.get("revision"),
+        "conditioning": conditioning,
+        "adapters": body.get("adapters") or {},
+        "controls": body.get("controls") or {},
     }
+
+
+def _reference_payload(ref: dict) -> dict:
+    # A voice model alone has no take (D76): no `audio`, so no `sha256` either.
+    payload = {} if ref.get("audio") is None else {
+        "audio": _b64(ref["audio"]),
+        "sha256": ref["sha256"],
+    }
+    payload |= {
+        "language": ref["language"],
+        "transcript": ref.get("transcript"),
+        "conditioning": [
+            {"model": c["model"], "revision": c["revision"], "blob": _b64(c["blob"])}
+            for c in ref.get("conditioning") or []
+        ],
+    }
+    if ref.get("adapter") is not None:
+        payload["adapter"] = {"blob": _b64(ref["adapter"]["blob"]),
+                              "sha256": ref["adapter"]["sha256"]}
+    if "use_clip" in ref:
+        payload["use_clip"] = ref["use_clip"]
+    if "controls" in ref:
+        payload["controls"] = ref["controls"]
+    return payload
 
 
 class ModelsClient:
@@ -53,15 +96,29 @@ class ModelsClient:
     def speak(
         self, text: str, language: str = "en", voice: str | None = None,
         segments: list[str] | None = None,
-        voices: list[str | None] | None = None, *, timeout: float = 300.0,
+        voices: list[str | None] | None = None, *,
+        references: dict | None = None, timeout: float | None = None,
     ) -> dict:
         """One narration clip (design §11.1). `audio` comes back as raw WAV bytes.
 
         The timeout is generous on purpose: this is a BATCH call on a board that may
         first have to evict gemma and load the voice model (§8.1).
+
+        `references` speaks SAVED voices: `{token: {audio: bytes, sha256, language,  # pragma: allowlist secret
+        transcript, conditioning: [{model, revision, blob: bytes}]}}`, and optionally
+        `adapter: {blob: bytes, sha256}` and `use_clip`; a reference with `use_clip`
+        False may leave out `audio` and `sha256` (D76). A test may add `controls:
+        {cfg_value, inference_timesteps}`. The reply's `conditioning` comes back with
+        its blobs as bytes, and `adapters` and `controls` as the service sent them.
+        `timeout=None` is 1800 s with references and 300 s without.
         """
+        if timeout is None:
+            timeout = SPEAK_TIMEOUT if references is None else SAVED_VOICE_SPEAK_TIMEOUT
         payload = {"text": text, "language": language, "voice": voice,
                    "segments": segments, "voices": voices}
+        if references is not None:
+            payload["references"] = {token: _reference_payload(ref)  # pragma: allowlist secret
+                                     for token, ref in references.items()}
         response = self._client.post("/speak", json=payload, timeout=timeout)
         response.raise_for_status()
         return _audio(response.json())
@@ -200,3 +257,58 @@ class ModelsClient:
     def model_unload(self, name: str, *, timeout: float = 30.0) -> None:
         response = self._client.post(f"/models/{name}/unload", timeout=timeout)
         response.raise_for_status()
+
+    def bake_start(self, clips: list[dict], *, tag: dict, config: dict | None = None,
+                   timeout: float = 600.0) -> dict:
+        """Start a bake; `clips` = `[{audio: bytes, sha256, text, language}]`. The
+        service answers 202 with the status at once."""
+        payload = {"clips": [clip | {"audio": _b64(clip["audio"])} for clip in clips],
+                   "config": config, "tag": tag}
+        response = self._client.post("/voice/bakes", json=payload, timeout=timeout)
+        response.raise_for_status()
+        return response.json()
+
+    def bake_status(self, bake_id: str, *, timeout: float = 10.0) -> dict:
+        response = self._client.get(f"/voice/bakes/{bake_id}", timeout=timeout)
+        response.raise_for_status()
+        return response.json()
+
+    def bake_current(self, *, timeout: float = 10.0) -> dict | None:
+        response = self._client.get("/voice/bakes/current", timeout=timeout)
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        return response.json()
+
+    def bake_cancel(self, bake_id: str, *, timeout: float = 30.0) -> dict:
+        response = self._client.post(f"/voice/bakes/{bake_id}/cancel", timeout=timeout)
+        response.raise_for_status()
+        return response.json()
+
+    def bake_adapter(self, bake_id: str, *, timeout: float = 120.0) -> bytes:
+        response = self._client.get(f"/voice/bakes/{bake_id}/adapter", timeout=timeout)
+        response.raise_for_status()
+        return response.content
+
+    def bake_delete(self, bake_id: str, *, timeout: float = 30.0) -> None:
+        response = self._client.delete(f"/voice/bakes/{bake_id}", timeout=timeout)
+        response.raise_for_status()
+
+    def transcribe(self, audio: bytes, language: str, *, timeout: float = 600.0) -> dict:
+        """The words of one take, `{text, model, revision, seconds, elapsed_s}`. 600 s
+        covers the first call's Whisper load and a wait for a scheduler slot. A non-2xx
+        raises `httpx.HTTPStatusError`."""
+        payload = {"audio": _b64(audio), "sha256": hashlib.sha256(audio).hexdigest(),
+                   "language": language}
+        response = self._client.post("/voice/transcribe", json=payload, timeout=timeout)
+        response.raise_for_status()
+        return response.json()
+
+    def embed_voice(self, audio: bytes, *, timeout: float = 600.0) -> dict:
+        """The speaker embedding of one clip, `{vector, model, revision, seconds, elapsed_s,
+        pipeline}`. 600 s covers the first call's load and a wait for a scheduler slot. A
+        non-2xx raises `httpx.HTTPStatusError`."""
+        payload = {"audio": _b64(audio), "sha256": hashlib.sha256(audio).hexdigest()}
+        response = self._client.post("/voice/embed", json=payload, timeout=timeout)
+        response.raise_for_status()
+        return response.json()

@@ -15,9 +15,12 @@ or a refusal) and still leave a watchable, silent film.
 
 import hashlib
 import logging
+import secrets
 import sqlite3
 import threading
 import time
+from collections.abc import Sequence
+from contextlib import contextmanager
 
 import httpx
 
@@ -35,7 +38,16 @@ from feed.director import (
 from feed.language import DEFAULT
 from feed.mood import SAMPLING
 from feed.mood import energy as measure_energy
+from feed.narration import draft_story, read_draft, rebase_consumed, timeline_script
 from feed.notes import notes_for_prompt, read_notes
+from feed.saved_voices import (
+    castable_takes,
+    film_take,
+    get_voice,
+    read_narrator,
+    reference_for,
+    token,
+)
 from feed.score import plan_sections
 from feed.signals import digest, read_signals
 from feed.store import (
@@ -44,9 +56,19 @@ from feed.store import (
     read_presentation,
     save_presentation,
 )
+from feed.story import _LANGUAGE_NAME as language_names
 from feed.story import _asks_for_a_voice as asks_for_a_voice
-from feed.story import uncovered_notes, write_story
-from feed.voice import catalogue_for_prompt, offered, pick_speaker, resolve
+from feed.story import match_photographs, uncovered_notes, write_story
+from feed.voice import (
+    SavedCast,
+    automatic_for_prompt,
+    offered,
+    pick_speaker,
+    resolve,
+    resolve_saved,
+    voice_label,
+)
+from models.catalog import cloning_entry_for
 from storage.base import Storage
 from storage.keys import content_key
 from storage.wav import decode_wav, duration_seconds
@@ -77,6 +99,11 @@ _STAGES: tuple[tuple[str, float], ...] = (
 # to decide anything, so a board that runs at a different rate gets a wrong estimate and
 # a correct film.
 MUSIC_RATE = 4.8
+
+# Seconds of compute per second of saved-voice narration (D28). An ESTIMATE, for the
+# moving bar only: VoxCPM2's rate on this mac is not measured yet (§6.1 replaces it).
+# Narration runs at about 14 characters a second.
+CLONE_RTF_ESTIMATE = 1.0
 
 
 class _Ticking:
@@ -141,6 +168,35 @@ class Cancelled(RuntimeError):
     without leaving a half-written presentation."""
 
 
+@contextmanager
+def voice_turn(lock: threading.Lock | None, progress, cancelled, fraction: float):
+    """Hold `lock`, the app's one voice call at a time (D52), for the body.
+
+    A caller that waits says so on its bar ("waiting for the voice model" at `fraction`)
+    and still honours Cancel: `cancelled()` is checked before the first acquire, at each
+    1-second miss and once more after the acquire, so a job cancelled while it waited
+    never takes the voice unit. `None` holds nothing."""
+    if lock is None:
+        yield
+        return
+    stage = "waiting for the voice model"
+    if cancelled is not None and cancelled():
+        raise Cancelled(stage)
+    reported = False
+    while not lock.acquire(timeout=1.0):
+        if not reported and progress is not None:
+            progress(stage, fraction)
+        reported = True
+        if cancelled is not None and cancelled():
+            raise Cancelled(stage)
+    try:
+        if cancelled is not None and cancelled():
+            raise Cancelled(stage)
+        yield
+    finally:
+        lock.release()
+
+
 class NarrationFailed(RuntimeError):
     """No voice could be produced for this film, so there is no film.
 
@@ -173,8 +229,21 @@ def build_presentation(
     max_shots: int = 40,
     progress=None,
     cancelled=None,
+    voices: Storage | None = None,
+    voice_lock: threading.Lock | None = None,
+    profile: str | None = None,
 ) -> Presentation:
     """Generate, store and record one memory's film.
+
+    `voices` is the saved-voice store (`data_dir/voices`). A film narrated by a saved
+    voice, chosen or picked by Automatic, needs it. Without it a chosen saved narrator
+    fails the film with the reason, and Automatic offers no saved voice.
+
+    `profile` is this app's hardware profile: Automatic offers saved voices only where
+    voice copy speaks the film's language on it (D105). None offers none.
+
+    `voice_lock` is the app's one voice call at a time (D52): resolving each used take
+    again, reading its audio and the speak call run while it is held (`voice_turn`).
 
     Raises `LookupError` when `group_id` is not this owner's memory — a missing memory
     is a routing bug, not a degraded film, so unlike the audio calls it is not
@@ -203,6 +272,32 @@ def build_presentation(
     shot_signals = read_signals(conn, group_id)
     step("planning the shots")
     edit = direct(shot_signals, base_seconds=base_seconds, max_shots=max_shots)
+    photo_ids = [shot.photo_id for shot in edit.shots]
+    # THE USER'S NARRATOR, when they chose one (D17, D18): a preset or one of their saved
+    # voices. A saved-voice film is narrated by saved voices only. Neither choice ever
+    # becomes Automatic: a narrator that cannot speak fails the film with the reason,
+    # before any model call (D33, D38). A row with neither column is a deleted saved voice.
+    chosen = read_narrator(conn, group_id, language)
+    saved_chosen = chosen is not None and chosen.preset_speaker is None
+    preset = None
+    if chosen is not None and not saved_chosen:
+        preset = resolve(language, chosen.preset_speaker)
+        if preset is None:
+            _fail(conn, group_id, language, current_signature(conn, owner_id), edit,
+                  f"The preset voice «{chosen.preset_speaker}» is not offered for "
+                  f"{language_names.get(language, language)} films. Choose another narrator.",
+                  decisions)
+    if saved_chosen:
+        saved = _saved_cast(conn, voices, owner_id, group_id, language, chosen, edit, decisions)
+    elif (chosen is None and profile and voices is not None
+          and cloning_entry_for(profile, language) is not None):
+        # Automatic may pick a saved voice (D105). A name a preset already holds is left
+        # out: the story's answer would be ambiguous.
+        saved = [(voice, take) for voice, take in castable_takes(conn, owner_id, language)
+                 if resolve(language, voice.name) is None]
+    else:
+        saved = []
+    saved_cast = [SavedCast(token(voice.id), voice.name) for voice, _ in saved]
 
     step("writing the narration")
     # The viewer's notes, whole. Nothing is parsed out of them: every pass that can act
@@ -212,34 +307,56 @@ def build_presentation(
     # is what turns "0:12" into "photograph 3" — which is what lets a fact attach to a
     # picture instead of to a moment (§11.3).
     previous_seconds, photo_at = _previous_cut(conn, group_id, language, shot_signals)
-    # The RICH briefs, not the bare vision sentence: the story pass is the one WRITING
-    # the memory, and it was previously blind to `vibe=festive`, `occasion=holiday`,
-    # `season_weather=snow`, the place and the hour — every label that turns a
-    # description of pictures into a memory of an evening (§11.1). Plus a digest of
-    # what the memory is as a WHOLE, which no per-photo line can carry.
-    story = write_story(
-        client, planner_model, title=title, description=description, edit=edit,
-        shots=[s.brief() for s in shot_signals[: len(edit.shots)]],
-        language=language, digest=digest(shot_signals),
-        # What the viewer typed into an earlier cut of this same film (§11.3).
-        # The PREVIOUS cut's length, so a note's timestamp can be expressed as a
-        # position in the script the model is about to write.
-        notes=notes_for_prompt(viewer_notes, previous_seconds, photo_at=photo_at),
-        # The speakers this language offers, as declared in the catalog: the story pass
-        # CASTS the film from them (CLAUDE.md § "A model's own metadata is DECLARED").
-        speakers=catalogue_for_prompt(language),
-        # What the server will actually take. Asked here, once, so the prompt is cut to
-        # fit instead of being rejected whole — which is what an over-long listing did:
-        # llama-server refused the call and the film failed for want of narration.
-        context_tokens=_context_tokens(client),
-    )
+    # What the server will actually take. Asked here, once, so the prompt is cut to fit
+    # instead of being rejected whole — which is what an over-long listing did: llama-server
+    # refused the call and the film failed for want of narration.
+    context_tokens = _context_tokens(client)
+    photos = [s.description or s.caption for s in shot_signals[: len(edit.shots)]]
+    # THE USER'S EDITED NARRATION, when there is one: its words are the script, spoken as
+    # written, and no story pass runs. Only each passage's photograph is asked for again
+    # (§11.1 "Edited narration is spoken as written").
+    draft = read_draft(conn, group_id, language)
+    if draft is not None:
+        story = match_photographs(client, planner_model, draft_story(draft, photo_ids), photos,
+                                  len(edit.shots), context_tokens, cancelled)
+    else:
+        # The RICH briefs, not the bare vision sentence: the story pass is the one WRITING
+        # the memory, and it was previously blind to `vibe=festive`, `occasion=holiday`,
+        # `season_weather=snow`, the place and the hour — every label that turns a
+        # description of pictures into a memory of an evening (§11.1). Plus a digest of
+        # what the memory is as a WHOLE, which no per-photo line can carry.
+        story = write_story(
+            client, planner_model, title=title, description=description, edit=edit,
+            shots=[s.brief() for s in shot_signals[: len(edit.shots)]],
+            language=language, digest=digest(shot_signals),
+            photos=photos,
+            facts=digest(shot_signals[: len(edit.shots)], guesses=False),
+            cancelled=cancelled,
+            # What the viewer typed into an earlier cut of this same film (§11.3).
+            # The PREVIOUS cut's length, so a note's timestamp can be expressed as a
+            # position in the script the model is about to write.
+            notes=notes_for_prompt(viewer_notes, previous_seconds, photo_at=photo_at),
+            # The speakers this language offers, as declared in the catalog, and the saved
+            # candidates by name: an Automatic film is CAST from them (CLAUDE.md § "A model's
+            # own metadata is DECLARED", D106). A chosen narrator reads every passage, so
+            # that story pass is shown no voice.
+            speakers=automatic_for_prompt(language, saved_cast) if chosen is None else "",
+            context_tokens=context_tokens,
+        )
     # THE STORY IS THE FILM. The shot list is rebuilt from the script's passages, not
     # from the photo list: a shot is a passage, and a photograph is what illustrates it.
-    # So a picture the story returns to appears twice, and one it never needed does not
-    # appear at all (§11.1).
+    # So a picture the story returns to appears twice, and a picture no sentence is about
+    # does not appear (§11.1).
     decisions["story"] = {
-        "context_tokens": _context_tokens(client),
+        **({"source": "draft", "draft_revision": draft.revision} if draft is not None else {}),
+        "context_tokens": context_tokens,
         "passages": len(story.script),
+        # Whether the final photographs keep the memory's order, "kept" or "broken". A
+        # diagnostic: nothing acts on it (§11.1).
+        "memory_order": story.memory_order,
+        "votes": list(story.votes),
+        "photos": [index for index, _text in story.script],
+        "matched": story.matched,
         "narrator_asked": story.narrator,
         "score_plan": [{"from": index, "brief": brief} for index, brief in story.score],
         "music_prompt": story.music_prompt,
@@ -261,50 +378,128 @@ def build_presentation(
         _fail(conn, group_id, language, signature, edit,
               f"No narration: the planner would not write this memory in {language}.",
               decisions)
-    # The language picks the MODEL (in the models service) and the memory's mood picks
-    # the SPEAKER — the user chooses neither (§11.1).
+    # The language picks the MODEL (in the models service). The SPEAKER is the user's
+    # choice when they made one on /feed, else the story pass's cast, else the memory's
+    # mood (§11.1).
     # THE MODEL CASTS THE FILM; the code only checks the cast is real. A name it
     # invented would raise inside the TTS child and fail the whole film (§11.1), so
-    # every choice goes through `resolve` against the catalog, and anything it did not
-    # or could not answer falls back to the deterministic rule.
-    speaker = resolve(language, story.narrator) or pick_speaker(language, shot_signals)
+    # every choice goes through `resolve` against the catalog (or `resolve_saved` against
+    # the saved candidates), and anything it did not or could not answer falls back to
+    # the deterministic rule.
     bracketed = _bracketed_passages(viewer_notes, previous_seconds, len(story.script))
-    passage_voices = _passage_voices(story, language, speaker, bracketed)
+    saved_pick = None
+    if saved_chosen:
+        # The user's choice reads EVERY passage, whatever the story pass cast (§11.1).
+        speaker = token(chosen.voice_id)
+        passage_voices = []
+        narrator_asked_was_real = bool(resolve_saved(story.narrator, saved_cast))
+    elif chosen is not None:
+        speaker = preset
+        passage_voices = []
+        narrator_asked_was_real = bool(resolve(language, story.narrator))
+    else:
+        # Automatic: the story pass's narrator, a preset first, then a saved candidate.
+        # The narrator's kind decides every passage voice, so one engine speaks (D107).
+        preset_pick = resolve(language, story.narrator)
+        saved_pick = None if preset_pick else resolve_saved(story.narrator, saved_cast)
+        if saved_pick is not None:
+            speaker = saved_pick
+            passage_voices = _passage_voices(story, language, speaker, bracketed,
+                                             saved=saved_cast)
+        else:
+            speaker = preset_pick or pick_speaker(language, shot_signals)
+            passage_voices = _passage_voices(story, language, speaker, bracketed)
+        narrator_asked_was_real = bool(preset_pick or saved_pick)
+    # A saved pick follows every rule of a saved-voice film below, and never falls back
+    # to a preset (D109).
+    saved_film = saved_chosen or saved_pick is not None
     # WHAT WAS ASKED FOR vs WHAT WAS CAST, per passage. A name the story pass invented
     # is dropped by `resolve` and the passage silently falls back to the narrator — so
     # a viewer's "[суровый мужской голос]" became a woman's voice with nothing anywhere
     # saying so. Now it says so.
     wanted_voice = asks_for_a_voice(notes_for_prompt(
         viewer_notes, previous_seconds, photo_at=photo_at))
-    cast = [{"passage": index, "asked": asked, "used": used}
+    # The labels are stored with the film, so a later delete or rename of a voice does
+    # not change what the film says about itself (D37).
+    cast = [{"passage": index, "asked": asked, "used": used,
+             "used_label": voice_label(used, language, saved_cast).label if used else None}
             for index, (asked, used) in enumerate(zip(story.voices, passage_voices))
             if asked or (used and used != speaker)]
+    narrator = voice_label(speaker, language, saved_cast)
     decisions["cast"] = {
         "narrator_used": speaker,
-        "narrator_asked_was_real": bool(resolve(language, story.narrator)),
+        "narrator_chosen_by": ("user" if chosen is not None
+                               else "story" if narrator_asked_was_real else "mood"),
+        "narrator_name": narrator.name if narrator is not None else None,
+        "narrator_label": narrator.label if narrator is not None else None,
+        "narrator_asked_was_real": narrator_asked_was_real,
         "notes_asked_for_a_voice": wanted_voice,
         "bracketed_passages": sorted(bracketed) if bracketed is not None else None,
         "model_cast": list(story.voices),
         "passages": cast,
-        "offered": [s.name for s in offered(language)],
+        "offered": ([voice.name for voice in saved_cast] if saved_chosen
+                    else [s.name for s in offered(language)]
+                    + [voice.name for voice in saved_cast]),
     }
     logger.info("cast: %s", decisions["cast"])
-    if wanted_voice and not cast:
+    if chosen is None and wanted_voice and not cast:
         # Visible on the page, not just in a log: the note asked for something and the
         # film did not do it.
         notes.append("a note asked for a different voice and none was cast")
-    try:
-        # The script's passages are handed over as the EXACT chunks to speak, so
-        # segment `i` of the returned audio is the words for shot `i`. That is what
-        # makes the film synchronised by arithmetic instead of by guesswork.
-        narration = client.speak(story.narration, language, speaker,
-                                 story.chunks or None, passage_voices or None)
-    except Exception as exc:  # every reason is reported, none swallowed
-        logger.exception("narrating the film failed")
-        _fail(conn, group_id, language, signature, edit,
-              f"No voice: the models service could not speak {language} "
-              f"({_reason(exc)}).", decisions)
-    narration_key = _store_audio(audio, narration["audio"])
+    by_token = {token(voice.id): voice for voice, _ in saved}
+    used = {name: by_token[name] for name in dict.fromkeys([speaker, *passage_voices])
+            if name in by_token}
+    # One turn covers resolving each take again, reading its audio and the call: a take
+    # whose words were heard while this film waited gives it that take, and the hearing
+    # job hears nothing while the film holds the lock (D52, §11.1).
+    takes: dict = {}
+    with voice_turn(voice_lock, progress, cancelled, stages["recording the voice"]):
+        references = None
+        if saved_film:
+            references = {}
+            for name, voice in used.items():
+                found = film_take(conn, owner_id, voice.id, language)
+                if found.problem is not None:
+                    _fail(conn, group_id, language, signature, edit,
+                          _cannot_narrate(voice.name, found.problem, language), decisions)
+                try:
+                    references[name] = reference_for(conn, voices, found.take)
+                except Exception as exc:  # a file the drain removed meanwhile, or unreadable
+                    logger.exception("reading take %s of %s failed", found.take.id, name)
+                    _fail(conn, group_id, language, signature, edit,
+                          f"Take #{found.take.id} of «{voice.name}» could not be read "
+                          f"({_reason(exc)}).", decisions)
+                takes[name] = found.take
+        started = time.monotonic()
+        try:
+            # The script's passages are handed over as the EXACT chunks to speak, so
+            # segment `i` of the returned audio is the words for shot `i`. That is what
+            # makes the film synchronised by arithmetic instead of by guesswork.
+            if references is None:
+                narration = client.speak(story.narration, language, speaker,
+                                         story.chunks or None, passage_voices or None)
+            else:
+                # Voice copy takes minutes, so the bar moves on an estimate (D28). One
+                # call, and never a second one with a preset if it fails (D17).
+                with _Ticking(progress, "recording the voice",
+                              (stages["recording the voice"], stages["composing the music"]),
+                              len(story.narration) / 14 * CLONE_RTF_ESTIMATE):
+                    narration = client.speak(story.narration, language, speaker,
+                                             story.chunks or None, passage_voices or None,
+                                             references=references)
+        except Exception as exc:  # every reason is reported, none swallowed
+            logger.exception("narrating the film failed")
+            _fail(conn, group_id, language, signature, edit,
+                  f"No voice: the models service could not speak {language} "
+                  f"({_reason(exc)}).", decisions)
+        wall_seconds = time.monotonic() - started
+    # The reply is the only proof that each take spoke (D86).
+    conditioning = narration.get("conditioning") or {}
+    for name in takes:
+        if (conditioning.get(name) or {}).get("state") not in ("built", "restored"):
+            _fail(conn, group_id, language, signature, edit,
+                  f"The models service did not speak «{used[name].name}» from its take.",
+                  decisions)
     # The NARRATION decides how long the film is. It used to be the other way round —
     # a runtime summed from nominal shot holds, with the voice left to fall where it
     # fell — which is precisely how picture and sound ended up as two things happening
@@ -314,6 +509,23 @@ def build_presentation(
     runtime = spoken_seconds + _TAIL_SECONDS if spoken_seconds else edit.seconds
     # Every shot now starts exactly when its own passage is spoken.
     edit = with_narration_timing(edit, segments, runtime)
+    passages, script = timeline_script(story, segments, passage_voices, speaker, photo_ids,
+                                       token=secrets.token_hex(16))  # pragma: allowlist secret
+    decisions["voice"] = {
+        "saved": saved_film,
+        "model": narration.get("model"),
+        "revision": narration.get("revision"),
+        "wall_seconds": round(wall_seconds, 3),
+        "narration_seconds": spoken_seconds,
+        "seed": "unsupported (voxcpm 2.0.3)" if saved_film else None,
+    }
+    if saved_film:
+        decisions["voice"]["takes"] = {
+            name: {"example_id": take.id, "sha256": take.content_hash,
+                   "state": conditioning[name]["state"]}
+            for name, take in takes.items()}
+        decisions["cast"]["narrator_model"] = f"spoken from take #{takes[speaker].id}"
+    logger.info("voice: %s", decisions["voice"])
 
     step("composing the music")
     # A SCORE, not a clip (§11.1): two to four sections that follow the story's own
@@ -349,7 +561,6 @@ def build_presentation(
             # gets this one's music: the seed is the film's own identity (§11.1).
             seed=_seed(group_id, language, signature), **SAMPLING[energy],
         )
-    music_key = _store_audio(audio, music["audio"]) if music is not None else None
     if music is None:
         notes.append("no music — the models service refused to compose")
     decisions["score"]["model"] = (music or {}).get("model")
@@ -376,36 +587,123 @@ def build_presentation(
         # The notes themselves, whole: the conductor reads any instruction in them and
         # places the effects and lengths it asks for.
         directions=notes_for_prompt(viewer_notes, previous_seconds, photo_at=photo_at),
-    ), keep_timing=aligned)
+    ), keep_timing=aligned, keep_order=bool(story.script))
 
     step("saving the film")
     decisions["film"] = {"runtime": runtime, "shots": len(edit.shots),
                          "narration_seconds": spoken_seconds,
                          "conductor_kept_timing": aligned}
     logger.info("film: %s", decisions["film"])
-    presentation = Presentation(
-        group_id=group_id,
-        language=language,
-        signature=signature,
-        timeline=edit.as_dict(),
-        music_key=music_key,
-        narration_key=narration_key,
-        status="ready",
-        # `error` is not a failure here — the film IS ready. It records what is
-        # MISSING and why, so the page can say "no voice, because…" instead of just
-        # playing silent and leaving the user to guess.
-        error="; ".join(notes) or None,
-        decisions=decisions,
-    )
-    save_presentation(conn, presentation)
+
+    def save_ready() -> Presentation:
+        """Write the film's WAVs and its ready row. The ONLY place film audio is
+        written (D34): the steps before used the bytes alone, so a film that fails or
+        is cancelled earlier leaves no audio behind, and no failure path prunes."""
+        presentation = Presentation(
+            group_id=group_id,
+            language=language,
+            signature=signature,
+            timeline={**edit.as_dict(), "passages": passages, "script": script},
+            music_key=_store_audio(audio, music["audio"]) if music is not None else None,
+            narration_key=_store_audio(audio, narration["audio"]),
+            status="ready",
+            # `error` is not a failure here — the film IS ready. It records what is
+            # MISSING and why, so the page can say "no voice, because…" instead of just
+            # playing silent and leaving the user to guess.
+            error="; ".join(notes) or None,
+            decisions=decisions,
+        )
+        save_presentation(conn, presentation)
+        return presentation
+
+    if draft is None and not saved_film:
+        presentation = save_ready()
+    else:
+        # A saved voice the film used may have been deleted while it was made (D33).
+        # The check, the WAV writes, the ready row and the rebase of the draft it spoke
+        # share ONE write lock, so no delete can land between them; a miss writes no film
+        # audio at all and leaves the draft as it was (D117).
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            gone = _deleted_voice(conn, owner_id, used) if saved_film else None
+            if gone is None:
+                presentation = save_ready()
+                if draft is not None:
+                    rebase_consumed(conn, draft, passages, script)
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        if gone is not None:
+            conn.execute("ROLLBACK")
+            _fail(conn, group_id, language, signature, edit,
+                  f"The saved voice «{gone}» was deleted while this film was made.",
+                  decisions)
+        conn.execute("COMMIT")
     # The table is authoritative right now — the one safe moment to drop the WAVs a
     # previous memory build left behind when its rows cascaded away (§11.1).
     prune_orphan_audio(conn, audio)
     return presentation
 
 
+def _saved_cast(
+    conn: sqlite3.Connection, voices: Storage | None, owner_id: int, group_id: int,
+    language: str, chosen, edit, decisions: dict,
+) -> list:
+    """`(SavedVoice, VoiceExample)` for every saved voice this film may cast: the voices
+    ready for `language` with their `film_take` (§11.1), once the user's chosen narrator
+    is known to be one of them. Otherwise the film FAILS with the reason (D33): it is
+    never quietly read by Automatic or a preset instead."""
+    signature = current_signature(conn, owner_id)
+    voice = get_voice(conn, owner_id, chosen.voice_id) if chosen.voice_id is not None else None
+    if voice is None:
+        _fail(conn, group_id, language, signature, edit,
+              "The saved voice chosen for this film was deleted. Choose another narrator.",
+              decisions)
+    found = film_take(conn, owner_id, voice.id, language)
+    if found.problem is not None:
+        _fail(conn, group_id, language, signature, edit,
+              _cannot_narrate(voice.name, found.problem, language), decisions)
+    cast = castable_takes(conn, owner_id, language)
+    if not any(candidate.id == voice.id for candidate, _ in cast):
+        # A delete landed between the two reads: say what it is now.
+        found = film_take(conn, owner_id, voice.id, language)
+        if found.problem is not None:
+            _fail(conn, group_id, language, signature, edit,
+                  _cannot_narrate(voice.name, found.problem, language), decisions)
+        cast.append((voice, found.take))
+    return cast
+
+
+def _cannot_narrate(name: str, problem: str, language: str) -> str:
+    """Why the saved voice `name` cannot narrate a `language` film, as `film_take`'s
+    problem names it (§11.1)."""
+    language_name = language_names.get(language, language)
+    if problem == "language":
+        return f"«{name}» has no {language_name} take yet. Record one under Voices, or choose another narrator."
+    if problem == "waiting":
+        return (f"The words of «{name}»'s {language_name} takes are not heard yet. Open «{name}» "
+                "under Voices and let it hear them, or choose another narrator.")
+    if problem == "unusable":
+        return (f"No {language_name} take of «{name}» has usable words. Record a take where you "
+                "speak, or choose another narrator.")
+    return f"The saved voice «{name}» is being deleted. Choose another narrator."
+
+
+def _deleted_voice(conn: sqlite3.Connection, owner_id: int, used: dict) -> str | None:
+    """The name of the first used saved voice that is gone or being deleted, else None.
+    A take deleted meanwhile does not count: the film spoke from the take it read.
+    Runs under the ready save's write lock."""
+    for voice in used.values():
+        current = get_voice(conn, owner_id, voice.id)
+        if current is None or current.deleting:
+            return voice.name
+    return None
+
+
 def _passage_voices(
     story, language: str, film_voice: str | None, bracketed: set[int] | None = None,
+    saved: Sequence[SavedCast] | None = None,
 ) -> list[str | None]:
     """One speaker per passage: the film's own, except where the story pass cast another.
 
@@ -413,6 +711,9 @@ def _passage_voices(
     table together, which is the only place that judgement can be made. All that
     happens here is `resolve`, which checks each name is real (an invented one raises
     inside the TTS child and narration is mandatory, §11.1), and the BRACKET GATE below.
+    With `saved` (a saved narrator) each name resolves among those saved voices only,
+    else among the presets only: a name of the other kind reads in the narrator's voice,
+    so one engine speaks the film (D107).
 
     There is no fallback that reads the brackets itself. One existed and it needed the
     phrase written its way; a note whose wording it did not know was silently ignored.
@@ -428,7 +729,8 @@ def _passage_voices(
     """
     if not story.script:
         return []
-    cast = [resolve(language, name) for name in story.voices]
+    cast = [resolve_saved(name, saved) if saved is not None else resolve(language, name)
+            for name in story.voices]
     cast += [None] * (len(story.script) - len(cast))
     if bracketed is not None:
         cast = [name if index in bracketed else None for index, name in enumerate(cast)]
@@ -442,10 +744,15 @@ def _bracketed_passages(notes, film_seconds: float, passages: int) -> set[int] |
 
     A note carries the second of the previous cut it was written at, so its share of
     that cut is its share of the story — and the passage at that share is the one it is
-    about. None when there is no previous cut to measure against (nothing is known about
-    where a note belongs, so nothing is gated).
+    about. No bracket at all marks no passage: the model fills in every `voice`, and
+    without this the film was spoken by whatever it wrote there. None when a bracket
+    exists but there is no previous cut to measure against (nothing is known about
+    where it belongs, so nothing is gated).
     """
-    if not notes or film_seconds <= 0 or passages <= 0:
+    notes = [note for note in notes or () if "[" in note.text]
+    if not notes:
+        return set()
+    if film_seconds <= 0 or passages <= 0:
         return None
     marked = set()
     for note in notes:

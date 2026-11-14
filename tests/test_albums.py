@@ -175,3 +175,32 @@ def test_retelling_leaves_every_other_memory_alone(conn):
     assert photo_ids_for_group(conn, first) == [2, 1]
     assert photo_ids_for_group(conn, second) == [3, 4]
     assert conn.execute("SELECT name FROM groups WHERE id = ?", (second,)).fetchone()["name"] == "B"
+
+
+def test_retelling_deletes_the_memorys_edited_narration_in_every_language(conn):
+    from albums.memory_store import Memory, replace_memories, rewrite_memory
+    from tests.factories import add_photo
+
+    for pid in (1, 2, 3, 4):
+        add_photo(conn, photo_id=pid, content_hash=f"h{pid}", thumb_key=f"{pid}.jpg")
+    replace_memories(conn, 1, [Memory("A", "a", [1, 2], "sig"),
+                               Memory("B", "b", [3, 4], "sig")])
+    rows = conn.execute("SELECT id FROM groups WHERE kind='memory' ORDER BY id").fetchall()
+    first, second = rows[0]["id"], rows[1]["id"]
+    for gid, language in ((first, "en"), (first, "ru"), (second, "en")):
+        conn.execute("INSERT INTO narration_drafts(group_id, language, draft_token, source_token,"
+                     " revision, script_json, passages_json, updated_at)"
+                     " VALUES (?, ?, 'd', 's', 1, '{}', '[]', 'now')", (gid, language))
+    conn.execute("INSERT INTO memory_notes(group_id, at_seconds, text, created_at)"
+                 " VALUES (?, 1.0, 'mine', 'now')", (first,))
+    conn.execute("INSERT INTO memory_narrators(group_id, language, preset_speaker)"
+                 " VALUES (?, 'en', 'af_heart')", (first,))
+
+    rewrite_memory(conn, first, Memory("A retold", "a2", [2, 1], "sig"))
+
+    drafts = conn.execute("SELECT group_id FROM narration_drafts").fetchall()
+    assert [row["group_id"] for row in drafts] == [second]
+    assert conn.execute("SELECT COUNT(*) c FROM memory_notes WHERE group_id = ?",
+                        (first,)).fetchone()["c"] == 1
+    assert conn.execute("SELECT COUNT(*) c FROM memory_narrators WHERE group_id = ?",
+                        (first,)).fetchone()["c"] == 1

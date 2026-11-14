@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}Voices — ivms777{% endblock %}
+{% block content %}
+{# Voices (design §6, §11.1, §13): a TOP-LEVEL grid (§13.1) — no ×, no ctx. A card is a
+   plain link to its voice (a full navigation, the one grid→leaf push). Create answers
+   the cards, and voices.js opens the one marked `data-created`. #}
+<div class="voices-shell voices-grid" id="voices-page">
+  <h1>Voices</h1>
+  {% if not available %}
+    <p class="voices-unavailable">{{ not_available }}</p>
+  {% else %}
+    <p class="hint">A voice is a person's own voice. It can narrate a film in each language it has a take of.</p>
+    <form class="voices-new js-voices-form" method="post" action="/voices">
+      <label for="voice-new-name">New voice</label>
+      <input type="text" id="voice-new-name" name="name" maxlength="80" required
+             placeholder="Grandma">
+      <button type="submit">Create</button>
+    </form>
+  {% endif %}
+
+  <p id="voices-error" class="voices-error" role="alert" hidden></p>
+
+  {% include "_voice_cards.html" %}
+</div>
+<script src="/static/voices.js?v={{ static_v('voices.js') }}" defer></script>
+{% endblock %}

@@ -1,7 +1,8 @@
 """Which speaker narrates a memory, and which narrates one passage (design §11.1, §11.3).
 
 The LANGUAGE picks the model — that routing lives in the models service, and the user
-never chooses it. This is about the speaker WITHIN that model.
+never chooses it. This is about the speaker WITHIN that model. The user may choose the
+speaker on `/feed`: a preset or a saved voice (§11.1).
 
 **No list of names lives here.** Every speaker is declared in `models/catalog.py` beside
 the model that offers it, with its gender, its register and what it sounds like
@@ -24,20 +25,78 @@ lived here and it needed the phrase written its way — `[страшных хр�
 People do not write to a table. The model reads the bracket itself, in whatever
 language and word order it was typed, and casts from the speakers above.
 
+A film narrated by a SAVED voice (D17) casts from the user's saved voices only, never
+from the catalog: `resolve_saved` is its gate.
+Automatic shows the story pass both kinds (`automatic_for_prompt`), and the narrator's kind
+decides the kind of every passage voice.
+
 PURE: catalog and signals in, a name out. No model, no I/O.
 """
 
+from collections.abc import Sequence
+from dataclasses import dataclass
+
 from feed import mood
+from feed.saved_voices import TOKEN_PREFIX
 from feed.signals import ShotSignal
 from models import catalog
 
 
 def offered(language: str) -> tuple[catalog.Speaker, ...]:
-    """Every speaker that can read `language`, as declared beside its model."""
+    """Every speaker that can read `language`, as declared beside its model.
+
+    A voice-copy entry (`clones`) is skipped: it has no speakers of its own, only the
+    user's saved voices, and those are cast through `resolve_saved` (D17)."""
     for entry in catalog.CATALOG:
-        if entry.slot == "voice" and language in entry.languages:
+        if entry.slot == "voice" and not entry.clones and language in entry.languages:
             return entry.speakers
     return ()
+
+
+@dataclass(frozen=True)
+class SavedCast:
+    """One saved voice a film may cast: the `POST /speak` token and the user's name."""
+
+    token: str
+    name: str
+
+
+def resolve_saved(name: str | None, cast: list[SavedCast]) -> str | None:
+    """The token of the saved voice `name` names — by the user's name, case-folded, or by
+    the token itself — if it is in `cast`; else None. The saved-film twin of `resolve`:
+    `cast` holds no voice being deleted, so a bracket cannot reach one (D33)."""
+    if not name:
+        return None
+    wanted = str(name).strip()
+    for voice in cast:
+        if wanted == voice.token or wanted.casefold() == voice.name.strip().casefold():
+            return voice.token
+    return None
+
+
+@dataclass(frozen=True)
+class VoiceLabel:
+    """How the page names one voice (D37): `name` is the short form ("af_heart"; the card adds "(auto)"),
+    `label` the full one ("af_heart (female, warm)", "Grandma (saved voice)")."""
+
+    name: str
+    label: str
+
+
+def voice_label(name: str | None, language: str, cast: Sequence[SavedCast] = ()) -> VoiceLabel | None:
+    """The label of a cast `name`: a saved-voice token of `cast`, a token of a voice that
+    is no longer there, a preset of `language`, else the name as it is. None when empty."""
+    if not name:
+        return None
+    for voice in cast:
+        if voice.token == name:
+            return VoiceLabel(voice.name, f"{voice.name} (saved voice)")
+    if name.startswith(TOKEN_PREFIX):
+        return VoiceLabel("a saved voice", "a saved voice")
+    for speaker in offered(language):
+        if speaker.name == name:
+            return VoiceLabel(name, f"{name} ({speaker.gender}, {speaker.register})")
+    return VoiceLabel(name, name)
 
 
 def resolve(language: str, name: str | None) -> str | None:
@@ -61,6 +120,22 @@ def catalogue_for_prompt(language: str) -> str:
     return "\n".join(
         f"  {s.name} — {s.gender}, {s.register}: {s.note}" for s in offered(language)
     )
+
+
+def automatic_for_prompt(language: str, saved: Sequence[SavedCast]) -> str:
+    """The voices an Automatic film's story pass may cast (D106): the presets, then the
+    saved candidates by name alone, because a saved voice declares no sound."""
+    presets = catalogue_for_prompt(language)
+    if not saved:
+        return presets
+    return "\n".join([
+        presets,
+        ("  SAVED VOICES — the user's own recordings of real people. How each one sounds is "
+         "not described. Choose one when it suits the memory, for example when the memory is "
+         "about that person or the notes ask for them. Never mix the two kinds: a saved "
+         "narrator takes saved passage voices only, a preset narrator presets only."),
+        *(f"  {voice.name} — a saved voice: this person's own voice" for voice in saved),
+    ])
 
 
 def _by(language: str, **wanted: str) -> tuple[str, ...]:

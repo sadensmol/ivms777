@@ -89,7 +89,8 @@ def rewrite_memory(conn: sqlite3.Connection, group_id: int, memory: Memory) -> N
 
     What does NOT survive is the film: the memory it narrated no longer exists in that
     shape, so every stored presentation for this group is dropped and must be prepared
-    again (§11.1).
+    again (§11.1). Its edited narration goes too, in every language: its photographs,
+    cards and score plan were made for the old telling.
     """
     conn.execute(
         "UPDATE groups SET name = ?, description = ? WHERE id = ? AND kind = 'memory'",
@@ -101,6 +102,7 @@ def rewrite_memory(conn: sqlite3.Connection, group_id: int, memory: Memory) -> N
         [(group_id, pid, rank) for rank, pid in enumerate(memory.photo_ids)],
     )
     conn.execute("DELETE FROM memory_presentations WHERE group_id = ?", (group_id,))
+    conn.execute("DELETE FROM narration_drafts WHERE group_id = ?", (group_id,))
     _reindex_memory(conn, group_id, memory)
 
 

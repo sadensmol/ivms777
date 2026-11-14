@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}{{ voice.name }} — Voices — ivms777{% endblock %}
+{% block content %}
+{# One voice: the LEAF of the Voices grid (design §13.1). ×, the "Voices" link and Esc go
+   up one level — history.back() when the page was opened from the grid
+   (`data-from-grid`, set by voices.js at mount), else location.replace("/voices"). Tabs
+   are state of the leaf (`?tab` through replaceState). Every action is a fetch that
+   swaps #voices; none pushes history. #}
+<div class="voices-shell voice-leaf" id="voices-page" data-voice-id="{{ voice.id }}">
+  <p id="voices-error" class="voices-error" role="alert" hidden></p>
+
+  {% include "_voice_body.html" %}
+
+  {# Outside #voices: a list refresh (the 2 s poll while a take is deleting) must never
+     take a live recording or an unsaved take with it. voices.js moves it under the kit
+     row whose Record opened it, or under "Add a take", and puts it back there after every
+     swap (D68). Record opens it PREPARED: the style's instruction, one kit text, "Different
+     text" (Add a take only) and "Start recording", and no microphone yet. A kit text is a
+     suggestion: the app hears what was said (D101). #}
+  <div id="voice-recorder" class="voice-recorder" hidden>
+    {% for code, texts in kit.items() %}
+      {% for text in texts %}
+        <p class="recorder-instruction" data-lang="{{ code }}" data-prompt-id="{{ text.id }}" hidden>{{ styles[text.style][0] }} — {{ styles[text.style][1] }}</p>
+        <p class="recorder-prompt" data-lang="{{ code }}" data-prompt-id="{{ text.id }}" hidden>{{ text.text }}</p>
+      {% endfor %}
+    {% endfor %}
+    <p class="recorder-hint muted" hidden>Read it, or say anything else: the app hears what you say.</p>
+    <div class="recorder-prepare" hidden>
+      <button type="button" class="recorder-next">Different text</button>
+      <button type="button" class="recorder-start">Start recording</button>
+    </div>
+    <p class="recorder-status muted"></p>
+    <div class="recorder-live" hidden>
+      <span class="recorder-timer">0:00</span>
+      <button type="button" class="recorder-pause" disabled>Pause</button>
+      <button type="button" class="recorder-stop">Stop</button>
+    </div>
+    <div class="recorder-take" hidden>
+      <audio class="recorder-preview" controls></audio>
+      <button type="button" class="recorder-save">Save</button>
+      <button type="button" class="recorder-again">Record again</button>
+      <button type="button" class="recorder-discard">Discard</button>
+    </div>
+  </div>
+
+  {# The Test tab's panel, also outside #voices: a list refresh never takes the typed text
+     or the job. The job lives in `app`, so a return to the page shows it again. The
+     language and the recording are chosen in #voices; the comparison is copied from its
+     <template class="test-compare">. #}
+  {% if not voice.deleting %}
+  <div id="voice-preview" class="voice-preview" data-tab-part="test"{% if tab != 'test' %} hidden{% endif %}>
+    <textarea class="preview-custom" maxlength="{{ custom_max }}" rows="3" aria-label="Test text"
+              placeholder="Type what «{{ voice.name }}» should say" hidden></textarea>
+    <p class="preview-count muted" hidden></p>
+    <div class="preview-actions">
+      <button type="button" class="preview-generate">Generate</button>
+      <span class="preview-through muted"></span>
+    </div>
+    {% include "_voice_preview.html" %}
+    <div class="preview-compare"></div>
+  </div>
+  {% endif %}
+</div>
+<script src="/static/voices.js?v={{ static_v('voices.js') }}" defer></script>
+{% endblock %}

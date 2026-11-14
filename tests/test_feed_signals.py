@@ -124,6 +124,20 @@ def test_the_digest_says_what_the_whole_memory_is(conn):
     assert "iPhone SE" in text
 
 
+def test_the_facts_leave_out_the_guessed_labels(conn):
+    # The labels are zero-shot guesses (0.2-0.6 confidence on a real memory); the story
+    # writer narrated "it rained" and "it was boring" from them as facts (§11.1).
+    from feed.signals import ShotSignal, digest
+
+    signals = [ShotSignal(photo_id=1, width=1, height=1, shot_at="2023-01-01T18:50:00",
+                          caption="c", description="d", place="Tbilisi",
+                          tags={"emotion": "bored", "season_weather": "rain"}, scores={},
+                          vector=None, camera="iPhone SE")]
+    text = digest(signals, guesses=False)
+    assert "Tbilisi" in text and "2023-01-01" in text and "iPhone SE" in text
+    assert "bored" not in text and "rain" not in text
+
+
 def test_the_digest_ranks_by_how_common_a_label_is(conn):
     from feed.signals import ShotSignal, digest
 

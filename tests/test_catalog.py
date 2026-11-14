@@ -217,3 +217,166 @@ def test_silero_is_fetched_from_its_own_host_not_the_hub():
     assert isinstance(source, catalog.UrlSource)
     assert source.url.startswith("https://models.silero.ai/")
     assert source.file == "v4_ru.pt"
+
+
+def test_voxcpm2_is_a_pinned_cloning_voice_for_mac_and_cloud():
+    entry = catalog.get("voice", "voxcpm2")
+    assert isinstance(entry.source, catalog.HfSource)
+    assert entry.source.repo == "openbmb/VoxCPM2"
+    revision = entry.source.revision
+    assert revision is not None and len(revision) == 40
+    assert all(c in "0123456789abcdef" for c in revision)
+    assert entry.profiles == ("mac", "cloud")
+    assert entry.clones is True
+    assert entry.languages == ("en", "ru")
+    assert entry.speakers == ()           # a saved voice, never a preset speaker
+    assert entry.cost_measured is False   # the fp32 MPS figure is an estimate
+    assert "ESTIMATE" in entry.note
+
+
+def test_unpinned_hf_entries_keep_following_main():
+    assert catalog.get("voice", "kokoro-82m").source.revision is None
+
+
+def test_the_cloning_entry_follows_the_profile():
+    assert catalog.cloning_entry_for("jetson", "en") is None
+    assert catalog.cloning_entry_for("mac", "ru").key == "voxcpm2"
+    assert catalog.cloning_entry_for("cloud", "en").key == "voxcpm2"
+    assert catalog.cloning_entry_for("mac", "klingon") is None
+
+
+def test_cloning_languages_follow_the_feed_order():
+    assert catalog.cloning_languages("cloud") == ("en", "ru")
+    assert catalog.cloning_languages("mac") == ("en", "ru")
+    assert catalog.cloning_languages("jetson") == ()
+
+
+def test_every_preset_voice_entry_declares_speakers():
+    # A non-cloning voice with no speakers would leave the cast with nothing to pick.
+    for entry in catalog.CATALOG:
+        if entry.slot == "voice" and not entry.clones:
+            assert entry.speakers, entry.key
+
+
+def test_only_voice_entries_clone():
+    for entry in catalog.CATALOG:
+        if entry.slot != "voice":
+            assert entry.clones is False, entry.key
+
+
+def test_cloning_adds_no_default_and_keeps_voice_automatic():
+    for profile in PROFILES:
+        assert catalog.default_key("voice", profile) == "kokoro-82m"
+    assert "voice" in catalog.AUTOMATIC_SLOTS
+
+
+def test_voxcpm2_declares_the_package_lora_shape_with_lm_and_dit_on():
+    adapter = catalog.get("voice", "voxcpm2").adapter
+    assert adapter.lora == {
+        "enable_lm": True,
+        "enable_dit": True,
+        "enable_proj": False,
+        "r": 8,
+        "alpha": 16,
+        "dropout": 0.0,
+        "target_modules_lm": ["q_proj", "v_proj", "k_proj", "o_proj"],
+        "target_modules_dit": ["q_proj", "v_proj", "k_proj", "o_proj"],
+    }
+
+
+def test_voxcpm2_training_cost_is_an_estimate_offered_on_mac_only():
+    adapter = catalog.get("voice", "voxcpm2").adapter
+    assert adapter.train_cost_mb == 14000
+    assert adapter.train_cost_measured is False
+    assert adapter.train_profiles == ("mac",)
+    assert adapter.guidance_minutes == (5.0, 10.0)
+
+
+def test_only_voxcpm2_declares_an_adapter():
+    for entry in catalog.CATALOG:
+        if entry.key != "voxcpm2":
+            assert entry.adapter is None, entry.key
+
+
+def test_voxcpm2_note_declares_the_lora_layers_inside_its_cost():
+    entry = catalog.get("voice", "voxcpm2")
+    assert entry.cost_mb == 10500
+    assert "LoRA layers for baked voices" in entry.note
+
+
+def test_the_adapter_entry_follows_the_profile():
+    assert catalog.adapter_entry_for("mac").key == "voxcpm2"
+    assert catalog.adapter_entry_for("cloud") is None
+    assert catalog.adapter_entry_for("jetson") is None
+
+
+def test_the_transcriber_is_one_pinned_whisper_entry():
+    assert len(catalog.TRANSCRIBERS) == 1
+    entry = catalog.TRANSCRIBERS[0]
+    assert entry.key == "whisper-large-v3-turbo"
+    assert entry.slot == "asr"
+    assert entry.source == catalog.HfSource(
+        "openai/whisper-large-v3-turbo", revision="41f01f3fe87f28c78e2fbf8b568835947dd65ed9")
+    assert entry.cost_mb == 4000
+    assert entry.cost_measured is False
+    assert entry.profiles == ("mac", "cloud")
+    assert entry.languages == ("en", "ru")
+
+
+def test_asr_is_no_slot_and_no_catalog_choice():
+    assert "asr" not in catalog.SLOTS
+    assert all(entry.slot != "asr" for entry in catalog.CATALOG)
+    assert all("asr" not in defaults for defaults in catalog.DEFAULTS.values())
+
+
+def test_the_transcriber_follows_the_profile():
+    assert catalog.transcriber_for("mac") is catalog.TRANSCRIBERS[0]
+    assert catalog.transcriber_for("cloud") is catalog.TRANSCRIBERS[0]
+    assert catalog.transcriber_for("jetson") is None
+
+
+@pytest.mark.parametrize("profile", ["mac", "cloud"])
+def test_the_transcriber_can_load_where_it_is_offered(profile):
+    settings = Settings(profile=profile, data_dir=Path("/tmp/pl"))
+    entry = catalog.transcriber_for(profile)
+    assert entry.cost_mb + _governor_headroom_mb() <= settings.ram_budget_mb
+
+
+@pytest.mark.parametrize("profile", PROFILES)
+def test_every_cloning_language_has_a_transcriber_that_hears_it(profile):
+    for language in catalog.cloning_languages(profile):
+        entry = catalog.transcriber_for(profile)
+        assert entry is not None and language in entry.languages, (profile, language)
+
+
+def test_the_speaker_embedder_is_one_pinned_ecapa_entry():
+    assert len(catalog.SPEAKER_EMBEDDERS) == 1
+    entry = catalog.SPEAKER_EMBEDDERS[0]
+    assert entry.key == "ecapa-voxceleb"
+    assert entry.slot == "speaker_embed"
+    assert entry.source == catalog.HfSource(
+        "speechbrain/spkrec-ecapa-voxceleb",
+        revision="0f99f2d0ebe89ac095bcc5903c4dd8f72b367286")
+    assert entry.dim == 192
+    assert entry.size_mb == 85
+    assert entry.cost_measured is False
+    assert entry.profiles == ("mac",)
+    assert entry.speakers == ()
+
+
+def test_speaker_embed_is_no_slot_and_no_catalog_choice():
+    assert "speaker_embed" not in catalog.SLOTS
+    assert all(entry.slot != "speaker_embed" for entry in catalog.CATALOG)
+    assert all("speaker_embed" not in defaults for defaults in catalog.DEFAULTS.values())
+
+
+def test_the_speaker_embedder_follows_the_profile():
+    assert catalog.speaker_embedder_for("mac") is catalog.SPEAKER_EMBEDDERS[0]
+    assert catalog.speaker_embedder_for("cloud") is None
+    assert catalog.speaker_embedder_for("jetson") is None
+
+
+def test_the_speaker_embedder_can_load_on_mac():
+    settings = Settings(profile="mac", data_dir=Path("/tmp/pl"))
+    entry = catalog.speaker_embedder_for("mac")
+    assert entry.cost_mb + _governor_headroom_mb() <= settings.ram_budget_mb

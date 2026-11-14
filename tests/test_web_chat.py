@@ -656,3 +656,17 @@ def test_the_recorded_wait_excludes_streaming_time(settings, monkeypatch):
     row = conn.execute("SELECT elapsed_ms FROM chat_messages ORDER BY id DESC").fetchone()
     # The second chunk's 50 ms sleep lands after the wait has already been stamped.
     assert row["elapsed_ms"] < 100
+
+
+def test_a_bfcache_return_reloads_only_the_chat_page():
+    # The pageshow listener outlives a boosted move from Chat to Organize, so it must
+    # not reload Organize when a film closes back to it (design §13.1).
+    import pathlib
+
+    source = pathlib.Path("web/static/chat.js").read_text()
+    assert "window.__chatPageshowWired" in source
+    listener = re.search(r'window\.addEventListener\("pageshow",.*?\}\);', source, re.DOTALL)
+    assert listener, "no pageshow listener"
+    assert re.search(r'if \(e\.persisted && document\.getElementById\("chat-q"\)\)\s*location\.reload\(\)',
+                     listener.group(0))
+    assert source.count("location.reload()") == 1

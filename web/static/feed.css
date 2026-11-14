@@ -68,11 +68,45 @@
 .feed-start-desc { max-width: 46ch; opacity: 0.8; text-align: center; }
 .feed-start-play { margin-top: 1rem; font-size: 1.3rem; opacity: 0.9; }
 
-.feed-close {
+/* The page's controls (D43). The header is the ONLY positioned element among them;
+   its children are in normal flow, so a wider control pushes the others along instead
+   of covering them. z-index: `.feed-start` is a later fixed full-screen element and
+   would otherwise paint over it. Its empty parts pass clicks through to the film. */
+.feed-head {
   position: fixed;
   top: 1rem;
+  left: 1rem;
   right: 1rem;
   z-index: 10;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.6rem;
+  pointer-events: none;
+}
+.feed-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  width: 100%;
+}
+.feed-actions > * { pointer-events: auto; }
+/* Download and close go to the right; the row wraps on a narrow window. */
+.feed-actions > .feed-lang { margin-right: auto; }
+/* Bounded and scrolling inside itself, left-aligned: the notes sheet and the bubbles
+   own the right column. */
+.feed-settings {
+  pointer-events: auto;
+  width: min(36rem, 100%);
+  max-height: 45vh;
+  overflow-y: auto;
+}
+@media (max-width: 66rem) {
+  .feed-body:has(.feed-settings) .feed-notes { max-height: calc(55vh - 7rem); }
+}
+
+.feed-close {
   width: 2.5rem;
   height: 2.5rem;
   border: 0;
@@ -107,16 +141,34 @@
 }
 .feed-note { max-width: 44ch; opacity: 0.6; font-size: 0.9rem; }
 
-/* The language selector, mirroring the close button on the other side. */
-.feed-lang {
-  position: fixed;
-  top: 1rem;
-  left: 1rem;
-  z-index: 10;
+/* The narrator select of both forms. It never widens its region past the viewport. */
+.feed-narrator {
   display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  max-width: 100%;
+  font-size: 0.85rem;
+  overflow-wrap: anywhere;
+}
+.feed-narrator select {
+  min-width: 0;
+  max-width: 100%;
+  padding: 0.25rem 0.4rem;
+  border: 1px solid #444;
+  border-radius: 0.35rem;
+  background: #161616;
+  color: #fff;
+  font: inherit;
+}
+
+.feed-lang {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   gap: 0.4rem;
   margin: 0;
 }
+.feed-lang-label { font-size: 0.8rem; opacity: 0.7; }
 .feed-lang button {
   padding: 0.25rem 0.7rem;
   border: 1px solid #444;
@@ -131,14 +183,24 @@
 }
 .feed-lang button.is-current { opacity: 1; border-color: #999; }
 
-/* Regenerate sits opposite the language pills, left of the close button. */
+/* Regenerate, with what this film is and the narrator for the next one. The panel
+   carries its own scrim, so it fades with the control while the film plays. */
 .feed-regen {
-  position: fixed;
-  top: 1rem;
-  right: 4rem;
-  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.4rem;
   margin: 0;
+  padding: 0.6rem 0.8rem;
+  border-radius: 0.5rem;
+  background: rgba(0, 0, 0, 0.6);
+  font-size: 0.85rem;
+  transition: opacity 0.4s ease;
 }
+.feed-regen p { margin: 0; overflow-wrap: anywhere; }
+.feed-this-film { font-weight: 600; }
+.feed-other-voices { opacity: 0.8; }
+.feed-regen .feed-note { max-width: none; font-size: 0.8rem; }
 .feed-regen button {
   padding: 0.25rem 0.7rem;
   border: 1px solid #444;
@@ -317,13 +379,9 @@
   .feed-scatter-note { animation: none; opacity: 0.7; }
 }
 
-/* Download sits with Regenerate, left of the close button. It shares their quiet
-   styling because it is a tool, not the point of the page. */
+/* Download sits in the action row, left of the close button. It shares the quiet
+   styling of the other controls because it is a tool, not the point of the page. */
 .feed-download {
-  position: fixed;
-  top: 1rem;
-  right: 11.5rem;
-  z-index: 10;
   padding: 0.25rem 0.7rem;
   border: 1px solid #444;
   border-radius: 1rem;
@@ -395,7 +453,9 @@
   z-index: 12;
   width: min(26rem, 90vw);
   max-height: 70vh;
-  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   padding: 1rem;
   border-radius: 0.6rem;
   background: rgba(12, 12, 14, 0.94);
@@ -404,6 +464,7 @@
 .feed-notes[hidden] { display: none; }
 /* The sheet's handle: always visible, and the whole thing folds into it. */
 .feed-notes-title {
+  flex: none;
   display: flex;
   align-items: center;
   gap: 0.5rem;
@@ -428,13 +489,24 @@
 }
 .feed-notes-chevron { margin-left: auto; opacity: 0.6; transition: transform 0.25s ease; }
 .feed-notes-body {
-  /* Slides down out of the way rather than disappearing, so it is obvious where it
-     went and how to get it back. */
-  overflow: hidden;
+  /* The panel's one scroller: the title stays, and the panel's height limit shrinks this.
+     Slides down out of the way rather than disappearing, so it is obvious where it went
+     and how to get it back; the transition needs a numeric max-height to start from. */
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
   max-height: 60vh;
   transition: max-height 0.28s ease, opacity 0.2s ease;
+  scrollbar-width: thin;
+  scrollbar-color: #3a3a3a transparent;
 }
+.feed-notes-body::-webkit-scrollbar { width: 12px; }
+.feed-notes-body::-webkit-scrollbar-track { background: transparent; }
+.feed-notes-body::-webkit-scrollbar-thumb { background: #3a3a3a; border-radius: 8px;
+  border: 3px solid transparent; background-clip: content-box; }
+.feed-notes-body::-webkit-scrollbar-thumb:hover { background: #555; background-clip: content-box; }
 .feed-notes.is-collapsed .feed-notes-body {
+  overflow: hidden;
   max-height: 0;
   opacity: 0;
   pointer-events: none;
@@ -489,6 +561,66 @@
   overflow: hidden;
   min-height: 2.1rem;
 }
+.feed-notes-list li.is-narration { grid-template-columns: auto auto 1fr auto; }
+.feed-note-tag {
+  margin-top: 0.45rem;
+  font-size: 0.7rem;
+  letter-spacing: 0.03em;
+  opacity: 0.55;
+}
+.feed-notes textarea[readonly] { opacity: 0.6; }
+.feed-narration-state { margin: 0.8rem 0 0; font-size: 0.8rem; line-height: 1.5; opacity: 0.75; }
+.feed-narration-state[hidden] { display: none; }
+.feed-narration-undo,
+.feed-narration-error button {
+  margin-left: 0.3rem;
+  padding: 0.15rem 0.6rem;
+  border: 1px solid #555;
+  border-radius: 0.35rem;
+  background: #1b1b1b;
+  color: #fff;
+  font: inherit;
+  cursor: pointer;
+}
+.feed-narration-error {
+  margin: 0.8rem 0 0;
+  padding: 0.4rem 0.6rem;
+  border-radius: 0.35rem;
+  background: rgba(140, 40, 40, 0.85);
+  font-size: 0.8rem;
+  line-height: 1.5;
+}
+.feed-narration-error[hidden],
+.feed-narration-error [hidden] { display: none; }
+/* Ask AI to rephrase (§11.3). No scroller of its own: `.feed-notes-body` is the panel's one. */
+.feed-rephrase { margin: 0 0 0.9rem; padding-top: 0.7rem; border-top: 1px solid #333; font-size: 0.82rem; }
+.feed-rephrase[hidden],
+.feed-rephrase [hidden] { display: none; }
+.feed-rephrase-title { margin: 0 0 0.5rem; font-size: 0.78rem; font-weight: 600; opacity: 0.75; }
+.feed-rephrase-log { list-style: none; margin: 0; padding: 0; }
+.feed-rephrase-log li { margin-bottom: 0.35rem; line-height: 1.4; overflow-wrap: anywhere; }
+.feed-rephrase-who { margin-right: 0.3rem; opacity: 0.6; }
+.feed-rephrase-summary { margin: 0.4rem 0; font-weight: 600; }
+.feed-rephrase-changes { list-style: none; margin: 0 0 0.5rem; padding: 0; }
+.feed-rephrase-changes li { display: grid; grid-template-columns: auto 1fr; gap: 0.1rem 0.5rem;
+  margin-bottom: 0.4rem; line-height: 1.4; overflow-wrap: anywhere; }
+.feed-rephrase-stamp { font-variant-numeric: tabular-nums; opacity: 0.6; }
+.feed-rephrase-old { opacity: 0.6; text-decoration: line-through; }
+.feed-rephrase-new { grid-column: 2; }
+.feed-rephrase-outdated,
+.feed-rephrase-refused { margin: 0.4rem 0; color: #f0b0a0; }
+.feed-rephrase-progress { display: flex; align-items: center; gap: 0.5rem; margin: 0.4rem 0; }
+.feed-rephrase-form { display: grid; grid-template-columns: 1fr auto; gap: 0.4rem; margin-top: 0.4rem; }
+.feed-rephrase button {
+  padding: 0.25rem 0.8rem;
+  border: 1px solid #555;
+  border-radius: 0.35rem;
+  background: #1b1b1b;
+  color: #fff;
+  font: inherit;
+  cursor: pointer;
+}
+.feed-rephrase button:disabled { opacity: 0.5; cursor: default; }
 .feed-notes-new { display: grid; gap: 0.4rem; }
 .feed-notes-at { font-size: 0.78rem; opacity: 0.7; font-variant-numeric: tabular-nums; }
 .feed-notes-new button {

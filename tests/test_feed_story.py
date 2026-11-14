@@ -17,12 +17,13 @@ import pytest
 from feed.director import direct
 from feed.language import DEFAULT, LANGUAGES, get_language, set_language
 from feed.signals import ShotSignal
-from feed.story import narration_words, sentences, write_story
+from feed.story import Story, match_photographs, narration_words, sentences, write_story
 
-# Which call a prompt is — the fake has to answer four different ones.
+# Which call a prompt is — the fake has to answer five different ones.
 TELL_MARKS = ("ЧТО ЭТО ЗА ДЕНЬ", "WHAT THE DAY WAS")
 EXPAND_MARKS = ("Допиши", "more sentences")
 WEAVE_MARKS = ("ПРЕДЛОЖЕНИЕ", "SENTENCE:")
+MATCH_MARKS = ("Which numbered photograph",)
 
 # Sentences long enough to be their own BEAT — a passage holds a photograph for as long
 # as it is spoken, so short clauses are joined (`_MIN_SENTENCE_CHARS`).
@@ -38,17 +39,19 @@ def stage(prompt: str) -> str:
     if prompt.startswith("Translate into"):
         return "translate"
     for name, marks in (("tell", TELL_MARKS), ("expand", EXPAND_MARKS),
-                        ("weave", WEAVE_MARKS)):
+                        ("weave", WEAVE_MARKS), ("match", MATCH_MARKS)):
         if any(mark in prompt for mark in marks):
             return name
     return "dress"
 
 
 class FakeClient:
-    """Answers every stage. `payload` is the cut-and-dress answer."""
+    """Answers every stage. `payload` is the cut-and-dress answer, and `votes` the
+    per-sentence matches in turn, each a raw reply or an Exception to raise."""
 
-    def __init__(self, payload, prose=PROSE, woven="", extra="", translated=None):
+    def __init__(self, payload, prose=PROSE, woven="", extra="", translated=None, votes=()):
         self.payload = payload
+        self.votes = list(votes)
         self.prose = prose
         self.woven = woven
         self.extra = extra
@@ -59,7 +62,7 @@ class FakeClient:
         prompt = messages[-1]["content"]
         which = stage(prompt)
         self.calls.append({"model": model, "messages": messages, "schema": json_schema,
-                           "stage": which, "prompt": prompt})
+                           "stage": which, "prompt": prompt, "kw": kw})
         if isinstance(self.payload, Exception):
             raise self.payload
         if which == "tell":
@@ -71,7 +74,15 @@ class FakeClient:
             return json.dumps({"story": self.extra})
         if which == "weave":
             return json.dumps({"text": self.woven})
+        if which == "match":
+            return self.vote()
         return self.payload
+
+    def vote(self):
+        answer = self.votes.pop(0) if self.votes else "{}"
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
 
     def prompt_of(self, which):
         return next(c["prompt"] for c in self.calls if c["stage"] == which)
@@ -94,7 +105,7 @@ GOOD = json.dumps({
                {"sentence": 3, "shot": 1, "voice": ""}],
     "narration": "",
     "narrator": "xenia",
-    "cards": [{"shot": 1, "text": "Golden light"}],
+    "cards": [{"sentence": 1, "text": "Golden light"}],
     "music_prompt": "warm ambient drone",
 })
 
@@ -121,9 +132,35 @@ def test_the_story_is_asked_for_as_a_story_not_as_captions():
 def test_the_story_call_carries_the_memorys_own_facts():
     client = FakeClient(GOOD)
     write_story(client, "gemma", title="Halloween", description="In Tbilisi.",
-                edit=EDIT, language="ru", digest="3 photographs. Where: Tbilisi.")
+                edit=EDIT, language="ru", facts="3 photographs. Where: Tbilisi.")
     told = client.prompt_of("tell")
     assert "Halloween" in told and "In Tbilisi." in told and "Where: Tbilisi." in told
+
+
+def test_the_story_is_told_from_what_the_photographs_show():
+    client = FakeClient(GOOD)
+    write_story(client, "gemma", title="T", description="D", edit=EDIT, language="ru",
+                photos=["Five young men around a campfire with guitars.",
+                        "Two men by a light-coloured SUV at the edge of the trees."])
+    told = client.prompt_of("tell")
+    assert "1. Five young men around a campfire with guitars." in told
+    assert "2. Two men by a light-coloured SUV" in told
+
+
+def test_the_story_call_is_not_shown_the_guessed_labels():
+    client = FakeClient(GOOD)
+    write_story(client, "gemma", title="T", description="D", edit=EDIT, language="ru",
+                digest="Season and weather: rain.", facts="2 photographs.")
+    told = client.prompt_of("tell")
+    assert "2 photographs." in told
+    assert "rain" not in told
+
+
+def test_more_story_is_asked_for_from_the_same_photographs():
+    client = FakeClient(GOOD, prose="Было темно.", extra="")
+    write_story(client, "gemma", title="T", description="D", edit=EDIT, language="ru",
+                photos=["Five young men around a campfire with guitars."])
+    assert "campfire with guitars" in client.prompt_of("expand")
 
 
 def test_english_asks_in_english():
@@ -166,6 +203,36 @@ def test_short_sentences_are_joined_into_one_beat():
     assert sentences("Было темно. Дул ветер. Мы стояли и молчали, не понимая ничего.") == [
         "Было темно. Дул ветер. Мы стояли и молчали, не понимая ничего.",
     ]
+
+
+# A real Russian film's narration: fourteen sentences, thirteen of them under 45
+# characters. The old join glued every one onto the one before and returned TWO
+# passages, so a six-photo memory played as a two-photo film.
+SHORT_SENTENCES = (
+    "Помнишь тот день? Мы были в лесу. Дорожка грязная, а дождь хлестал по листве. "
+    "Мы собрались вместе. Гитары лежали, огонь потрескивал. Это было то время. "
+    "Чувствовалось то знакомое, тягучее счастье. Было немного скучно, но это было "
+    "хорошо. Мы смеялись, спорили о чем-то пустом. Обнимались, и тепло от огня "
+    "обволакивало. В этом хаосе была вся наша привязанность. Время текло медленно, "
+    "как густой мёд. Мы просто были. И в этом моменте, среди сырости и темноты, всё "
+    "казалось совершенным.")
+
+
+def test_a_join_stops_once_the_passage_is_long_enough():
+    passages = sentences(SHORT_SENTENCES)
+    assert len(passages) == 7
+    assert " ".join(passages) == SHORT_SENTENCES
+
+
+def test_a_short_last_sentence_joins_the_passage_before_it():
+    long = "Мы приехали в Тбилиси поздним ветреным вечером и сразу пошли гулять."
+    assert sentences(f"{long} Было темно.") == [f"{long} Было темно."]
+
+
+def test_the_story_is_never_cut_into_fewer_passages_than_photographs():
+    passages = sentences(SHORT_SENTENCES, at_least=12)
+    assert len(passages) >= 12
+    assert " ".join(passages) == SHORT_SENTENCES
 
 
 # --- the language guarantee ------------------------------------------------------------
@@ -318,6 +385,33 @@ def test_every_sentence_gets_a_photograph():
     assert all(0 <= shot < len(EDIT.shots) for shot, _ in story.script)
 
 
+def test_a_photograph_the_matching_call_left_out_stays_out_of_the_film():
+    # GOOD puts sentences 1-3 over photographs 1, 2, 1 — photograph 3 is never shown.
+    edit = direct([sig(1), sig(2), sig(3)])
+    story = write_story(FakeClient(GOOD), "gemma", title="T", description="D",
+                        edit=edit, language="ru")
+    assert [shot for shot, _ in story.script] == [0, 1, 0]
+    assert story.narration == PROSE
+
+
+def test_a_story_with_fewer_sentences_than_photographs_is_extended():
+    # Long enough in WORDS, so the length repair stays quiet — but three sentences
+    # cannot carry four photographs, so the follow-up is asked for more.
+    prose = ("Мы приехали в старый Тбилиси поздним ветреным вечером, бросили вещи в "
+             "маленькой гостинице и сразу пошли гулять по узким улицам. "
+             "Было очень холодно, ветер дул с реки, но город с его огнями и балконами "
+             "казался нам невероятно красивым и совсем родным. "
+             "Мы гуляли допоздна, заходили в крошечные кафе, пили горячее вино и "
+             "вернулись домой совершенно счастливыми и уставшими.")
+    extra = "Под утро город затих, и мы долго смотрели на пустые мокрые улицы."
+    edit = direct([sig(i) for i in range(1, 5)])
+    client = FakeClient(GOOD, prose=prose, extra=extra)
+    story = write_story(client, "gemma", title="T", description="D", edit=edit,
+                        language="ru")
+    assert len(client.staged("expand")) == 1
+    assert len(story.script) == 4
+
+
 def test_the_words_are_ours_not_the_matching_calls():
     # The matching call cannot rewrite the story: it only points at sentences.
     payload = json.loads(GOOD)
@@ -372,7 +466,7 @@ def test_title_cards_are_sparse_and_bounded():
     from feed.story import MAX_TITLE_CARDS
 
     payload = json.loads(GOOD)
-    payload["cards"] = [{"shot": 1, "text": f"card {i}"} for i in range(20)]
+    payload["cards"] = [{"sentence": 1, "text": f"card {i}"} for i in range(20)]
     story = write_story(FakeClient(json.dumps(payload)), "gemma", title="T",
                         description="D", edit=EDIT, language="ru")
     assert len(story.cards) <= MAX_TITLE_CARDS
@@ -380,7 +474,7 @@ def test_title_cards_are_sparse_and_bounded():
 
 def test_a_card_pointing_outside_the_film_is_dropped():
     payload = json.loads(GOOD)
-    payload["cards"] = [{"shot": 99, "text": "nowhere"}]
+    payload["cards"] = [{"sentence": 99, "text": "nowhere"}]
     story = write_story(FakeClient(json.dumps(payload)), "gemma", title="T",
                         description="D", edit=EDIT, language="ru")
     assert story.cards == ()
@@ -435,6 +529,32 @@ def test_a_bracket_with_no_voice_cast_makes_the_matching_call_ask_again():
                 notes="  [at 0:00, about 0% of the way through] [хриплый голос] тут",
                 speakers="  aidar — male, deep: low and rough")
     assert len(client.staged("dress")) == 2
+
+
+VOICE_NOTE = "  [at 0:00, about 0% of the way through] [хриплый голос] тут"
+CASTING_CLAUSE = "cast a speaker like that for THAT passage"
+
+
+def test_a_film_with_speakers_is_told_to_cast_a_bracket():
+    client = FakeClient(GOOD, woven="")
+    write_story(client, "gemma", title="T", description="D", edit=EDIT, language="ru",
+                notes=VOICE_NOTE, speakers="  aidar — male, deep: low and rough")
+    prompt = client.prompt_of("dress")
+    assert CASTING_CLAUSE in prompt
+    assert "THE VOICES YOU MAY CAST" in prompt
+
+
+def test_a_chosen_narrator_reads_every_passage_and_a_bracket_casts_no_one():
+    client = FakeClient(GOOD, woven="")
+    write_story(client, "gemma", title="T", description="D", edit=EDIT, language="ru",
+                notes=VOICE_NOTE)
+    prompt = client.prompt_of("dress")
+    assert CASTING_CLAUSE not in prompt
+    assert "THE VOICES YOU MAY CAST" not in prompt
+    assert "reads ALL passages" in prompt
+    assert "ANYTHING IN [SQUARE BRACKETS] IS AN INSTRUCTION" in prompt
+    assert "A bracket about the music belongs in `music_prompt`" in prompt
+    assert len(client.staged("dress")) == 1                 # no retry for a cast
 
 
 def test_a_cast_voice_survives_the_match():
@@ -545,3 +665,320 @@ def test_a_bracket_the_story_copied_in_is_never_narrated():
                         language="ru")
     assert "суровый" not in story.narration
     assert story.narration.startswith("Мы приехали")
+
+
+#
+# The expected photographs are always a passage's own vote, else the SELECTED stage-2
+# answer's. Nothing relabels a photograph.
+
+TOLD = ["Sentence A.", "Sentence B.", "Sentence C.", "Sentence D."]
+EDIT3 = direct([sig(1), sig(2), sig(3)])
+SPEAKERS = "  aidar — male, deep: low and rough"
+
+
+class DressClient(FakeClient):
+    """Answers each stage-2 call with the next payload; an Exception is raised."""
+
+    def __init__(self, *dresses, votes=()):
+        super().__init__(None, votes=votes)
+        self.dresses = list(dresses)
+
+    def text_complete(self, model, messages, *, json_schema=None, **kw):
+        prompt = messages[-1]["content"]
+        self.calls.append({"stage": stage(prompt), "prompt": prompt, "schema": json_schema,
+                           "kw": kw})
+        if stage(prompt) == "match":
+            return self.vote()
+        answer = self.dresses.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+
+def dress_answer(photos, voices=None, **extra):
+    """A stage-2 answer: sentence i+1 over photograph photos[i]+1."""
+    voices = voices or [""] * len(photos)
+    return json.dumps({
+        "script": [{"sentence": i + 1, "shot": photo + 1, "voice": voice}
+                   for i, (photo, voice) in enumerate(zip(photos, voices))],
+        "narration": "",
+        **extra,
+    })
+
+
+def votes(*photos):
+    """Per-sentence matches: 0-based photographs, as the 1-based replies a model gives."""
+    return [json.dumps({"photo": photo + 1}) for photo in photos]
+
+
+FIRST = dress_answer([2, 0, 2, 1], ["", "aidar", "", ""], narrator="xenia",
+                     cards=[{"sentence": 2, "text": "The turn"}],
+                     score=[{"from": 1, "brief": "solo piano"}],
+                     music_prompt="warm strings")
+# The first answer as the selected Story: its words, photographs and furniture.
+SELECTED = {
+    "narration": " ".join(TOLD),
+    "cards": ((1, "The turn"),),
+    "music_prompt": "warm strings",
+    "narrator": "xenia",
+    "script": ((2, TOLD[0]), (0, TOLD[1]), (2, TOLD[2]), (1, TOLD[3])),
+    "voices": ("", "aidar", "", ""),
+    "score": ((0, "solo piano"),),
+}
+
+
+def dress(client, told=TOLD, edit=EDIT3, notes="", speakers="", photos=None):
+    from feed.story import _dress
+
+    return _dress(client, "gemma", told, "T", "D", edit, None, "en", "", notes, "",
+                  speakers, None, photos)
+
+
+@pytest.mark.parametrize(("photos", "expected"), [
+    ([0, 1, 0, 2], True),
+    ([2, 0, 2, 1], False),
+    ([0, 0, 2, 1], False),
+    ([], True),
+])
+def test_introduces_in_order_checks_first_appearances_only(photos, expected):
+    from feed.story import introduces_in_order
+
+    assert introduces_in_order(photos) is expected
+
+
+def test_the_script_is_parsed_in_told_order_with_each_voice_on_its_sentence():
+    from feed.story import _script
+
+    told = ["A", "B", "C", "D", "E"]
+    raw = [
+        {"sentence": 3, "shot": 2, "voice": "v3"},
+        "junk",
+        {"sentence": 2, "shot": 3, "voice": "v2"},
+        {"sentence": 3, "shot": 1, "voice": "duplicate"},
+        {"sentence": "x", "shot": 1, "voice": "malformed"},
+        {"sentence": 5, "shot": 1, "voice": "v5"},
+    ]
+    script, voices, matched = _script(raw, 3, told)
+    # Sentence 1 is missing: it takes the next accepted sentence's photograph (2's).
+    # Sentence 4 is missing: it takes the photograph of the sentence before it (3's).
+    assert script == ((2, "A"), (2, "B"), (1, "C"), (1, "D"), (0, "E"))
+    assert voices == ("", "v2", "v3", "", "v5")
+    assert matched is True
+
+
+@pytest.mark.parametrize("raw", [
+    "nonsense",
+    [],
+    ["junk", {"sentence": 9, "shot": 1}, {"shot": 1, "voice": ""}],
+])
+def test_a_script_with_nothing_accepted_is_the_even_fallback(raw):
+    from feed.story import _script
+
+    script, voices, matched = _script(raw, 3, TOLD)
+    assert [photo for photo, _ in script] == [0, 0, 1, 2]
+    assert [text for _, text in script] == TOLD
+    assert voices == ("", "", "", "")
+    assert matched is False
+
+
+def test_a_card_names_a_sentence_and_lands_on_that_passage():
+    from feed.story import MAX_TITLE_CARDS, _cards
+
+    assert _cards([{"sentence": 3, "text": "Home"}], 4) == ((2, "Home"),)
+    assert _cards([{"sentence": 5, "text": "Past the end"}], 4) == ()
+    assert _cards([{"shot": 1, "text": "Old key"}], 4) == ()
+    many = [{"sentence": 1, "text": f"card {i}"} for i in range(20)]
+    assert len(_cards(many, 4)) == MAX_TITLE_CARDS
+
+
+def test_a_card_on_a_returning_passage_stays_on_that_passage():
+    payload = json.loads(GOOD)
+    payload["cards"] = [{"sentence": 3, "text": "Back again"}]
+    story = write_story(FakeClient(json.dumps(payload)), "gemma", title="T",
+                        description="D", edit=EDIT, language="ru")
+    assert story.script[2][0] == story.script[0][0]
+    assert story.lines_for(len(story.script)) == ["", "", "Back again"]
+
+
+def test_the_schema_and_prompt_ask_for_a_cards_sentence_and_no_order_or_coverage():
+    client = FakeClient(GOOD)
+    write_story(client, "gemma", title="T", description="D", edit=EDIT, language="ru")
+    call = next(c for c in client.calls if c["stage"] == "dress")
+    assert call["schema"]["properties"]["cards"]["items"]["required"] == ["sentence", "text"]
+    assert '{"sentence": <1-based sentence number>, "text": "..."}' in call["prompt"]
+    assert "EVERY photograph at least once" not in call["prompt"]
+    assert "Introduce the photographs" not in call["prompt"]
+
+
+def test_an_answer_in_the_memorys_order_is_kept_with_no_second_stage_2_call():
+    client = FakeClient(GOOD)                         # photographs [0, 1, 0]
+    story = write_story(client, "gemma", title="T", description="D", edit=EDIT,
+                        language="ru")
+    assert [photo for photo, _ in story.script] == [0, 1, 0]
+    assert len(client.staged("dress")) == 1
+    assert story.memory_order == "kept"
+
+
+def test_a_sentence_moves_to_the_photograph_it_describes():
+    # The film of 2026-11-04: the two cats' sentence was on photograph 3, the one cat.
+    told = ["The cat and her.", "The girl.", "The blanket.", "The light.",
+            "Two cats in a basket.", "The end."]
+    client = DressClient(dress_answer([0, 2, 1, 3, 2, 3]), votes=votes(0, 2, 1, 3, 3, 3))
+    story = dress(client, told=told, edit=direct([sig(i) for i in range(1, 5)]))
+    assert story.script[4] == (3, "Two cats in a basket.")
+    assert story.votes == (0, 2, 1, 3, 3, 3)
+    assert story.memory_order == "broken"
+
+
+def test_each_passage_is_matched_on_its_own_at_temperature_0():
+    client = DressClient(FIRST)
+    dress(client, photos=["Two cats.", "A girl.", "One cat."])
+    calls = client.staged("match")
+    assert len(calls) == len(TOLD)
+    for call, sentence in zip(calls, TOLD):
+        assert [text for text in TOLD if text in call["prompt"]] == [sentence]
+        assert "1. Two cats.\n2. A girl.\n3. One cat." in call["prompt"]
+        assert "order" not in call["prompt"].lower()
+        assert call["kw"]["temperature"] == 0
+        assert call["schema"]["properties"] == {"photo": {"type": "integer"}}
+        assert call["schema"]["required"] == ["photo"]
+
+
+@pytest.mark.parametrize(("photos", "listed"), [
+    (["DESCRIPTION 1", "DESCRIPTION 2"], "1. DESCRIPTION 1\n2. DESCRIPTION 2"),
+    (None, "1. BRIEF 1\n2. BRIEF 2"),
+], ids=["descriptions", "briefs"])
+def test_a_sentence_is_matched_against_the_descriptions_else_the_briefs(photos, listed):
+    client = FakeClient(GOOD)
+    write_story(client, "gemma", title="T", description="D", edit=EDIT, language="ru",
+                shots=["BRIEF 1", "BRIEF 2"], photos=photos)
+    assert listed in client.prompt_of("match")
+
+
+def test_every_matching_prompt_fits_the_server_and_lists_every_photograph():
+    from feed.story import CHARS_PER_TOKEN, RESERVED_TOKENS
+
+    client = FakeClient(GOOD)
+    write_story(client, "gemma", title="T", description="D", edit=_long_edit(),
+                shots=_briefs(), language="ru", context_tokens=8192)
+    prompts = [call["prompt"] for call in client.staged("match")]
+    assert prompts
+    for prompt in prompts:
+        assert len(prompt) / CHARS_PER_TOKEN + RESERVED_TOKENS <= 8192
+        assert "\n40. A very long" in prompt
+
+
+def test_a_correct_return_stays_with_an_unused_third_photograph():
+    client = DressClient(dress_answer([0, 2, 1]), votes=votes(0, 1, 0))
+    story = dress(client, told=TOLD[:3])
+    assert [photo for photo, _ in story.script] == [0, 1, 0]
+    assert story.memory_order == "kept"
+
+
+def test_stage_2s_repeat_stays_with_an_unused_third_photograph():
+    story = dress(DressClient(dress_answer([0, 1, 0])), told=TOLD[:3])
+    assert [photo for photo, _ in story.script] == [0, 1, 0]
+    assert story.votes == (None, None, None)
+
+
+def test_a_photograph_no_sentence_is_about_is_logged(caplog):
+    with caplog.at_level("INFO", logger="feed.story"):
+        dress(DressClient(dress_answer([0, 1, 0])), told=TOLD[:3])
+    assert "no sentence is about photographs [2]" in caplog.text
+
+
+def test_out_of_order_matches_stay_with_no_further_call():
+    client = DressClient(dress_answer([0, 1, 0, 2]), votes=votes(2, 0, 2, 1))
+    story = dress(client)
+    assert [photo for photo, _ in story.script] == [2, 0, 2, 1]
+    assert [text for _, text in story.script] == TOLD
+    assert story.memory_order == "broken"
+    assert len(client.staged("dress")) == 1
+
+
+def test_a_match_changes_only_the_photographs():
+    story = dress(DressClient(FIRST, votes=votes(0, 1, 0, 2)))
+    assert story == Story(**{**SELECTED,
+                             "script": ((0, TOLD[0]), (1, TOLD[1]), (0, TOLD[2]),
+                                        (2, TOLD[3]))},
+                          votes=(0, 1, 0, 2), memory_order="kept")
+
+
+def test_a_voice_cast_by_the_voice_retry_survives_the_match():
+    client = DressClient(
+        dress_answer([0, 1, 0, 2]),                              # no voice cast
+        dress_answer([2, 0, 2, 1], ["", "aidar", "", ""]),       # cast
+        votes=votes(0, 1, 0, 2),
+    )
+    story = dress(client, notes=VOICE_NOTE, speakers=SPEAKERS)
+    assert len(client.staged("dress")) == 2
+    assert [photo for photo, _ in story.script] == [0, 1, 0, 2]
+    assert story.voices == ("", "aidar", "", "")
+
+
+@pytest.mark.parametrize("unusable", [
+    "this is not json",
+    "{}",
+    "[2]",
+    '{"photo": 0}',
+    '{"photo": 4}',
+    '{"photo": null}',
+    '{"photo": "x"}',
+    '{"photo": true}',
+    '{"photo": 1.5}',
+])
+def test_an_unusable_answer_keeps_stage_2s_photograph_and_the_calls_go_on(unusable):
+    client = DressClient(FIRST, votes=[unusable, *votes(1, 0, 2)])
+    story = dress(client)
+    assert [photo for photo, _ in story.script] == [2, 1, 0, 2]
+    assert story.votes == (None, 1, 0, 2)
+    assert len(client.staged("match")) == 4
+
+
+def test_a_raised_match_stops_the_calls_and_stage_2_stands_from_there():
+    client = DressClient(FIRST, votes=[*votes(1), RuntimeError("the server went away"),
+                                       *votes(0, 0)])
+    story = dress(client)
+    assert [photo for photo, _ in story.script] == [1, 0, 2, 1]
+    assert story.votes == (1, None, None, None)
+    assert len(client.staged("match")) == 2
+
+
+def test_a_film_with_no_votes_is_stage_2s_film():
+    story = dress(DressClient(FIRST))
+    assert story == Story(**SELECTED, votes=(None,) * 4, memory_order="broken")
+
+
+@pytest.mark.parametrize("answer", ["this is not json", RuntimeError("gone")],
+                         ids=["unparsable", "raised"])
+def test_a_vote_replaces_the_even_fallback_and_it_stays_marked(answer):
+    story = dress(DressClient(answer, votes=votes(2, 1, 0, 0)))
+    assert [photo for photo, _ in story.script] == [2, 1, 0, 0]
+    assert story.matched is False
+
+
+def test_no_vote_leaves_the_even_fallback_marked():
+    story = dress(DressClient("this is not json"))
+    assert [photo for photo, _ in story.script] == [0, 0, 1, 2]
+    assert story.matched is False
+    assert story.memory_order == "kept"
+
+
+def test_cancel_stops_the_photograph_calls_that_are_left():
+    class Counting:
+        calls = 0
+
+        def text_complete(self, *_args, **_kwargs):
+            self.calls += 1
+            return '{"photo": 2}'
+
+    client = Counting()
+    told = Story(narration="a b c", cards=(), music_prompt="",
+                 script=((0, "a"), (0, "b"), (0, "c")))
+
+    matched = match_photographs(client, "m", told, ["one", "two"], 2, None,
+                                lambda: client.calls >= 1)
+
+    assert client.calls == 1
+    assert matched.votes == (1, None, None)
+    assert [index for index, _text in matched.script] == [1, 0, 0]

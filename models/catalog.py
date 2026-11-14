@@ -61,9 +61,14 @@ class Preprocess:
 
 @dataclass(frozen=True)
 class HfSource:
-    """A `transformers` checkpoint, fetched into the HF cache."""
+    """A `transformers` checkpoint, fetched into the HF cache.
+
+    `revision` pins one Hub commit. `None` follows the repo's `main`, as every entry
+    did before pinning existed.
+    """
 
     repo: str
+    revision: str | None = None
 
 
 @dataclass(frozen=True)
@@ -112,6 +117,17 @@ class Speaker:
 
 
 @dataclass(frozen=True)
+class AdapterSpec:
+    """A cloning entry that can learn ONE saved voice as a LoRA adapter (design §4.1, §8.1)."""
+
+    lora: dict  # LoRAConfig fields, the same for the trainer and the voice child
+    train_cost_mb: int  # resident cost of the training child — an ESTIMATE until a bake measures it
+    train_cost_measured: bool
+    train_profiles: tuple[str, ...]  # where a bake is offered; adapters are USED wherever the entry runs
+    guidance_minutes: tuple[float, float]  # the package authors' figure: guidance, never a promise
+
+
+@dataclass(frozen=True)
 class ModelEntry:
     key: str
     slot: str
@@ -130,7 +146,11 @@ class ModelEntry:
     languages: tuple[str, ...] = ()
     # The voices this entry can read in (§11.1). Empty for every other slot.
     speakers: tuple[Speaker, ...] = ()
+    # The entry speaks a SAVED voice from its example clip (§4.1, §11.1) instead of
+    # preset speakers, so it declares none. Preset routing never picks it.
+    clones: bool = False
     note: str | None = None
+    adapter: AdapterSpec | None = None
 
 
 _ALL = ("mac", "jetson", "cloud")
@@ -392,6 +412,27 @@ CATALOG: tuple[ModelEntry, ...] = (
         "straight from models.silero.ai. Licence is CC-BY-NC (Silero's MIT covers only "
         "their base cis-tts models): fine for a personal library, not for shipping.",
     ),
+    ModelEntry(
+        key="voxcpm2", slot="voice", display="VoxCPM2 · voice copy",
+        source=HfSource("openbmb/VoxCPM2", revision="32279effe8c19989596f05d353d1447f51d9e915"),
+        size_mb=4728, cost_mb=10500, cost_measured=False,
+        profiles=("mac", "cloud"), languages=("en", "ru"), clones=True,
+        note="Voice copy (§4.1, §11.1): speaks a SAVED voice from its example clip; no preset speakers. "
+             "2.29B params, Apache-2.0 code and weights, 48 kHz mono. Pinned to one Hub commit; loaded with "
+             "load_denoiser=False and no timestamps extra. MPS runs it in float32 (the package forces it), so "
+             "the cost is an ESTIMATE: 2,290,004,544 x 4 B + the 377 MB AudioVAE + runtime. Measure it and pin it "
+             "with IVMS777_MODEL_COST_MB. The voice child is built with LoRA layers for baked voices: about 18 MB "
+             "in float32 (an estimate), inside cost_mb 10500. With no adapter loaded they add no adapter "
+             "contribution; their extra matmuls are not measured.",
+        adapter=AdapterSpec(
+            lora={"enable_lm": True, "enable_dit": True, "enable_proj": False,
+                  "r": 8, "alpha": 16, "dropout": 0.0,
+                  "target_modules_lm": ["q_proj", "v_proj", "k_proj", "o_proj"],
+                  "target_modules_dit": ["q_proj", "v_proj", "k_proj", "o_proj"]},
+            train_cost_mb=14000, train_cost_measured=False, train_profiles=("mac",),
+            guidance_minutes=(5.0, 10.0),
+        ),
+    ),
     # --- music (feed soundtrack, design §11.1) -------------------------------
     ModelEntry(
         key="musicgen-small",
@@ -428,6 +469,37 @@ CATALOG: tuple[ModelEntry, ...] = (
         "and cloud stay on small — the 8 GB board has no room for it at all. Weights "
         "are CC-BY-NC 4.0, personal use only; the code is MIT. Its resident cost is an "
         "ESTIMATE — measure it and pin it with IVMS777_MODEL_COST_MB.",
+    ),
+)
+
+# No slot and no user choice: it hears each take right after it is saved (§11.1).
+TRANSCRIBERS: tuple[ModelEntry, ...] = (
+    ModelEntry(
+        key="whisper-large-v3-turbo", slot="asr", display="Whisper large-v3 turbo · words of a take",
+        source=HfSource("openai/whisper-large-v3-turbo",
+                        revision="41f01f3fe87f28c78e2fbf8b568835947dd65ed9"),
+        size_mb=1547, cost_mb=4000, cost_measured=False,
+        profiles=("mac", "cloud"), languages=("en", "ru"),
+        note="Hears the words of each take of a saved voice right after it is saved (§4.1, §8.1, §11.1). "
+             "808,878,080 params, MIT weights, 16 kHz input, a 30 s window (a take is 5-30 s). Loaded in "
+             "float32 on MPS and CUDA, so the cost is an ESTIMATE: 808,878,080 x 4 B + runtime. Measure it "
+             "and pin it with IVMS777_MODEL_COST_MB {\"asr\": ...}.",
+    ),
+)
+
+# No slot and no user choice: it measures a test against the takes (§11.1) and speaks
+# nothing. Not `SPEAKERS`: `ModelEntry.speakers` means preset narrators.
+SPEAKER_EMBEDDERS: tuple[ModelEntry, ...] = (
+    ModelEntry(
+        key="ecapa-voxceleb", slot="speaker_embed", display="ECAPA-TDNN VoxCeleb · speaker similarity",
+        source=HfSource("speechbrain/spkrec-ecapa-voxceleb",
+                        revision="0f99f2d0ebe89ac095bcc5903c4dd8f72b367286"),
+        size_mb=85, cost_mb=1000, cost_measured=False,
+        profiles=("mac",), dim=192,
+        note="Compares a voice test with the voice's own takes (§4.1, §8.1, §11.1); a film never calls "
+             "it. Apache-2.0 weights, 16 kHz input, a 192-value embedding. Its Russian accuracy is not "
+             "measured. The cost is an ESTIMATE: 85 MiB of files + runtime. Measure it and pin it with "
+             "IVMS777_MODEL_COST_MB {\"speaker_embed\": ...}.",
     ),
 )
 
@@ -480,6 +552,49 @@ def entries_for(slot: str, profile: str) -> list[ModelEntry]:
 
 def default_key(slot: str, profile: str) -> str:
     return DEFAULTS[profile][slot]
+
+
+def cloning_entry_for(profile: str, language: str) -> ModelEntry | None:
+    """The `voice` entry that speaks a SAVED voice in `language` on `profile`, or None
+    (§11.1)."""
+    for entry in entries_for("voice", profile):
+        if entry.clones and language in entry.languages:
+            return entry
+    return None
+
+
+def adapter_entry_for(profile: str) -> ModelEntry | None:
+    """The cloning entry whose `AdapterSpec` trains on `profile`, or None (§4.1)."""
+    for entry in entries_for("voice", profile):
+        if entry.clones and entry.adapter is not None and profile in entry.adapter.train_profiles:
+            return entry
+    return None
+
+
+def transcriber_for(profile: str) -> ModelEntry | None:
+    """The `TRANSCRIBERS` entry offered on `profile`, or None (§4.1)."""
+    for entry in TRANSCRIBERS:
+        if profile in entry.profiles:
+            return entry
+    return None
+
+
+def speaker_embedder_for(profile: str) -> ModelEntry | None:
+    """The `SPEAKER_EMBEDDERS` entry offered on `profile`, or None (§4.1)."""
+    for entry in SPEAKER_EMBEDDERS:
+        if profile in entry.profiles:
+            return entry
+    return None
+
+
+def cloning_languages(profile: str) -> tuple[str, ...]:
+    """The film languages a saved voice can narrate on `profile`, in the order the
+    feed lists its languages."""
+    # Imported here: the models image ships `models/catalog.py` without `feed/`
+    # (Dockerfile.models), and only `app` asks this question.
+    from feed.language import LANGUAGES
+
+    return tuple(lang for lang in LANGUAGES if cloning_entry_for(profile, lang) is not None)
 
 
 # `voice` is never offered to the user. Which voice narrates a film follows from the

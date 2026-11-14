@@ -1,0 +1,193 @@
+{# One voice, the leaf body (design §6, §11.1, §13.1). Every action on /voices/{id} answers
+   this fragment, and voices.js swaps it in for #voices: the header with the state of the
+   voice per language, the tabs, the recording kit with its takes, "Add a take" and the
+   Test tab's language and text. The recorder and the test panel stay OUTSIDE (voice.html,
+   D53). A take or voice being deleted carries `data-deleting` — the page polls
+   /voices/{id}/list every 2 s while one is shown. `data-epoch` / `data-completed` come
+   from the test state read BEFORE the voice: voices.js swaps in only a body that matches
+   the test state it has seen (t27). `data-test-ready` = the voice can be tested. The
+   hearing job (`_voice_hearing.html`) sits under the header on every tab.
+   No part lets the user pick a take for films, and none shows, asks for or confirms
+   words (D101). #}
+{% macro take_row(example, record_again=False) %}
+  <li class="voice-example{{ ' voice-pending' if example.deleting else '' }}"
+      data-example-id="{{ example.id }}" {{ 'data-deleting' if example.deleting else '' }}>
+    <span class="take-id">#{{ example.id }}</span>
+    {% if example.deleting %}
+      <span class="voice-deleting">deleting…</span>
+    {% else %}
+      <audio controls preload="none"
+             src="/voices/{{ voice.id }}/examples/{{ example.id }}/audio"></audio>
+      <span class="muted">{{ example.seconds|clock }}</span>
+      <span class="muted">{{ example.source }}</span>
+      <span class="muted">{{ example.created_at[:10] }}</span>
+      {% if example.words_state == 'unusable' %}
+        <span class="take-unused">not used: {{ example.transcript_error }}</span>
+      {% elif example.words_state == 'waiting' %}
+        <span class="take-waiting">words not heard yet</span>
+      {% endif %}
+      <span class="take-actions">
+        {% if record_again %}<button type="button" class="kit-record">Record again</button>{% endif %}
+        <form class="example-delete js-voices-form" method="post"
+              action="/voices/{{ voice.id }}/examples/{{ example.id }}/delete">
+          <button type="submit" class="reprocess-btn">Delete</button>
+        </form>
+      </span>
+    {% endif %}
+  </li>
+{% endmacro %}
+<div id="voices" class="voice-body" data-epoch="{{ preview.epoch }}"
+     data-completed="{{ preview.completed }}" data-voice-id="{{ voice.id }}"{% if not voice.deleting and test_ready %} data-test-ready="1"{% endif %}>
+  <header class="voice-head">
+    <h1 class="voice-title"><a class="voices-up" href="/voices">Voices</a>
+      <span class="voice-crumb">›</span> <span class="voice-name">{{ voice.name }}</span></h1>
+    {% if voice.deleting %}
+      <span class="voice-deleting" data-deleting>deleting…</span>
+    {% else %}
+      <details class="voice-menu">
+        <summary aria-label="Voice actions">⋯</summary>
+        <div class="voice-menu-body">
+          <form class="voice-rename js-voices-form" method="post"
+                action="/voices/{{ voice.id }}/rename">
+            <input type="text" name="name" value="{{ voice.name }}" maxlength="80"
+                   aria-label="Voice name" required>
+            <button type="submit">Rename…</button>
+          </form>
+          <form class="voice-delete js-voices-form" method="post"
+                action="/voices/{{ voice.id }}/delete"
+                data-confirm="Delete «{{ voice.name }}» and its examples? Films already narrated with this voice keep their sound until you regenerate them.">
+            <button type="submit" class="danger">Delete voice…</button>
+          </form>
+        </div>
+      </details>
+    {% endif %}
+    <button class="voices-close" type="button" aria-label="Close">×</button>
+  </header>
+
+  {% if voice.deleting %}
+    <p class="hint">This voice is being deleted.</p>
+  {% else %}
+  {% for line, ready in ready_lines %}
+    <p class="voice-ready{{ '' if ready else ' voice-unready' }}">{{ line }}</p>
+  {% endfor %}
+  {% if waiting_takes and not hearing_here %}
+    {% if hear_offered %}
+      <p class="voice-ready voice-unready"><button type="button" class="voice-hear" data-voice-id="{{ voice.id }}">Hear the words</button></p>
+    {% else %}
+      <p class="voices-unavailable">{{ hear_not_offered }}</p>
+    {% endif %}
+  {% endif %}
+  {% with page_voice = voice.id %}{% include "_voice_hearing.html" %}{% endwith %}
+
+  <div class="voice-tabs" role="tablist" aria-label="{{ voice.name }}">
+    {% for key, label in tabs %}
+      <button type="button" role="tab" class="voice-tab" data-tab="{{ key }}"
+              aria-selected="{{ 'true' if key == tab else 'false' }}">{{ label }}</button>
+    {% endfor %}
+  </div>
+
+  <section class="voice-part" data-tab-part="recordings"{% if tab != 'recordings' %} hidden{% endif %}>
+    {% for section in recordings %}
+      <h2 class="voice-lang">{{ section.name }} · {{ section.kit_done }} of {{ section.kit_total }} kit texts · {{ section.seconds|clock }} recorded</h2>
+      {% for group in section.groups %}
+        <h3 class="kit-style">{{ group.label }} — {{ group.instruction }}</h3>
+        <ul class="kit-texts">
+          {% for text, takes in group.rows %}
+            <li class="kit-row" data-lang="{{ section.code }}" data-prompt-id="{{ text.id }}">
+              <span class="kit-line">
+                <span class="kit-id">{{ text.id }}</span>
+                <span class="kit-text">“{{ text.text|truncate(32, False, '…', 0) }}”</span>
+                {% if section.recordable and not takes|rejectattr('deleting')|list %}
+                  <button type="button" class="kit-record">Record</button>
+                {% endif %}
+              </span>
+              {% if takes %}
+                <ul class="voice-examples">
+                  {% for example in takes %}{{ take_row(example, record_again=section.recordable) }}{% endfor %}
+                </ul>
+              {% endif %}
+            </li>
+          {% endfor %}
+        </ul>
+      {% endfor %}
+      {% if section.other %}
+        <h3 class="kit-style">Other takes</h3>
+        <ul class="voice-examples">
+          {% for example in section.other %}{{ take_row(example) }}{% endfor %}
+        </ul>
+      {% endif %}
+    {% endfor %}
+    {% if available %}
+      <div class="voice-add" data-voice-id="{{ voice.id }}">
+        <span class="voice-add-title">Add a take</span>
+        <label class="voice-add-language">Language
+          <select class="voice-language" aria-label="Take language">
+            {% for code, label in languages %}
+              <option value="{{ code }}">{{ label }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <p class="voices-tip muted">Record clean, normal speech in a quiet room. Films and tests of «{{ voice.name }}» speak from its newest take of the language, once its words are heard.</p>
+        <button type="button" class="voice-record">Record</button>
+        <label class="picker-btn">Upload a file<input type="file" class="voice-upload"
+               accept="audio/*" hidden></label>
+        <span class="voice-record-note muted" hidden>Recording needs HTTPS or localhost. Upload a file instead.</span>
+      </div>
+    {% else %}
+      <p class="voices-unavailable">{{ not_available }}</p>
+    {% endif %}
+  </section>
+
+  {# Last in #voices, so it sits right above the test panel that follows #voices. #}
+  <section class="voice-part voice-test-pick" data-tab-part="test"{% if tab != 'test' %} hidden{% endif %}>
+    {% if not available %}
+      <p class="voices-unavailable">{{ not_available }}</p>
+    {% elif test_ready %}
+      <label class="test-label">Language
+        <select class="test-language" aria-label="Test language">
+          {% for code, label, take_id in test_languages %}
+            <option value="{{ code }}" data-take="{{ take_id }}">{{ label }}</option>
+          {% endfor %}
+        </select>
+        <span class="muted">the newest take of the language with heard words speaks</span>
+      </label>
+      {# `custom` is the state with no recording chosen, so it is never in the open list. #}
+      <label class="test-label">Recording
+        <select class="test-text" aria-label="Recording to test">
+          <option value="custom" hidden disabled selected>Choose a recording to compare with</option>
+          {% for value, code, label, words in test_texts %}
+            <option value="{{ value }}" data-lang="{{ code }}" data-words="{{ words }}">{{ label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+    {% else %}
+      <p class="voice-test-blocked">Record a take first. Tests speak from the newest take of the language, once its words are heard.</p>
+    {% endif %}
+    {% if test %}
+      {% set test_language = language_names.get(test.language, test.language) %}
+      <template class="test-compare">
+        <div class="compare-line">
+          <span class="example-label">Generated</span>
+          <span class="example-test muted">{{ test_language }} · “{{ test.text }}” · {% if test.prompt_example_id %}from take #{{ test.prompt_example_id }}{% elif test.model_version %}voice model v{{ test.model_version }}{% else %}from a deleted take{% endif %} · {{ test.model_key }} @ {{ test.revision[:7] }} · made in {{ '%.1f'|format(test.elapsed_seconds) }} s · {{ test.created_at[:10] }}{% if test_take_now and test_take_now != test.prompt_example_id %} · films of «{{ voice.name }}» now speak from take #{{ test_take_now }} — generate it again{% endif %}</span>
+          <audio controls preload="none" src="/voices/{{ voice.id }}/preview/audio?v={{ test.storage_key[:12] }}"></audio>
+        </div>
+        {% if original %}
+          <div class="compare-line">
+            <span class="example-label">Original</span>
+            <span class="compare-what">take #{{ original.id }}: “{{ test.text }}”</span>
+            <audio controls preload="none" src="/voices/{{ voice.id }}/examples/{{ original.id }}/audio"></audio>
+          </div>
+        {% elif test.text_kind == 'take' %}
+          <div class="compare-line">
+            <span class="example-label">Original</span>
+            <span class="compare-what">the take was deleted</span>
+          </div>
+        {% endif %}
+        <div class="compare-line">
+          <span class="example-test muted test-likeness">{% if test.likeness %}Speaker similarity {{ '%.2f'|format(test.likeness.cosine) }} (cosine){% if test.likeness.own %} · your own takes {{ '%.2f'|format(test.likeness.own.min) }}-{{ '%.2f'|format(test.likeness.own.max) }}{% endif %}{% if test_older_takes %} · measured against older takes{% endif %}{% elif test.likeness_error %}Speaker similarity not measured: {{ test.likeness_error }}{% else %}Speaker similarity not measured{% endif %}</span>
+        </div>
+      </template>
+    {% endif %}
+  </section>
+  {% endif %}
+</div>

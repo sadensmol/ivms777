@@ -360,7 +360,7 @@ budget, the scheduler's "needs" list, and the ingest stages a switch invalidates
 | `text_embed` | `nomic-embed-text-v1.5` | caption-meaning vectors (§9) | `caption_embed` |
 | `caption` | `gemma4-E2B` GGUF (vision) | the caption sentence | `caption` → `caption_embed` |
 | `planner` | `gemma4-E2B` GGUF (text) | query planner + chat | nothing (no stored output) |
-| `voice` | Kokoro-82M (en) · Silero v4_ru (ru) | the narration read over a memory film (§11.1) | nothing (no stored output) |
+| `voice` | Kokoro-82M (en) · Silero v4_ru (ru) · VoxCPM2 = saved voices (en, ru; mac/cloud) | the narration read over a memory film (§11.1) | nothing (no stored output) |
 | `music` | MusicGen **medium** on mac · small on jetson/cloud | the score generated per memory film (§11.1) | nothing (no stored output) |
 
 **`off` is a real catalog entry, not a missing one.** `voice` and `music` are the two
@@ -381,6 +381,95 @@ speak it. Kokoro ships nine languages upstream but **not Russian**, which is exa
 why a second entry exists rather than a bigger one — and why the settings popup states
 each voice's languages.
 
+**A `clones` entry speaks SAVED voices, never presets.** `voxcpm2` (VoxCPM2,
+`openbmb/VoxCPM2` pinned to one Hub commit, `profiles=("mac", "cloud")`,
+`languages=("en", "ru")`) carries `clones=True` and declares **no `speakers`**: it
+reads a passage in the voice of an example clip that the request itself brings
+(`references`, §5.1). A take holds no words when it is added, recorded or uploaded:
+its words exist only after speech recognition hears them, right after the take is saved
+(§6, §11.1). Saved
+voices and presets never meet in routing. `voice_entry_for` and
+`ensure_voice_for` consider only the entries whose `clones` matches the request —
+selected entry first, then catalog order: a request with no `references` routes among
+the presets only, so Kokoro stays the voice default on every profile and no preset film
+changes, and a request with `references` routes to the cloning entry only, so a saved
+voice never reaches a preset child. The speakers rule (CLAUDE.md § "A model's own
+metadata is DECLARED") does not apply to a `clones` entry: its voices are user data,
+never a `catalog.Speaker`. `catalog.cloning_entry_for(profile, language)` and
+`cloning_languages(profile)` answer "is voice copy available here" from the catalog
+alone; jetson lists no cloning entry. The voice child of an entry comes from
+`VOICE_TARGETS[key]` with no fallback — an unknown key raises instead of loading Kokoro.
+
+**A cloning entry may declare an `AdapterSpec`** (`ModelEntry.adapter`). With it, a
+saved voice can be **baked**: a LoRA adapter of the cloning model is trained on the
+voice's takes, and the result is one adapter file per voice. **`app` no longer bakes
+and no longer speaks through an adapter**: a film and a test of a saved voice speak
+from ONE take, the newest take of the language whose words were heard (§11.1). In a
+blind test of 28 clips that take alone beat the stored baked model (likeness 4.75 vs
+3.00, accepted 12 of 12 vs 6 of 12), and it needs no training time. The stored voice
+models, their files, the trainer and `/voice/bakes` stay for
+`scripts/voice_bake_check.py` (`docs/models.md`); removing them is a separate task.
+`voxcpm2` declares one, as data beside the model:
+
+- `lora` — the LoRA shape: the package's own `LoRAConfig` defaults with the LM and the
+  DiT on and the projections off (rank 8, alpha 16, dropout 0, on `q_proj`, `k_proj`,
+  `v_proj` and `o_proj`). The trainer and the voice child both read it from the catalog,
+  so their shapes always agree.
+- `train_cost_mb` 14000 and `train_cost_measured=False` — the resident cost of the
+  training child (§8.1). It is an **estimate** until a bake is measured.
+- `train_profiles=("mac",)` — where the models service trains. `catalog.adapter_entry_for(profile)`
+  names the entry that bakes on a profile; jetson and cloud have none yet, and a bake
+  request there answers "baking a voice is not offered on this device yet" (§5.1).
+- `guidance_minutes=(5, 10)` — the package authors' figure of 5-10 minutes of audio. It
+  is their guidance, not a promise of a result.
+
+An adapter is used wherever the entry runs (a voice baked on the mac also speaks on
+cloud), and only at the entry's pinned revision: the file records the revision and the
+LoRA shape, and the voice child refuses a file made for another (§5.1). The voice child
+of `voxcpm2` is always built with these LoRA layers (about 18 MB in float32, an
+estimate, inside `cost_mb` 10500). With no adapter loaded every LoRA B weight is zero,
+so the layers add no adapter contribution; their extra matmuls still run, and their
+cost is not measured. The catalog `note` of `voxcpm2` says the same.
+
+**The speech recognition of a take.** A film and a test send the take's words with its
+audio (the child then continues from the person's own speech, §5.1), and the user types
+no words: a take is free speech, and the recording kit's text is only a suggestion
+(§11.1). So the catalog declares one speech-recognition model beside the slots, in a
+tuple of its own, `catalog.TRANSCRIBERS`:
+
+- `whisper-large-v3-turbo` — `openai/whisper-large-v3-turbo` pinned to the Hub commit
+  `41f01f3…`, MIT weights, `languages=("en", "ru")`, `profiles=("mac", "cloud")`,
+  `cost_mb` 4000 with `cost_measured=False` — an **estimate** (`docs/models.md`). It
+  runs on every profile that clones (MPS on mac, CUDA on cloud, float32 on both), so
+  each take is heard right after it is saved wherever a saved voice can speak. A
+  profile with no transcriber hears no words, so no saved voice is ready for films
+  there; jetson clones nothing and lists none. There is no CPU path and no fallback
+  that speaks a take without its words.
+- It is **no slot and no user choice**: `SLOTS`, `DEFAULTS`, `CATALOG` and the settings
+  popup do not list it. `catalog.transcriber_for(profile)` names the entry offered on a
+  profile, else `None`.
+- `app` asks for it right after a take is saved (§11.1): the hearing job hears every
+  take of the voice that has no words yet. The bake check's bakes ask for it too.
+  Nothing else uses it.
+
+**The speaker-similarity meter.** A test of a saved voice is judged by ear, and the
+user also needs a number that compares generated speech with the recordings (§11.1). So
+the catalog declares one speaker-verification model beside the slots, in a tuple of its
+own, `catalog.SPEAKER_EMBEDDERS`:
+
+- `ecapa-voxceleb` — `speechbrain/spkrec-ecapa-voxceleb` pinned to the Hub commit
+  `0f99f2d…`, Apache-2.0 weights, `dim` 192, `profiles=("mac",)` (on cloud a test is
+  still saved: its measure fails and is stored as `likeness_error`, §11.1), `size_mb` 85 for the whole pinned
+  snapshot (its pretrainer also loads `classifier.ckpt` and `label_encoder.txt`),
+  `cost_mb` 1000 with `cost_measured=False` — an **estimate** (`docs/models.md`).
+- It is **no slot and no user choice**: `SLOTS`, `DEFAULTS`, `CATALOG` and the settings
+  popup do not list it. `catalog.speaker_embedder_for(profile)` names the entry offered
+  on a profile, else `None`. The name is not `SPEAKERS`, because `ModelEntry.speakers`
+  means preset narrators.
+- It **measures only**. It changes no synthesis, no adapter and no reference, and a film
+  never calls it. Only the speaker-similarity step of a test (§11.1) and
+  `scripts/voice_bake_check.py` ask for it.
+
 `caption` and `planner` are **separately selectable but share one `llama-server`
 child** — one process, one port. If they resolve to different GGUFs the child
 restarts when the role changes, which is exactly the cost shape the existing
@@ -393,7 +482,10 @@ downstream has to know model names:
 
 - `source` — the Hugging Face repo id, the GGUF repo + file (+ mmproj file), or
   `NoSource()` for the `off` entry of an optional slot (nothing to fetch, nothing
-  to load, always "on disk").
+  to load, always "on disk"). An `HfSource` can pin a `revision` (a Hub commit;
+  `None` = the repo's `main`). A pinned entry is fetched at that commit
+  (`hf:<repo>@<revision>`), its child loads exactly that snapshot, and the model
+  reports the revision with its output (§5.1), so a stored result can be bound to it.
 - `cost_mb` — the resident cost the governor budgets against (§8.1), and whether
   that figure is **measured on this board or an estimate**. An estimate is shown
   as unverified in the UI, because an over-estimate can make a model unloadable
@@ -422,7 +514,8 @@ profile default**. Confirming a switch, in one transaction:
    migrated),
 3. calls `jobs.reprocess()` over the slot's invalidated stage range (table above),
 
-then pushes the new slots to the `models` service. The `worker` drains the requeued
+then pushes the switchable slots (`catalog.is_switchable`) to the `models` service —
+never the automatic `voice` slot, which the `models` service owns. The `worker` drains the requeued
 stages exactly like any other reprocess, with the same per-stage progress rows (§8);
 search and "similar" run against a thinning index until it finishes, which is why the
 popup states the photo count before it asks for confirmation.
@@ -458,11 +551,16 @@ and re-reads it per request; a captured entry means every caption is stamped
 The `models` service holds no database, so it cannot read the choice itself: it
 starts on the profile defaults and reports **which model each slot currently holds**
 (on `GET /resources` and `GET /models`, alongside a `generation` counter that moves
-on every switch). `app` compares those reported slots with its own resolved selection
-on the resource-bar poll it already makes (§13) and re-pushes when they differ — so a
-`models` restart converges back to the user's selection without a coordinating store,
-and no second polling loop exists. The `generation` is what invalidates the caller's
-cached `/embed/spec` (§5.1).
+on every switch). `app` compares the reported **switchable** slots
+(`catalog.is_switchable`) with its own resolved selection on the resource-bar poll it
+already makes (§13) and re-pushes only those when they differ — so a `models` restart
+converges back to the user's selection without a coordinating store, and no second
+polling loop exists. The automatic `voice` slot is in neither the comparison nor the
+push: the `models` service owns it (`ensure_voice_for` routes each request — VoxCPM2
+for a saved voice, Silero for Russian), and `app` resolves it only to the profile
+default, so pushing that back would unload the routed voice child, mid-call too. On
+`cloud` nothing is switchable, so nothing is pushed. The `generation` is what
+invalidates the caller's cached `/embed/spec` (§5.1).
 
 ## 5. Architecture
 
@@ -477,17 +575,17 @@ source of truth").
 flowchart TB
     subgraph machine["Your machine"]
         disk[("Photos on disk<br/>sources — the app never writes here")]
-        browser["Browser<br/>/upload · /library · /photo · /organize · /feed · /chat"]
+        browser["Browser<br/>/upload · /library · /photo · /organize · /voices · /feed · /chat"]
         sync["ivms777-sync CLI<br/>apply · undo · verify<br/>reads the downloaded plan document"]
     end
 
     subgraph gpu["The GPU box · docker compose (jetson/cloud) · host processes (mac)"]
-        app["app · FastAPI + Jinja + HTMX<br/>UI · read queries · upload receipt · /api/plan (stage-2 plan document)<br/>NO models, NO torch — a thin client of the models service"]
-        worker["worker · ingest pipeline (primary writer)<br/>facets · thumbs · taxonomy · caption · memories · feed audio · deletions<br/>NO models, NO torch — a thin client of the models service"]
-        models["models · THE ONE INFERENCE GATEWAY (§5.1)<br/>the only process that imports torch/transformers AND the only client of the inference server<br/>hosts the image/text embedder in KILLABLE TorchWorker children (parent imports no torch) on the GPU — mps (mac) / cuda (jetson, cloud), NEVER cpu (§3.1) · memory governor swaps embedder↔LLM under budget (§8.1)<br/>owns the model slots + downloads (§4.1)<br/>HTTP: /embed/image · /embed/text · /embed/spec · /tag · /caption · /speak · /music · /plan · /chat · /resources · /models/*"]
+        app["app · FastAPI + Jinja + HTMX<br/>UI · read queries · upload receipt · saved-voice receipt · hearing the words of a take · voice tests · /api/plan (stage-2 plan document)<br/>NO models, NO torch — a thin client of the models service"]
+        worker["worker · ingest pipeline (primary writer)<br/>facets · thumbs · taxonomy · caption · memories · feed audio · deletions (folders · saved voices)<br/>NO models, NO torch — a thin client of the models service"]
+        models["models · THE ONE INFERENCE GATEWAY (§5.1)<br/>the only process that imports torch/transformers AND the only client of the inference server<br/>hosts the image/text embedder in KILLABLE TorchWorker children (parent imports no torch) on the GPU — mps (mac) / cuda (jetson, cloud), NEVER cpu (§3.1) · memory governor swaps embedder↔LLM under budget (§8.1)<br/>owns the model slots + downloads (§4.1)<br/>trains a saved voice's LoRA adapter in a killable voice_train child (§8.1)<br/>hears the words of a saved voice's takes in a killable asr child (§8.1)<br/>measures speaker embeddings of takes and tests in a killable speaker_embed child (§8.1)<br/>HTTP: /embed/image · /embed/text · /embed/spec · /tag · /caption · /speak · /music · /plan · /chat · /resources · /models/* · /voice/bakes · /voice/transcribe · /voice/embed"]
         infer["inference · llama.cpp llama-server (mac/jetson) | vLLM (cloud)<br/>ONE gemma4-E2B GGUF — text (planner/chat) AND vision (caption), on the GPU<br/>reached ONLY by the models service · (host on mac, container on jetson/cloud)"]
         db[("SQLite WAL<br/>sqlite-vec + FTS5 · named volume")]
-        store[("Storage<br/>originals + thumbnails + feed audio")]
+        store[("Storage<br/>originals + thumbnails + feed audio<br/>saved-voice examples + voice models + voice tests (data_dir/voices)")]
     end
 
     disk -.->|user selects| browser
@@ -501,10 +599,10 @@ flowchart TB
 
     app <-->|"reads · small short writes"| db
     worker <-->|"owns writes"| db
-    app -->|"read originals / thumbnails"| store
-    worker -->|"write originals / thumbnails"| store
+    app -->|"read originals / thumbnails · write saved-voice examples, their heard words and voice tests"| store
+    worker -->|"write originals / thumbnails · remove deleted saved-voice files"| store
 
-    app -->|"ALL inference: query embed · planner · chat (HTTP)"| models
+    app -->|"ALL inference: query embed · planner · chat · /speak with saved voices' newest heard takes: films and voice tests · /voice/transcribe after a take is saved · /voice/embed (HTTP)"| models
     app -->|"slot switch + downloads: PUT /models/slots · POST /models/download (§4.1)"| models
     worker -->|"ALL inference: embed · zero-shot tags · caption (HTTP)"| models
     models -->|"gemma4-E2B: planner/chat + caption/vision (OpenAI /v1)"| infer
@@ -518,8 +616,8 @@ flowchart TB
 `worker` owns the ingest pipeline and is the primary writer. Both open the same
 SQLite file in WAL mode with a busy timeout — SQLite permits one writer at a
 time, and `app`'s writes are small and short (recording a received upload,
-accepting a group, editing vocabulary), so contention stays negligible at this
-scale. If public traffic ever makes that false, the fix is Postgres, and the
+accepting a group, editing vocabulary, saving a voice example or a voice test), so contention stays
+negligible at this scale. If public traffic ever makes that false, the fix is Postgres, and the
 repository layer is the only thing that changes.
 
 **All model work lives in one process — the `models` service (§5.1).** `app` and
@@ -591,14 +689,233 @@ HTTP.
 - `POST /caption` — a caption sentence (title/description) for one image (OpenAI
   `/v1` call to `llama-server` with the image as an `image_url`, §4). It returns
   **no tags** — tags are SigLIP-only (§7).
-- `POST /speak` — `{text, language, voice}` → `{audio (base64 WAV), sample_rate,
-  model}`: one narration clip for a memory film (§11.1), from the `voice` residency
-  unit. `Priority.BATCH` — a film is prepared offline and must never preempt a search
-  or a chat turn. **503** when the `voice` slot holds `off`, **or** when no offered
-  voice lists `language` in its catalog `languages` (§4.1). Any other synthesis failure
-  is a **500 carrying the model's own message**, because that reason is shown to the
-  user: a film with no speech is a FAILED film (§11.1), so the error has to be
-  readable, never swallowed into "no voice".
+- `POST /speak` — `{text, language, voice, segments, voices, references}` →
+  `{audio (base64 WAV), sample_rate, model, segments, revision, conditioning}`: the
+  whole narration of a memory film (§11.1), from the `voice` residency unit.
+  `Priority.BATCH`, label `narrating` — a film is prepared offline and must never
+  preempt a search or a chat turn.
+  - `segments` is the EXACT list of chunks to speak, in order; `voices` is one speaker
+    per segment (a `[voice]` bracket, §11.3; `None` or a shorter list falls back to
+    `voice`). Same-voice runs are spoken as one call, and the reply's `segments`
+    (`[{text, start, end}]`, seconds) says where each chunk landed, because the film
+    cuts on the narration (§11.1).
+  - `references` (optional) asks for SAVED voices: `{token → {audio (base64 PCM-16 WAV
+    of one example), sha256, language, transcript, conditioning: [{model, revision,
+    blob}]}}`. With it, `voice` is required and must be a token of `references`, and so
+    must every non-empty name in `voices`; a request never mixes saved voices and preset
+    speakers. At most 8 references, each decoded WAV ≤ 4 MiB, and its sha256 must match.
+    Any breach is a **422** with the reason. The parent decodes the base64 and passes
+    `references` to the backend only when the request carries them. The gateway routes a
+    reference request to the `clones` entry for the language (§4.1), never to a preset,
+    and after the call checks that the reply's `model` is the routed key and its
+    `revision` is the entry's pinned commit — a mismatch is a 500
+    (`voice identity mismatch`).
+  - `revision` is the Hub commit the voice ran at (`None` for Kokoro and Silero).
+    `conditioning` is `{token → {state: built | restored, model, revision, reason,
+    blob}}`: a `built` entry carries the new blob (base64) and why it was built, a
+    `restored` one has `blob: null`. The blob is opaque to everyone but the child that
+    made it; the caller stores it and sends it back with the next request for that clip.
+  - **A baked voice model rides on its reference** (§4.1). A reference may carry
+    `adapter: {blob, sha256}` — the base64 of the safetensors file a bake wrote
+    (`/voice/bakes` below) and the sha256 of the decoded bytes — and `use_clip`
+    (default `true`; `false` speaks from the adapter alone, with no prompt take, and
+    is allowed only with an adapter). At most 4 references with an adapter per
+    request, each decoded adapter ≤ 64 MiB, and its sha256 must match. More adapters,
+    a larger one, a sha256 mismatch, bad base64 or `use_clip: false` without an
+    adapter is a **422** with the reason. The reply gains `adapters`: `{token →
+    {state: loaded | kept | none, sha256}}`, the state of the token's last run.
+    A reference with `use_clip: false` needs no `audio` and no `sha256`: it speaks
+    from the adapter alone. With `use_clip: true` (the default) a reference without
+    `audio` is a **422** ("the reference of '<token>' needs its audio"). Audio sent
+    with `use_clip: false` is still checked and is not used. No film and no test of
+    `app` sends an adapter: they send the voice's newest heard take of the language with
+    its words, `use_clip` left at its default (§11.1). Only `scripts/voice_bake_check.py`
+    sends one.
+  - **Generation settings, for a test run only.** A reference may carry `controls:
+    {cfg_value, inference_timesteps}`. Only `scripts/voice_bake_check.py --sweep` and
+    `--heldout` send it (§11.1): no film, preview or other path of `app` does. Both
+    fields are required. `cfg_value` is a number from 1.5 to 3.0 and `inference_timesteps` an integer from 10
+    to 20; anything else, an extra field included, is a **422**. A reference without
+    `controls` reaches the child exactly as before. The child lays the two values over a
+    fresh copy of its fixed controls for that token's runs (`docs/models.md`), and the
+    reply gains `controls`: `{token → {cfg_value, inference_timesteps}}`, only for the
+    tokens that set them. That echo is the proof the values reached the child: a stale
+    service ignores the field and speaks at the fixed values.
+  - The voice child keeps ONE loaded adapter, by sha256, and serves one generation at
+    a time, so a switch never races a generation. Before each run of a token it keeps
+    the loaded adapter (`kept`), or resets the LoRA weights when the token has none
+    (`none`), or checks and loads another (`loaded`). The check comes BEFORE any load:
+    the file's metadata must name this app's format, `voxcpm2`, the pinned revision and
+    the catalog's LoRA shape, and its tensor names must equal the child's LoRA names
+    exactly, each with the same shape. Only then are the LoRA weights reset and the file
+    loaded, and the loaded and skipped keys are checked again. So no base weight is ever
+    overwritten. Any failure in this step — a check, an I/O error, an error inside the
+    load — resets the LoRA weights, forgets the kept sha256 and fails the call with a
+    **500** carrying the reason ("made for another model revision", "made with another
+    LoRA shape", "the voice model misses N keys", …). An adapter sent to a child built
+    without LoRA is a 500 "this voice child was built without LoRA". A film or a test
+    fails with that reason: a voice model that does not fit is never spoken in part.
+    With `use_clip: false` no conditioning is built or restored for the token, and the
+    reply's `conditioning` has no entry for it.
+  - **503** when the service has no `voice` unit, or when no offered voice lists
+    `language` in its catalog `languages` (§4.1), and **503** `voice copy is not available: <reason>` (`CloningUnavailable`) when a
+    reference request finds no cloning entry for the language on this profile.
+  - **409** for every voice request, preset or saved, while a voice is being baked:
+    "a voice is being baked (N%); try again when it ends, or cancel it" (the voice
+    gate, `/voice/bakes` below).
+  - Any other synthesis failure — VoxCPM2 weights not on disk, a revision mismatch at
+    load, a CPU device — is a **500 carrying the model's own message**, because that
+    reason is shown to the user: a film with no speech is a FAILED film (§11.1), so the
+    error has to be readable, never swallowed into "no voice".
+  - `ModelsClient.speak(…, references=None, timeout=None)` encodes the base64 and
+    decodes the reply's blobs to bytes. Its timeout is 1800 s with references (an
+    unmeasured cloning model and its first load), else 300 s. A reference may carry
+    `"adapter": {"blob": bytes, "sha256"}` and `"use_clip"`; the client encodes the
+    blob, and the reply's `adapters` passes through. The client sends `audio` and
+    `sha256` only when the reference has them.
+- **`/voice/bakes` — baking a saved voice into a LoRA adapter.** One bake at a time per
+  service. The service trains the adapter in the `voice_train` child (§8.1) and holds
+  no database: the request brings the takes by value, as `/speak` brings references.
+  `app` starts no bake any more (§11.1): only the user's `scripts/voice_bake_check.py`
+  bakes one read-only for the manual bake check (`docs/models.md`) and compares the
+  result by ear. A bake that `app` started before carries `source: "app"` in its tag;
+  after a restart `app` still finishes or cleans up such a bake (`reattach`), and it
+  never cleans up a bake it did not start.
+
+  | Method | Path | Reply |
+  |---|---|---|
+  | POST | `/voice/bakes` | 202 with the status; 409 when a bake runs; 422 with the reason; 503 "baking a voice is not offered on this device yet" |
+  | GET | `/voice/bakes/current` | the running bake, else the last ended one not yet deleted; 404 when none |
+  | GET | `/voice/bakes/{id}` | the status; 404 |
+  | POST | `/voice/bakes/{id}/cancel` | the status; 404 |
+  | GET | `/voice/bakes/{id}/adapter` | the safetensors file (`application/octet-stream`); 409 when the bake is not `done`; 404 |
+  | DELETE | `/voice/bakes/{id}` | 204; 409 while it runs; 404 |
+
+  - **The request:** `{model: "voxcpm2", clips: [{audio (base64 WAV), sha256, text,
+    language}], config: {…}, tag: {…}}`. Each is checked, and a breach is a **422**
+    with the reason: 1-300 clips; each decoded clip ≤ 4 MiB, its sha256 equal, a mono
+    PCM-16 WAV at 48000 Hz (the `/speak` reference format) with at least one frame and
+    every declared frame present (else "take N: holds no audio" or "take N: is cut
+    short: part of its audio is missing"); all clips ≤ 192 MiB;
+    `text` 1-1000 characters after strip; `language` one of the entry's `languages`;
+    `config` within the trainer's ranges (`steps` 1-5000, else the default; `0 <
+    learning_rate ≤ 1e-2`; `batch_size` 1-8; `0 ≤ weight_decay ≤ 1`; `0 <
+    max_grad_norm ≤ 100`); `tag` ≤ 64 KiB as JSON; `model` the entry that bakes on this
+    profile. The **503** "baking a voice is not offered on this device yet" answers
+    when no entry bakes on this profile (`adapter_entry_for`, §4.1). It is apart from
+    `voice copy is not available`: on cloud voice copy runs and a bake does not.
+  - **The work folder.** A bake writes its clips and a `train.jsonl` manifest to
+    `<data_dir>/voice-bakes/<id>/`, and the `datasets` cache to
+    `<data_dir>/voice-bakes/hf-cache` (offline). The folder holds copies of a person's
+    voice, so nothing outlives a bake: the cache goes at the end of each bake, the
+    previous ended folder at the next start, a folder on `DELETE`, and everything under
+    `voice-bakes` at service start (`sweep`). Every caller deletes every ended bake —
+    `done`, `failed` or `cancelled`.
+  - **The status:** `{id, state: running | done | failed | cancelled, stage, fraction,
+    step, steps, loss_first, loss_last, seconds_per_step, stage_seconds, elapsed_s,
+    free_mb_before, min_free_mb, peak_device_bytes, device, error, adapter: {sha256,
+    bytes, keys} | null, model, revision, lora, config, dataset_sha256, clips, seconds,
+    tag}`. The stages, each with its share of the bar:
+
+    | Stage | Fraction | What |
+    |---|---|---|
+    | preparing the takes | 0.00-0.02 | the work folder (in the request) |
+    | waiting for the voice calls to end | 0.02 | the voice gate closes, and every speak and every manual `voice` ensure it already let in ends first, also one that waits for a GPU slot |
+    | waiting for the GPU | 0.02 | `voice`, `asr` and `speaker_embed` are unloaded (one VoxCPM2 copy, and neither Whisper nor the speaker model beside the training child) |
+    | loading the voice model for training | 0.02-0.10 | `voice_train` is leased, then a BATCH slot is reserved for the whole bake; the scheduler admits the bake and the governor loads the child inside that reserve, so this stage also covers any wait for a free slot; the bar moves on an estimate of the load time (display only) |
+    | reading the takes | 0.10-0.12 | the child reads the manifest |
+    | training · step N of M | 0.12-0.95 | one step per batch |
+    | saving the voice model | 0.95-0.99 | the adapter file |
+    | done | 1.00 | |
+
+  - **What Cancel stops.** Before training, the bake checks Cancel after the drain,
+    before the reserve and after the load. A Cancel seen there ends the bake as
+    `cancelled` at once: the parent sets the status, and no training call is made. A
+    load in progress runs to its end first. While the takes are read and during
+    training, the child stops at the next step boundary and saves nothing. The end of
+    the last step is a step boundary too, so a Cancel during the last step also saves
+    nothing. In these two stages the status reads `cancelled` only after the child
+    reports it. There is no "within N seconds" promise. A
+    caller that cancelled waits for ANY end state (`cancelled`, `done` or `failed`),
+    keeps no adapter, and deletes the bake.
+  - **The voice gate.** Every voice request (`/speak`, preset or saved), every
+    `POST /voice/transcribe` and `POST /voice/embed` (below), every manual
+    `POST /models/voice/ensure`, every `POST /models/asr/ensure` and every
+    `POST /models/speaker_embed/ensure` enters one counted admission gate before
+    routing, and leaves it when it ends. A bake closes the gate, waits for the speaks,
+    the transcribe and embed calls and the manual ensures already in it, then unloads
+    `voice`, `asr` and `speaker_embed`, and opens the gate again only after the training
+    child is torn down. While it is closed, every voice request, every transcribe call
+    and every embed call answers the **409** above, and so do
+    `POST /models/voice/ensure`, `POST /models/asr/ensure` and
+    `POST /models/speaker_embed/ensure`.
+    `POST /models/voice_train/ensure` always answers **409** (only a bake loads it,
+    through its own reserve), and `POST /models/voice_train/unload` answers **409**
+    during a bake (the lease).
+    Music, embeddings and chat run as before; an op that cannot fit beside the training
+    child fails with the governor's own reason.
+  - **A restart ends a bake.** A restart of the models service (a hot reload of
+    `modelsvc` or `audio` too) ends the bake with its child. The next process knows no
+    bake: every id is 404, and `sweep` removes the old folders.
+  - `ModelsClient` has `bake_start`, `bake_status`, `bake_current` (404 → `None`),
+    `bake_cancel`, `bake_adapter`, `bake_delete`, `transcribe` and `embed_voice`
+    (below).
+- **`POST /voice/transcribe` — hearing the words of one take.** A film and a test send
+  a take with its words, and the user types no words, so `app` asks the service to hear
+  them right after the take is saved, one take per call (the hearing job, §11.1); a
+  bake's transcription stage asks the same. The
+  service runs the speech-recognition model (`catalog.TRANSCRIBERS`, §4.1) in
+  the `asr` child (§8.1) and holds no database: **the app stores the words** on the
+  take.
+  - **The request:** `{audio (base64 WAV), sha256, language}` — one take, by value.
+    **The reply (200):** `{text, model, revision, seconds, elapsed_s}`. `text` is the
+    text as the model decoded it, with no cleanup: `app` alone judges whether it holds
+    usable words. `language` is the take's own label and forces the decoding language;
+    nothing detects a language.
+  - The parent decodes and checks the clip before any load, so a refused clip loads
+    nothing. A **422** with the reason: bad base64, a sha256 mismatch, a decoded clip
+    over 4 MiB, a clip that is not a mono PCM-16 WAV at 48000 Hz with every declared
+    frame present (the `/voice/bakes` take checks), a clip over 30 s, or a `language`
+    that the entry does not list.
+  - **409**, the voice gate's text, while a bake holds the gate (above).
+  - **503** "hearing the words of a take is not offered on this device yet" when the
+    service has no `asr` unit (no `TRANSCRIBERS` entry on this profile).
+  - **500** with the model's own message for a load or model error, for example
+    "Whisper weights for <revision> are not on disk: run `make models`". After the
+    call the reply's `revision` must equal the entry's pinned commit, else a 500
+    (`asr identity mismatch`).
+  - The call runs at `Priority.BATCH` (hearing is background work), label "hearing the
+    words of a take".
+- **`POST /voice/embed` — the speaker embedding of one clip.** The speaker-similarity
+  meter (§11.1) compares a generated clip with the takes of a voice, so `app` asks the
+  service for one vector per clip. The service runs `catalog.SPEAKER_EMBEDDERS` (§4.1) in
+  the `speaker_embed` child (§8.1) and holds no database: **`app` stores the vectors and
+  does the arithmetic**.
+  - **The request:** `{audio (base64 WAV), sha256}` — one clip, by value: a take or a
+    generated test. **The reply (200):** `{vector, model, revision, seconds, elapsed_s,
+    pipeline}`. `vector` is the raw 192-value embedding, not normalised. `pipeline` is
+    the integer version of the preprocessing (`audio/speaker_embed.py:PIPELINE`); a
+    stored vector of another version is never compared with this one.
+  - The parent decodes and checks the clip before any load, so a refused clip loads
+    nothing. A **422** with the reason: bad base64, a sha256 mismatch, a decoded clip
+    over 4 MiB, or a clip that is not a mono PCM-16 WAV at 48000 Hz with every declared
+    frame present (the `/voice/bakes` take checks). Takes and VoxCPM2's output are both
+    this format. There is **no 30 s cap**: 4 MiB is about 43 s at 48 kHz. The child
+    itself accepts any rate from 16000 Hz and resamples to the model's 16 kHz.
+  - A **422** with the reason also when the clip holds too little voiced audio after
+    resampling (`audio/speaker_embed.py`, one check): fewer than `MIN_VOICED_SECONDS`
+    (1.0 s) of 30 ms frames at or over `VOICED_RMS` (0.01). This is an energy check, not
+    voice detection. Both constants are a stated choice, not calibrated.
+  - **409**, the voice gate's text, while a bake holds the gate (above).
+  - **503** "measuring a voice is not offered on this device yet" when the service has
+    no `speaker_embed` unit (no `SPEAKER_EMBEDDERS` entry on this profile).
+  - **500** with the model's own message for a load or model error, for example
+    "ECAPA weights for <revision> are not on disk: run `make models`". After the call
+    the reply's `revision` must equal the entry's pinned commit, else a 500
+    (`speaker_embed identity mismatch`), and the vector must hold the entry's `dim`
+    values.
+  - The call runs at `Priority.BATCH`, label "measuring a voice": a measure never
+    preempts a search or a chat turn.
 - `POST /music` — `{sections | prompt, seconds, seed, temperature, guidance}` →
   `{audio (base64 WAV), sample_rate, model, segments}`: the whole SCORE for a memory
   film in one call (§11.1). `sections` is `[{brief, seconds}]` in running order, and
@@ -699,12 +1016,120 @@ The library is one SQLite file. **The full DDL — every table and index, the
 - **`memory_presentations`** — one row per memory **per language** that has been
   prepared as a film (§11.1), keyed `(group_id, language)`: the `Edit` JSON, the
   storage keys of the two generated WAVs, and the library signature it was built
-  against. `group_id` cascades from `groups`, so §11's atomic memory swap drops every
+  against. A ready film's `Edit` JSON also carries its **`passages`** — per passage, in
+  telling order: its number `n`, its text, its `start` and `end` in the narration audio
+  (both null when the voice's segments do not pair with the passages), its photograph
+  (`photo`, an index, and `photo_id`) and its voice (`voice_asked`, `voice_used`) — and
+  its **`script`**: a random `token` that names this one film, and the replay inputs
+  (`narrator_asked`, `narrator_used`, the title `cards` as `{n, text}` per passage, the
+  `score_plan` and the `music_prompt`). A failed row carries neither key; a film made
+  before them has none (§11.3). `group_id` cascades from `groups`, so §11's atomic memory swap drops every
   stale presentation in every language for free — a recycled group id can never
   inherit a previous memory's film. A presentation is stale exactly when its stored
   signature no longer matches the library's.
 - **`uploads`**, **`chat_sessions` / `chat_messages`** — the folder list (§3.2c) and
   the persisted chat transcript (§10).
+- **`saved_voices` / `voice_examples`** — a **saved voice** is user data, never a
+  catalog speaker: a name per owner, and its example clips, each in ONE language
+  (`recorded` or `uploaded`). An example is a
+  mono PCM-16 WAV at 48 kHz with its sha256 and its length. An example also holds the words that speech
+  recognition heard in it after it was saved (`transcript`, with `transcript_model` = the
+  speech-recognition model and revision that heard it; NULL = not heard yet), or why
+  it found no usable words (`transcript_error`), and the recording-kit text it was
+  shown (`kit_id`), only a suggestion: NULL for an upload or a recording made with no
+  kit text. A take stored before speech recognition holds the text it was shown in
+  `transcript` until the hearing job replaces it with the heard words; nothing reads
+  that text as words. `transcript_confirmed_at` is unused and kept. `consent_at` is kept and only repeats the store time: a family records its own voices, so no consent statement is asked. The examples are the model-independent source of
+  truth of a voice (§11.1). Both ids use `AUTOINCREMENT`, so an id is never reused.
+- **`voice_models`** — the voice model of one saved voice: the LoRA adapter baked from
+  ALL its takes (§4.1). **Films and tests no longer speak through it**: they speak from
+  a take (§11.1). Its rows and files stay, and only `scripts/voice_bake_check.py` reads
+  them. One row per voice, versioned (a Rebake stored version + 1 in place), bound to
+  the model key, the revision and the LoRA shape it was trained for, and stored at most
+  once per bake. It stays when takes are added or deleted.
+- **`voice_model_takes`** — what a voice model learned: one row per trained take with
+  its language, its length and its fingerprint. A row stays after its take is deleted,
+  so the page can show the snapshot and count the changes since it. The model's
+  languages come from these rows.
+- **`voice_bake_runs`** — the immutable snapshot of a bake that `app` started, written
+  before the bake starts. The snapshot holds each trained take with the words speech
+  recognition heard in it. It holds `cancel_requested_at`, which Cancel, a replace and a
+  voice delete set before they answer, so a cancelled bake is never stored, also after
+  an app restart. The row goes when the bake has ended and its result is stored or
+  dropped.
+- **`voice_tests`** — the last test of one saved voice (§11.1), made from the take films
+  of its language speak from: its language, its text and where the text came from, the
+  take that spoke (`prompt_example_id`; NULL once that take is deleted), model,
+  revision, time and a WAV in `data_dir/voices`. A test spoken from a take stores
+  `model_version` 0 and an empty `model_sha256`; an older row keeps the voice model
+  version that spoke it. A film never uses it. `likeness_json`
+  holds its speaker-similarity measure and `likeness_error` the reason there is none
+  (§11.1); both NULL means that the test was never measured, and that is never a zero.
+- **`voice_take_embeddings`** — the speaker embedding of one take (§11.1): one row per
+  `(example_id, model_key, revision, pipeline)`. A cache of what `/voice/embed` answered
+  for the take's immutable audio. A deleted take takes its vector with it (`ON DELETE
+  CASCADE`). This table owns no files.
+- **`voice_conditionings`** — what a cloning model built from one example: an opaque
+  blob per `(example_id, model_key, revision)`, a cache the voice child restored only
+  when the model key, revision, `voxcpm` version, clip sha256, cloning mode and
+  transcript all matched (§4.1, §5.1). A film and a test send the stored blobs of their
+  take with it (`reference_for`), as the manual bake check does (`docs/models.md`).
+  `app` writes no new rows: the `built` blobs of a reply are not stored. The drain
+  removes the files with their take.
+- **`voice_film_examples`** — legacy per-language film-example choices. Films, tests
+  and the page no longer read or write them. Existing rows stay. Deleting their example
+  sets `example_id` to NULL; deleting their voice removes the rows. This table owns no
+  files.
+- **`voice_previews`** — the last test of one example, before voice models: its text,
+  model, revision, built/restored, time and a WAV in `data_dir/voices`. **Films and
+  tests no longer use it**; the one test per voice is `voice_tests`. Its rows stay, and
+  the drain removes their files with their take.
+- **`memory_narrators`** — who narrates one memory's film in one language when the
+  user chose a narrator, keyed `(group_id, language)`; no row = Automatic. A row holds
+  a saved voice (`voice_id`) OR a preset voice (`preset_speaker`, a catalog speaker
+  name), never both: a `CHECK` in the schema, and `set_narrator` refuses both on every
+  table (an older table gains `preset_speaker` without the `CHECK`). `group_id`
+  cascades from `groups`, so §11's atomic memory swap drops the choice together with
+  the films. Both NULL = the chosen saved voice was deleted: that film fails until the
+  user picks again, and it never becomes Automatic.
+- **`narration_drafts`** — the user's edited narration of one memory's film in one
+  language (§11.1, §11.3), keyed `(group_id, language)`; no row = the film's own words.
+  The first change to a passage seeds the row with ALL passages of the ready film and
+  every replay input of its `script` (without its token), so a retry never needs that
+  film. Each seeding gets a new `draft_token` (32 hex); `source_token` is the token of
+  the film whose times the rows carry; `revision` is 1 at seeding and goes up by one on
+  every change and every rebase. A change drops the title card of each row whose text
+  changed, from the seed on; every other card stays (§11.1). Every change reads, checks
+  and writes under `BEGIN IMMEDIATE`. The ready save of a film made from the draft **rebases** it in the
+  same transaction — the rows take that film's passages, times, photographs, token and
+  script, the words stay — and never deletes it. Only "Write a new story", a retelling (§11.1) and
+  the memory's own deletion remove it: `group_id` cascades from `groups`. A narration
+  row is never a note (`memory_notes`).
+- **`voice_deletions` / `voice_file_deletions`** — the outbox of saved-voice deletion
+  (below): one owner-scoped, idempotent intent per voice or example, and one row per
+  file in `data_dir/voices` that may have lost its last row, or may never get one.
+- **`data_dir/voices`** — the saved-voice files: example WAVs, conditioning blobs,
+  voice model files and test WAVs, content-addressed (`storage/keys.py`). It is a store of its own, apart from the film
+  audio in `data_dir/audio`, so the film's orphan-audio prune never sees it.
+
+**Deleting a saved voice or an example runs through an outbox + worker, never
+inline** (the §3.2c pattern). The request records the intent in `voice_deletions` and
+returns; the row shows "deleting…" and takes no edit and no new casting. The drain
+(`process_voice_deletions`, `drain_pass` group 1) deletes the rows and records their
+files in `voice_file_deletions` in one transaction, then removes each file that no row
+still holds — voice files are content-addressed, so two voices can share one and a
+deleted clip can be added again. The intent ends only after its files are gone. With
+no worker (`inline_drain`), `app` runs the same drain on one background thread after a
+delete; after a film build, an added example, every voice test and every bake, and at
+start, it runs only when the outbox holds a row; it retries every 10 s. A
+film whose chosen narrator is being deleted, or was deleted, fails with that reason. A
+film finished before the delete keeps its sound until it is regenerated; a film still
+being made fails at its save, before any film audio is written (§11.1). Every voice
+file write first commits a cleanup row, so a process that dies mid-write leaves no file
+that nothing removes. Ids are never reused, so an old intent never meets a new voice.
+Test WAVs follow the same rules: written behind a cleanup row, removed only by the drain.
+A voice model and a voice test leave with their voice. A deleted take never removes the
+stored voice model.
 
 `tags` is a shared vocabulary with no `owner_id`; every user-scoped query filters on
 `owner_id`.
@@ -875,6 +1300,115 @@ gemma exactly as SigLIP does. Neither cost is measured yet: `music` (MusicGen sm
 figures must be measured on the board the way this section requires — the drop in
 `psutil.virtual_memory().available` across a load — and pinned with
 `IVMS777_MODEL_COST_MB='{"music": <measured>}'` before they are trusted next to gemma.
+
+**The `voice` unit can hold VoxCPM2** (`voxcpm2`, mac/cloud, §4.1) — one unit, so it
+swaps with Kokoro and Silero like any language swap, and a saved-voice film and a preset
+film never hold two voice children at once. It is by far the heaviest voice: 2.29 B
+params, and on MPS the package forces float32, so the weights alone are ≈ 9.1 GB
+(2,290,004,544 × 4 B + the 377 MB AudioVAE). Its `cost_mb` of **10500** is an
+**estimate** (that figure + ≈ 15 % runtime), labelled unverified like every other
+unmeasured cost; it must be measured on the user's mac — the drop in
+`psutil.virtual_memory().available` across a load — and pinned with
+`IVMS777_MODEL_COST_MB='{"voice": <measured>}'`. The child loads on the GPU only
+(`mps` or `cuda`; a CPU device is a load error, §3.1) and its `warm()` runs one short
+zero-shot generate, so "resident" means a first call costs no hidden load.
+The `voxcpm2` child is built with the catalog's LoRA layers for baked voices (§4.1):
+about 18 MB in float32, an estimate, inside that 10500.
+
+**The `voice_train` unit** hosts the training child of a bake
+(`audio.voxcpm_trainer:VoxCPMTrainer`, `/voice/bakes` in §5.1). It is no slot and no
+catalog choice: `SlotManager` registers it once, when an entry bakes on the profile
+(`adapter_entry_for`, §4.1), and a later slot switch never touches it, because a
+registration first unloads its unit. Nothing outside a bake asks for it. Its cost is
+the entry's `train_cost_mb` (14000 for `voxcpm2`, an **estimate**: the 9.1 GB of
+float32 weights plus an unmeasured allowance for activations and gradients), and
+`IVMS777_MODEL_COST_MB='{"voice_train": <measured>}'` overrides it. The rules:
+
+- **One bake at a time, and one VoxCPM2 copy.** A bake first closes the voice gate and
+  waits for the speaks and the manual `POST /models/voice/ensure` calls it already let
+  in (also one that waits for a GPU slot), then unloads `voice`, `asr` and
+  `speaker_embed` (below), so the training child is the only VoxCPM2 in memory and never
+  shares it with Whisper or the speaker model. While the gate is closed, a new manual `voice` ensure
+  answers 409, like a speak. The gate opens
+  again only after the training child is torn down; the next `/speak` loads the voice
+  child again.
+- **A lease keeps the training child resident.** `MemoryGovernor.lease("voice_train")`
+  is held for the whole bake: the governor treats a leased unit as kept, so a music or
+  embedder load can never evict it, and an unload of it raises `UnitLeased` (the
+  `POST /models/voice_train/unload` 409). The bake also holds one BATCH scheduler slot
+  for its whole length. At the end the lease is released and the unit is unloaded: the
+  child ends, and its memory comes back.
+- **The child trains on a thread of its own.** One call to a `TorchWorker` child holds
+  its lock until it returns, so a blocking "train" call would hide all progress. The
+  child starts a training thread and returns; it answers `status` and `cancel` between
+  steps, and the parent polls it every second. A Cancel stops the loop at the next step
+  boundary. The end of the last step is a boundary too, so a Cancel during the last
+  step also saves no adapter.
+- **A hot reload ends a bake.** The models service reloads on a change in `modelsvc`
+  or `audio` (as every change does), and a reload ends every child, the training child
+  too. The bake is then gone.
+- **Unmeasured.** The drop in free memory across the training load, the seconds per
+  step and the adapter size are measured only by the user's bake run
+  (`scripts/voice_bake_check.py` reports `free_mb_before`, `min_free_mb`,
+  `peak_device_bytes` and `seconds_per_step`). Until then 14000 is an estimate, shown
+  as one.
+
+**The `asr` unit** hosts the speech-recognition child that hears the words of a take
+(`audio.whisper_asr:WhisperASR`, the `catalog.TRANSCRIBERS` entry of §4.1,
+`POST /voice/transcribe` in §5.1). It is no slot and no catalog choice. The rules:
+
+- **Registered once.** `SlotManager` registers it once, when the catalog offers a
+  transcriber on the profile (`transcriber_for`, §4.1; mac and cloud), as it registers
+  `voice_train`: a registration first unloads its unit, so a later slot switch never
+  ends a transcribe call. It holds ONE Whisper child, loaded on the GPU (`mps` or
+  `cuda`; a CPU device is a load error) from the pinned snapshot on disk only. The
+  weights load on ONE thread (`HF_DEACTIVATE_ASYNC_LOAD=1` in the child): transformers'
+  4 loader threads each cast float16 to float32 on MPS at once, and torch's MPS kernel
+  cache then crashed the child (SIGSEGV) or spun it at 0 of 587 weights.
+- **In the voice gate.** Every transcribe call and every `POST /models/asr/ensure`
+  enters the voice gate (§5.1), so during a bake they answer 409, and a bake's drain
+  waits for one already in flight. A call runs at `Priority.BATCH`: the hearing job and
+  a bake are background work and never preempt a search or a chat turn.
+- **Unloaded before training.** A bake unloads `asr` right after `voice`, before the
+  training lease, so Whisper is never resident beside the training child. Outside a
+  bake it can sit beside the voice child under the mac and cloud budgets, and the governor evicts
+  it like any other unit. The next transcribe loads it again.
+- **A hot reload ends it**, like any child.
+- **Its cost is an estimate.** `cost_mb` 4000 with `cost_measured=False`: 3086 MiB of
+  float32 weights plus an unmeasured allowance (`docs/models.md`).
+  `IVMS777_MODEL_COST_MB='{"asr": <measured>}'` overrides it. When a transcribe call
+  loads the child, the service logs one line: `asr <key>@<first 7 of revision> loaded
+  by this request: free_mb <before> → <after>, net change <N> MB; evicted: <units, or
+  none>`. A load can evict other units to make room, so that figure is the net
+  free-memory change of the whole request, evictions included. It is never the model's
+  cost. A cost is pinned only from a load that evicts nothing, read the way this
+  section requires.
+
+**The `speaker_embed` unit** hosts the speaker-similarity child
+(`audio.speaker_embed:SpeakerEmbedder`, the `catalog.SPEAKER_EMBEDDERS` entry of §4.1,
+`POST /voice/embed` in §5.1). It is no slot and no catalog choice. The rules:
+
+- **Registered once.** `SlotManager` registers it once, when the catalog offers a
+  speaker embedder on the profile (`speaker_embedder_for`, §4.1; mac only), as it
+  registers `asr`: a registration first unloads its unit, so a later slot switch never
+  ends an embed call. It holds ONE ECAPA-TDNN child, loaded on the GPU (`mps` or
+  `cuda`; a CPU device is a load error, and there is no CPU fallback) from the pinned
+  snapshot on disk only. It loads through `EncoderClassifier.from_hparams` with
+  `source` and `pretrained_path` both set to the snapshot folder and
+  `LocalStrategy.NO_LINK`, because the pinned `hyperparams.yaml` names the Hub repo as
+  `pretrained_path`. No `savedir` is passed, so it writes no folder.
+- **In the voice gate.** Every embed call and every `POST /models/speaker_embed/ensure`
+  enters the voice gate (§5.1), so during a bake they answer 409, and a bake's drain
+  waits for one already in flight. A call runs at `Priority.BATCH`.
+- **Unloaded before training.** A bake unloads `speaker_embed` right after `asr`, before
+  the training lease, so the speaker model is never resident beside the training child.
+  Outside a bake the governor evicts it like any other unit. The next embed loads it
+  again.
+- **A hot reload ends it**, like any child.
+- **Its cost is an estimate.** `cost_mb` 1000 with `cost_measured=False`: 85 MiB of
+  files plus an unmeasured allowance for the torch runtime and the activations of a
+  43 s clip (`docs/models.md`). `IVMS777_MODEL_COST_MB='{"speaker_embed": <measured>}'`
+  overrides it.
 
 **Residency is a claim about the world, not a note to self.** gemma lives in a
 separate process that can die without asking us — `llama-server` aborts (SIGABRT) the
@@ -1392,7 +1926,7 @@ bound context. Runs only over processed photos.
 ```mermaid
 flowchart TB
     mrstart["Rebuild memories (manual, background thread)<br/>agent tools + embeds call the models service (§5.1)<br/>embed calls: HIGH priority — preempt an in-flight caption on jetson (§8.1)"] --> lib
-    lib["Owner's PROCESSED photos<br/>caption + embedding present"] --> pool["1 · Pool (cheap, NO decisions)<br/>coarse sessions by time + ~50 km region<br/>6 h gap at home · 36 h while staying away<br/>(a week's trip is ONE session)<br/>— only to bound context"]
+    lib["Owner's PROCESSED photos<br/>caption + embedding present"] --> pool["1 · Pool (cheap, NO decisions)<br/>coarse sessions by time + ~50 km region<br/>6 h gap at home · 36 h while staying away<br/>(a week's trip is ONE session)<br/>undated photos: one session per upload folder<br/>— only to bound context"]
     pool --> events["2 · Compose events (AGENT, per session)<br/>reads summaries, decides the carve<br/>tools: similar · facets · nearby-in-time · same-subject"]
     lib --> themes["3 · Discover themes (AGENT + RAG)<br/>propose thread → retrieve candidates → curate"]
     events --> recon["4 · Reconcile (AGENT)<br/>dedupe, merge fragments, final titles/covers<br/>keeps event⇆theme overlap"]
@@ -1462,14 +1996,27 @@ whole difference between a film and a slideshow with a soundtrack near it.
    - `palette` + `light` pick the **grade**;
    - pacing opens slow, tightens through the middle, and closes slow.
 3. **Story** (`feed/story.py`) — ONE model call, for the things taste owns: the
-   narration script, the sparse title cards, and the music prompt. It is shown the
+   narration script, the sparse title cards (each names the sentence it sits on), and
+   the music prompt. It is shown the
    **same rich briefs the conductor gets** — every taxonomy dimension, the place, the
    hour, the camera — plus a **digest of the memory as a whole** (`signals.digest`):
    how many photographs, over what span, where, and the dominant occasion, mood,
    weather and light. It was previously shown only the bare vision sentence, so it
    wrote about pictures instead of about an evening; the labels are what turn "several
    individuals in front of illuminated structures" into "a snowy holiday night in
-   Tbilisi". Written **directly in the target language**, so it is also the translation — the shot lines
+   Tbilisi".
+
+   **The words are WRITTEN from what the photographs show, not from labels.** The
+   story is written in its own call before any photograph is matched to it (one job,
+   so it is a story and not a caption track), and that call — and the "write more"
+   follow-up — is shown every photograph's **description in the memory's order**, as
+   the facts the story is built on, plus only the hard facts of the digest
+   (`signals.digest(guesses=False)`: count, time, place, camera). It is NOT shown the
+   zero-shot labels (mood, feeling, weather, light, setting, colour): they are guesses
+   at 0.2-0.6 confidence, and a writer given only them and three sentences narrated
+   "you and I in the rain, a little bored" over five friends with guitars by a
+   campfire — 90% of it unrelated to the memory. The labels stay where a guess is
+   harmless: the matching call's per-photo briefs, the score and the conductor. Written **directly in the target language**, so it is also the translation — the shot lines
    are never the raw `ai_title`, which is object labelling ("Spray Bottle in Hand")
    and reads as such.
 4. **Audio** — narration (`POST /speak`) and the score (`POST /music`), both `BATCH`.
@@ -1532,9 +2079,10 @@ previous film playable.
      like, when to reach for it and when not to, with every parameter's range explained.
 
    It returns, per position: which photograph plays, when it starts, how long it holds,
-   which effect with which parameters, and how it arrives. **It may reorder the film** —
-   showing the cat while the voice talks about the cat is the entire point, and a frozen
-   order cannot do that.
+   which effect with which parameters, and how it arrives. **It never reorders a film
+   with a script**: the story pass already put each photograph under its own words, so
+   the shot order is the told order (`keep_order`, "THE PHOTO ORDER BELONGS TO THE
+   MEMORY" below), and the conductor's answer gives the times and the effects.
 
    Nothing trusts the answer. `director.with_arrangement` repairs it: every photograph
    appears exactly once, times are forced monotonic, names are validated, out-of-range
@@ -1647,7 +2195,18 @@ server-side render** anywhere in this pipeline — a video FILE is produced, but
 recording this same canvas in the browser (§11.2).
 
 **Autoplay is a click.** Browsers refuse to start audio without a user gesture, so the
-film opens paused behind a title card; the first click starts picture and sound.
+film opens paused behind a title card; the first click starts picture and sound. A
+click starts nothing until the first photograph is loaded, failed, or 40 seconds have
+passed: Play then says "Loading…" and never starts by itself. The film clock starts at
+that click, so time spent idle on the title card or paused does not count.
+
+**Controls.** The page's controls sit in ONE header, the only fixed element among
+them: an action row (language, ↓ Download, ×) that wraps, and, on a ready film, a
+settings region below it with the ↻ Regenerate form, which scrolls inside its own
+bounded height. There are no fixed offsets between controls, so a wider control
+pushes the others along instead of covering them. Each control fades on its own,
+never the header as a whole, so an exporting ↓ Download stays fully visible. The
+header's empty parts pass clicks through to the film (`docs/ui.md`).
 
 **Language.** `feed_language` (§6, `app_settings`) is `en` by default and may be `ru`.
 It selects the language the story pass writes in, and therefore the language the voice
@@ -1657,50 +2216,388 @@ the other. Narration needs a voice that speaks the language: Kokoro covers Engli
 **not Russian**, so the catalog declares each voice's `languages` and `POST /speak`
 answers **503** when no offered voice can speak the requested one (§4.1). The film's
 language also picks the voice MODEL automatically — the user never selects it — and a
-Russian film that cannot be narrated is a failed film, not a mute one.
+Russian film that cannot be narrated is a failed film, not a mute one. A **saved voice**
+narrates a film from ONE take: **the newest take of the film's language whose words
+were heard** (`film_take`, `feed/saved_voices.py`), sent with those words and no
+adapter. Nobody picks it: a new take whose words are heard replaces it for the next
+film. A take whose words are not heard yet, or that has no usable words, is skipped, so
+the take before it speaks meanwhile. The voice is **ready** for a language when it has
+such a take. A voice with no take in the film's language, or whose takes of that
+language are all waiting for their words or all without usable words, cannot narrate,
+and the narrator picker shows it disabled with the reason. No voice model, no bake and
+no training wait are involved (§4.1).
 
 **Film pipeline.**
 
 ```mermaid
 flowchart TB
-    trigger["Prepare film (manual, background thread)<br/>one at a time per process · per LANGUAGE"] --> sig
+    trigger["Prepare film (manual, background thread)<br/>one at a time per process · per LANGUAGE<br/>narrator: Automatic · a preset voice · a saved voice"] --> sig
     sig["1 · Signals (PURE SQL, no model)<br/>orientation · tags (vibe/palette/light/quality/subject)<br/>place_city · shot_at · SigLIP vector"] --> dir
     dir["2 · Direct (PURE, no model)<br/>camera move per shot (one eased PUSH, never a pan)<br/>burst → hard cuts · hero → long push-in<br/>palette+light → grade · a DEFAULT effect per shot<br/>this is the film if no model ever runs"] --> story
-    story["3 · Story (model call 1, POST /text/complete)<br/>narration script · sparse title cards · music prompt<br/>+ SCORE PLAN: where the music changes, and to what<br/>written DIRECTLY in en or ru"] --> narr
-    narr["4a · Narration (POST /speak, BATCH) — MANDATORY<br/>kokoro (en) · silero v4_ru (ru, split at sentences)<br/>returns segments [{text,start,end}] — the film's SPINE<br/>no script in the language, or no speech → FAIL"] --> music
-    narr -- "cannot speak" --> failed["status='failed' + the reason<br/>the page shows the error, never a mute film"]
+    story["3 · Story (model call 1, POST /text/complete)<br/>narration WRITTEN from each photo's description, in memory order (no guessed labels)<br/>sparse title cards · music prompt<br/>+ SCORE PLAN: where the music changes, and to what<br/>written DIRECTLY in en or ru<br/>passages ≥ photos, best effort · told order = film order<br/>then ONE temperature-0 call per passage matches its photograph: a vote stands, no vote keeps stage 2's photograph<br/>memory order recorded kept or broken, never corrected · a photo no sentence is about is left out and logged<br/>Automatic only: casts the narrator + a per-passage voice from the preset table and the saved voices ready for the language<br/>an edited narration (narration_drafts): no story call, its words are the script<br/>only the per-passage match runs: no vote keeps the stored photograph"] --> narr
+    narr["4a · Narration (POST /speak, BATCH) — MANDATORY<br/>kokoro (en) · silero v4_ru (ru, split at sentences)<br/>voxcpm2 — a SAVED voice (mac/cloud): its newest heard take of the language, with its words<br/>a CHOSEN narrator (preset or saved) reads EVERY passage<br/>Automatic: a [voice] bracket may give ONE passage another voice of the narrator's kind<br/>returns segments [{text,start,end}] — the film's SPINE<br/>no script in the language, or no speech → FAIL"] --> music
+    narr -- "cannot speak · chosen or picked narrator unavailable" --> failed["status='failed' + the reason<br/>the page shows the error, never a mute film"]
     music["4b · SCORE (POST /music, BATCH) — feed/score.py plans it<br/>2-4 sections on the story's own turns, each a CONTINUATION of the last<br/>brief per section = mood + THAT stretch's photographs + role (open/lift/turn/close)<br/>covers the runtime and ENDS — no loop · 503 when the slot is off"] --> beats
     beats["4c · Beats (PURE numpy, feed/beats.py)<br/>spectral flux → onset envelope → tempo → downbeats<br/>NO model"] --> cond
-    cond["5 · Conduct (model call 2, feed/conductor.py)<br/>briefed with: every photo's description + 10 tag dimensions +<br/>place/time/EXIF · every narration sentence's timing ·<br/>every downbeat · the whole effect library<br/>returns: WHICH photo plays WHEN, with which effect + params<br/>MAY REORDER — the cat under the sentence about the cat<br/>repaired by director.with_arrangement · fallback = even + snapped"] --> persist
-    persist["6 · Persist<br/>WAVs → data_dir/audio (content-addressed, §6.1)<br/>row → memory_presentations(group_id, language)"] --> play
+    cond["5 · Conduct (model call 2, feed/conductor.py)<br/>briefed with: every photo's description + 10 tag dimensions +<br/>place/time/EXIF · every narration sentence's timing ·<br/>every downbeat · the whole effect library<br/>returns: WHEN each shot plays, with which effect + params<br/>never reorders a film with a script: the shots keep the told order<br/>repaired by director.with_arrangement · fallback = even + snapped"] --> persist
+    persist["6 · Persist<br/>WAVs → data_dir/audio (content-addressed, §6.1)<br/>row → memory_presentations(group_id, language)<br/>saved film: voice check → WAVs → row in one transaction<br/>timeline.passages + script · a used draft is rebased in the same transaction"] --> play
+    persist -- "a used saved voice was deleted (no WAV written)" --> failed
     play["/feed/{key}?lang=… — WebGL2 player<br/>CLOCK = the soundtrack's currentTime, never a timer<br/>36 shot effects + 14 transitions, one fragment shader<br/>NO model · NO ffmpeg · a LEAF under the memory grid (§13.1)"] --> save
     save["↓ Download (§11.2) — MediaRecorder over THIS canvas + THIS audio bus<br/>real time · mp4 where the browser can encode H.264, else webm<br/>no second renderer, so the file is what you watched"]
+    play -- "the rows in Tell the story better (§11.3)" --> rephrase
+    rephrase["Ask AI to rephrase (feed/rephrase.py, a job in app, POST /text/complete)<br/>reads: active rows · title · notes · photo details (as they are today)<br/>+ the READY film's timeline and decisions (the exact record)<br/>over the model's context: refused, nothing is cut<br/>proposes changed words only · any bad item rejects the whole proposal<br/>writes NOTHING"] -- "Use this: one locked write of the whole patch" --> drafts
+    drafts["narration_drafts<br/>the words change · a changed row loses its title card<br/>voices and times stay · the next build matches the photographs again"] -- "↻ Regenerate: an explicit build, step 3 runs no story pass" --> story
 ```
 
 **A model CASTS the film; the code only checks the cast is real.** Every speaker a
 voice model offers is declared in `models/catalog.py` beside it — name, gender,
 register, and a sentence saying what it sounds like (CLAUDE.md § "A model's own metadata
-is DECLARED"). The story pass is shown that table together with the memory and the
-viewer's notes, and returns a **`narrator`** for the film plus, per passage, an optional
-different **`voice`**. Judging which voice suits which moment is taste, and taste is
+is DECLARED"). In an Automatic film the story pass is shown that table together with
+the memory and the viewer's notes, and returns a **`narrator`** for the film plus, per passage, an optional
+different **`voice`**. Where voice copy speaks the film's language here, the table also
+lists the user's saved voices that are ready for that language, by name
+only: a saved voice declares nothing else, so the table says their sound is not
+described and that the two kinds never mix (`voice.automatic_for_prompt`).
+Judging which voice suits which moment is taste, and taste is
 what the story pass owns; enumerating what exists is data, and `feed/voice.py` holds no
 list of names at all.
 
-Two things the model is not trusted with. `voice.resolve()` checks every cast against
-the catalog, because an invented name raises inside the TTS child and narration is
-mandatory — a bad cast would fail the whole film. And `voice.pick_speaker()` is the
-fallback for when no model runs, deriving a narrator from the memory's own mood and
-photographs.
+Two things the model is not trusted with. `voice.resolve()` checks preset casts against
+the catalog; `voice.resolve_saved()` checks saved casts against the eligible saved voices.
+An invented name must not reach the TTS child, because narration is mandatory. And
+`voice.pick_speaker()` supplies a preset narrator from the memory's mood and photographs
+when the story names no valid narrator.
 
-**A `[voice]` bracket repaints EXACTLY ONE PASSAGE, never the film.** The narration is
+**Automatic may pick a saved voice.** The candidates are the user's saved voices that
+are ready for the film's language (`castable_takes`, the call that enables
+them in the picker), and only when voice copy speaks that language on this profile
+(`cloning_entry_for`). A saved voice whose name is also a preset name of the language
+is left out, so the story's answer is never ambiguous. With no candidate, Automatic
+picks presets only. The story's narrator resolves as a preset first, then as a
+candidate (`voice.resolve_saved`). The mood fallback (`voice.pick_speaker`) picks a
+preset only, because a saved voice declares no register.
+Each film records who
+chose its narrator — `user`, `story` or `mood` — and the narrator's name and label,
+in `decisions["cast"]` (`narrator_chosen_by`, `narrator_name`, `narrator_label`, and
+`used_label` per passage). `/feed` and the Organize card show them, and read them
+from the film, never from the current choice in `memory_narrators`, so a later delete
+or rename does not change what a film says about itself. A film made before these
+fields existed shows the label of `narrator_used` ("a saved voice" for a saved-voice
+token), and "Voice not recorded" when it has no cast. Nothing predicts the Automatic
+voice before the film is made: the story pass decides it during the build.
+
+**The user may choose the narrator: Automatic, a preset voice or a saved voice.** The
+Prepare and ↻ Regenerate forms on `/feed` carry the picker "Narrator for the next
+film", always shown (§13). The choice is stored per memory and language in
+`memory_narrators` (§6), so it survives navigation, and the build reads it from that
+table. **One voice engine per film** — saved voices and presets never mix. Automatic
+is the path above: the story pass is shown the preset table and the saved candidates,
+and casts the narrator and any per-passage voice. The narrator's kind decides the kind
+of every passage voice: a preset narrator takes preset passage voices only, a saved
+narrator saved passage voices only. A passage voice of the other kind is dropped, and
+that passage reads in the narrator's voice. With no saved candidate, only presets
+speak.
+
+**A chosen narrator reads the whole film.** When the user chooses a preset or a saved
+voice, that voice speaks EVERY passage. The story pass is shown no voice table, so it is
+asked for no cast and is never retried for one; a narrator or a per-passage voice it
+returns anyway is ignored. A `[voice]` bracket in the notes is still an instruction that
+is never narrated, but it recasts no passage. The film records no per-passage cast
+(`decisions["cast"]["passages"]` is empty). It still keeps what the story pass returned
+(`model_cast`) and whether a note asked for a voice (`notes_asked_for_a_voice`), and it
+shows no "a note asked for a different voice and none was cast" warning: only an
+Automatic film shows that. A saved narrator, chosen or picked by Automatic, makes the
+film a saved-voice film. The narration is one `POST /speak` with `references` — the
+narrator's take and the take of each saved passage voice (Automatic only), each the
+voice's newest heard take of the language with its audio, its heard words and its
+stored conditioning blobs (`reference_for`, §5.1), and no adapter —
+and it routes to the cloning entry, VoxCPM2 on mac/cloud (§4.1). A saved-voice
+narration can take minutes, so the call has a longer timeout and the "recording the
+voice" bar moves on an estimate. A narration call waits while another voice call of
+`app` runs (a film, a voice test or the hearing job), and the bar then reads "waiting
+for the voice model"; `app` never runs two voice calls at once. One turn covers
+resolving each take again, reading its audio and the speak call: a take whose words
+were heard while the film waited gives the film that take. The reply must report a
+conditioning (`built` or `restored`) for each sent take, else the film fails with "The
+models service did not speak «<name>» from its take." The film records the take it
+used (`decisions["voice"]["takes"]`: id and sha256), and "This film" names it ("·
+spoken from take #12"); a film made through a voice model keeps "· voice model v3",
+and one made from one take before voice models says "· made from one take, before
+voice models".
+
+**A saved narrator never degrades to a preset.** This holds for a saved narrator the
+user chose and for one Automatic picked: a pick is resolved again in the voice turn
+like a chosen voice, and ↻ Regenerate makes a new pick. The film fails with the reason,
+and no speak call runs, when the narrator was deleted or is being deleted, or is not
+ready for the film's language ("«me» has no English take yet. Record one under Voices,
+or choose another narrator."; "The words of «me»'s English takes are not heard yet.
+Open «me» under Voices and let it hear them, or choose another narrator."; "No English
+take of «me» has usable words. Record a take where you speak, or choose another
+narrator."; a deleted one: "The saved voice chosen for this film was deleted. Choose
+another narrator."). A take whose audio cannot be read fails it with "Take #<id> of
+«<name>» could not be read (<reason>)." It never falls back to Automatic or to a
+preset. It fails
+with the service's reason when voice copy is not available or the speak call fails —
+never a second call with a preset. Every film writes its WAVs only at "saving the
+film"; the steps before it use the bytes only. A saved film runs, in one transaction
+at that step: the check that the saved narrator
+still exists and is not being deleted → the WAV writes → the ready row. So a voice
+deleted while the film is made fails it at the save, before any film audio is written
+("The saved voice «<name>» was deleted while this film was made."). A take deleted or
+added while the film is made does not fail it: the film used the take it read and
+records it. A film finished before the
+delete keeps its sound until it is regenerated (§6). **A chosen preset never degrades
+either:** when the catalog no longer offers it for the film's language
+(`voice.resolve` rejects it), the film fails with that reason before the story pass,
+with no speak call, and never becomes Automatic.
+
+**Edited narration is spoken as written.** Every ready film keeps its narration as
+`timeline.passages` and `timeline.script` (§6): one passage per sentence of the story, in
+telling order — the order of the `/speak` chunks and of the audio — with its time in that
+audio, its photograph and its voice. The user may change those words in "Tell the story
+better" (§11.3); the first change makes a draft (`narration_drafts`, §6). A build reads the
+draft once, at "writing the narration", and with no draft runs the story pass as above.
+With a draft (`feed/narration.py`):
+
+- **No model call writes the story.** `write_story` does not run: no telling, no
+  translation, no expansion, no note weaving and no stage 2. The draft becomes the
+  `Story`: its texts in the draft's order are the script, joined they are the narration,
+  and its `voice_asked` values, `narrator_asked`, `music_prompt` and cards come from the
+  draft. Each passage starts from the photograph stored with it (`photo_id`); a photograph
+  no longer in the library takes the previous passage's, else the first. A card stays on
+  its own passage, and a card whose passage was removed is dropped. Each score-plan entry
+  moves to the first remaining passage at or after it; a second entry on the same passage,
+  or one with no such passage, is dropped. `draft_story` calls no model.
+- **Each passage's photograph is matched again.** A stored photograph can be wrong, and
+  edited words can describe another picture. So after `draft_story` the build runs
+  `story.match_photographs` (below), with the photographs' descriptions, the context the
+  server reports and Cancel. A vote sets its passage's photograph. No vote, a failed call
+  or Cancel keeps the stored photograph. The words, their order, the voices, the narrator,
+  the cards and the score plan do not change. The film records the diagnostic
+  `memory_order`, "kept" or "broken", from the final photographs (below); nothing relabels
+  them.
+- **A changed row loses its title card.** A card was written for the words of its passage.
+  So a change that gives a row new text removes that row's card from the draft's script,
+  at the seed and at every later change: `save_passage` and `rewrite_passages` alike. A
+  row whose text did not change keeps its card. Putting the old words back does not bring
+  the card back. Nothing else clears a card: a draft saved earlier keeps its cards until
+  its row changes.
+- **The narrator rules do not change.** A chosen preset or saved narrator reads every
+  passage, and the stored `voice_asked` values are ignored. Automatic resolves
+  `narrator_asked` as a preset, then as a saved candidate, else from the mood. A stored
+  passage voice stays only at a passage that a current `[voice]` bracket points at, and
+  with no bracket note there is none. A new `[voice]` note recasts nothing, because no
+  story pass reads it; when no passage is cast, the film keeps the notice "a note asked for
+  a different voice and none was cast". A saved-voice film runs its voice turn, its reply
+  check and its save checks as above.
+- **What a note can still do.** `/speak` gets the draft's texts exactly. The score, the
+  beats and the conductor run as for any film, and the conductor still reads the notes:
+  an effect bracket reaches it. When the speech pairs with the shots, every shot keeps
+  its narration time, so a timing note changes nothing. A note's words are never narrated
+  and change no word, voice or music of the draft. The stages, the progress bar and Cancel
+  are the same.
+- **The draft is rebased, never consumed.** The new film gets its own passages (`n` from
+  0) and times from its own audio. Its ready save runs in ONE `BEGIN IMMEDIATE`: the
+  deleted-voice check (a saved-voice film) → the ready row → the rebase of the draft,
+  matched by its `draft_token` AND the revision the build read → `COMMIT`. The draft then
+  holds the same words with the new film's passages, times, final photographs, token and
+  script, at revision + 1, so every later ↻ Regenerate speaks the same words again, with any narrator, until
+  "Write a new story" (§11.3). An edit saved while the build ran has another revision: it
+  stays as it is, with the earlier film's times. A deleted voice rolls the save back and
+  the film fails, and the draft stays. A failed or cancelled build never touches the
+  draft, and nothing touches it when a build starts. `decisions["story"]` of such a film
+  reads `"source": "draft"` with `draft_revision`, the passage count, `narrator_asked`,
+  the moved score plan, the music prompt, the uncovered notes, `memory_order`, the final
+  `photos`, `matched`, `votes` (one per passage) and the `context_tokens` the server
+  reported.
+
+**Asking AI to rephrase changes only a draft.** "Ask AI to rephrase" (§11.3) is the one
+other model call on the narration, and it is not a step of a build. It proposes words,
+and **Use this** writes them to the draft like any other edit. No audio changes. The next
+↻ Regenerate speaks them as written, by the path above.
+
+**Testing a saved voice.** One Test per person: the Test tab of a voice
+(`/voices/{id}`) makes a test through the same `POST /speak` and the same reference a
+film sends — the voice's newest heard take of the language (`film_take`), with its
+words. The user picks a language (one the voice is ready for), then writes the text
+(≤ 300 characters) or picks one of its takes in that language, which fills in what the
+user said there (the words speech recognition heard; a take not heard yet, or one with
+no usable words, is not offered). Editing those words makes them the user's own text.
+Then one Generate. `POST /voices/{id}/preview` still takes a fixed voice-check sentence
+(`text_kind=sentence`, `scripts/voice_check.py`, EN-1..5 and RU-1..5); no page sends one.
+A voice that is ready for no language says "Record a take first. Tests speak from the
+newest take of the language, once its words are heard." and Generate stays disabled; a
+language the voice is not ready for refuses with its reason. The test resolves the take
+under the voice lock and speaks from the take it finds there. The last test per voice
+is kept (`voice_tests`, §6) with its language, text, the take that spoke, model,
+revision and time; a test whose take was deleted, or whose voice is being deleted,
+while it ran is dropped ("The take of the test was deleted while the test ran, or the
+voice is being deleted. Generate it again."), and a kept test made from another take
+than the one films now speak from says so. ▶ Original plays the take whose words the
+test spoke, while that take exists. The reply must report a conditioning (`built` or
+`restored`) for the take, else the test fails. One test runs at a time per process,
+with stage, percent and Cancel; Cancel frees the page at once and drops the result,
+while the running model call ends in the background. A test that was cancelled or
+replaced is never stored after the cancel or the new Generate returns: the store step
+and the cancel share one lock. Cancel is logical, not a GPU stop: it may wait for a
+test that is being stored, never for synthesis. A cancel before the model call makes no
+call; a call already sent runs to its end in the models service, and the next test or
+film waits for it ("waiting for the voice model"). The 1800-second limit is the HTTP
+timeout of the call, not a GPU deadline. After an app restart the panel says that the
+test stopped. A test never changes a take or the narrator films use.
+
+**Speaker similarity of a test.** After a test is made, `app` measures it against the
+voice's own takes (`feed/voice_likeness.py`), and the page shows the result under the
+test: "Speaker similarity 0.31 (cosine) · your own takes 0.72-0.85". This measures only:
+it changes no synthesis and no take, a film never calls it, and it is evidence
+for the ear, not a verdict. **There is no fixed threshold and no pass line**, and the
+number is never shown as a percent or a probability, because a raw cosine differs by
+model and has no meaning alone. The scale is the voice's own take range and nothing
+else.
+
+- **The model.** `ecapa-voxceleb` through `POST /voice/embed` (§4.1, §5.1). The score
+  uses the real stored WAV of the test.
+- **The reference takes.** Every take of the voice in the TEST'S language that is not
+  being deleted and passes the speaker model's audio checks (a refusal of
+  `/voice/embed`). `transcript_error` plays no part: it concerns the words. The set is read
+  from `voice_examples`, not from `voice_model_takes`, which outlives deleted takes.
+  Skipped takes are listed with their ids and reasons. ONE snapshot of the takes serves
+  the centroid, the own range and the fingerprint of the whole measurement.
+- **The arithmetic.** Each vector is L2-normalised. The centroid is the equal-weight
+  mean of the takes, L2-normalised again. The **score** is the cosine of the test with
+  the centroid of ALL the reference takes. The **own range** is leave-one-out: each
+  take's cosine with the centroid of the other takes, reported as min, median and max.
+  With fewer than 2 takes there is no own range, and the score still shows.
+- **Take vectors are cached** in `voice_take_embeddings` (§6) by take, model, revision
+  and pipeline version, so a later test embeds only new takes.
+- **Where it runs.** After the check of which take spoke, before `job_lock` and
+  outside `voice_turn`: no model call runs under `job_lock`, and a film does not wait on
+  the first embedding of all the takes. It has the stage "measuring the voice · take N
+  of M", a percentage, and a Cancel check before the first call and between calls.
+  `Cancelled` stays a cancel and never becomes a failed measure. The result goes into
+  the ONE `save_test` row, so publication stays one store under `job_lock`.
+- **A failed measure never fails the test.** A 409 of a running bake, a 503, a refused
+  test clip, a clip over the 4 MiB limit or any other error is stored as
+  `likeness_error` and shown as "Speaker similarity not measured: <reason>". "Not
+  measured" is never a zero.
+- **Provenance.** `likeness_json` (sorted JSON) holds the cosine, each take's
+  leave-one-out cosine, the own min, median and max, the evaluator `key@revision`, the
+  pipeline and method versions, the takes count, the exact ids and content hashes of the
+  reference takes (as `voice_bake_runs.snapshot_json`), the skipped ids with reasons, and
+  the reference hash: the sha256 of the sorted content hashes. When the takes of that
+  language have changed since, the page adds "measured against older takes"; a skipped
+  take had no part in the score, so it does not count.
+- **The limits.** The own range comes from 5-30 s takes, so a short test may score
+  lower for its length alone; `report.json` keeps the seconds per row so this can be
+  seen. The Russian accuracy of a VoxCeleb model is not measured. The score compares
+  with one person only: **with no second person, the meter's separation of two speakers
+  is not proven on this user's data.** A real run proves that the model runs, no more.
+  Known takes of this user and generated samples must be scored before the meter is
+  called reliable for this user's problem.
+- **The distribution lives in the bake check.** One test is one sample. A generated
+  voice varies from run to run, so `scripts/voice_bake_check.py --measure --repeats N`
+  speaks the check sentences and a long passage through the STORED voice model with no
+  bake, N times per variant, and scores every file; a bake run scores its files too
+  (`docs/models.md`). The scores go in `report.json` only, and the console table prints
+  none, so the listening stays blind. The pass rule stays by ear.
+- **Comparing models and architectures.** `--compare OLD NEW` reads two reports and
+  prints mean, worst and spread per arm and per text, the deltas, and every frozen input
+  that differs. A report's `results` hold nothing of VoxCPM2 (arm, label, model, revision,
+  text, repeat, cosine, seconds), so a report of another model compares with this one.
+- **The settings sweep lives in the bake check too.** `--sweep` speaks one new Russian
+  sentence through the stored voice model at six settings of `cfg_value` and
+  `inference_timesteps`, for a blind listen (`docs/models.md`). It is a test: films keep
+  the fixed controls, and the meter score of a sweep is a diagnostic, never a ranking.
+- **The held-out check lives there too.** `--heldout` speaks five new Russian texts through
+  the stored voice model at the baseline and candidate settings, 28 calls under neutral
+  names, for a blind listen (`docs/models.md`). `key.json` and `frozen.json` go to disk
+  before the first call, and a wall budget of 1500 s ends the run. A pass under the frozen
+  rule earns only the question of changing the fixed controls. Its meter score is a
+  diagnostic.
+- **The longer bake lives there too.** `--longer-bake` bakes one voice model of 1000 steps
+  from the takes and the recipe of the stored v2, through the models service, and keeps it
+  only in its output folder: the stored model and the database stay unchanged. A watchdog
+  requests a cooperative cancel (at a step boundary) at 12 h, under 1024 MiB free, above
+  45 s per step after step 50, or on a failure. Its 12 h clock starts at the local time of
+  the first good status request minus the status's `elapsed_s`, and keeps running through
+  failed polls. A poll that times out or loses its connection is retried on the same bake,
+  a failed cancel is retried until the bake ends, and the service's bake folder is deleted
+  only after an end state. A new bake's id goes to `bake.json` in the output folder, and
+  `--attach BAKE_ID` follows a bake that already runs, with no new start, only when the
+  folder and the bake's status match `frozen.json`. After a complete bake it speaks the five
+  held-out texts through the new model and v2 at the production controls, 28 calls under
+  neutral names, for a blind listen (`docs/models.md`). A pass earns only a separate question
+  of adopting the new model for this voice; a fail keeps v2.
+
+**Recording a saved voice.** The Recordings tab offers a recording kit per language —
+the four reading texts, then slow, fast, calm, happy, sad, serious, excited, questions,
+emphasis, articulation, and numbers and names, each with its instruction; a kit text
+can have several takes. **A take is free speech.** The kit texts are suggestions only:
+the user may read one, say anything else, or upload any recording, and types, checks or
+confirms no words. A take records which kit text it was shown (`kit_id`), never that
+text as its words. **The app bakes nothing**: the Bake and Rebake buttons are gone, and
+`POST /voices/{id}/bake` no longer exists. A take is used by the next film as soon as
+its words are heard.
+
+**The words of a take are heard right after it is saved.** A film and a test send the
+take's words with its audio, so the voice child continues from the person's own speech
+(§5.1). When a take is saved and this device offers speech recognition
+(`transcriber_for`, §4.1), `app` starts the **hearing job** (`feed/voice_hearing.py`,
+`VoiceHearings` in `web/voices_api.py`): one job per process, with stage ("hearing the
+words · take N of M"), percent and Cancel, shown under the header of the voice it
+hears; the page of a voice that waits for another voice shows "queued" with Cancel, and
+every page polls while its voice is heard or queued and refreshes its state and Test tab
+at the end. It sends every take of the voice that has not been heard yet — the new one, and
+any take a Cancel, a failure or a restart left behind, or a take stored before speech
+recognition — one by one to the speech-recognition model in the models service (`POST
+/voice/transcribe`, §5.1; Whisper, §4.1), and stores the words it heard on the take
+(`voice_examples.transcript`, §6). A take saved while the job runs is heard in the same
+job; a take of another voice waits in its queue and is heard after. Cancel stops the
+work of the voice whose page sent it; the other voices are heard as before. The take's language
+label is the decoding language; nothing detects a language. Cancel is checked between
+takes: the call in flight ends first, and no other take is heard. A take is heard once:
+its words never change after that, and nothing hears it again. Words that the model
+hears wrongly are spoken as heard; nobody corrects them. Words already stored stay
+after a Cancel, a failure or a restart. A voice with a take not heard yet, and no
+hearing job of its own, shows **Hear the words**, which starts the job again. A
+transcribe call that fails ends the job with its reason ("Could not hear the words of
+take #N (<reason>)."; "Hearing the words of a take is not offered on this device
+yet."; a 409 while the bake check bakes: "The models service is baking a voice for the
+bake check. Hear the words again when it ends."), shown on the page of that voice until
+Close or until it is heard again, and nothing is stored for that take. A failure ends the
+work of that voice only: the job goes on with the next voice in the queue. A take deleted during the job is skipped. The job holds the voice
+lock for each take, so films and tests wait for it ("waiting for the voice model"), and
+it waits for them.
+
+**A take with no usable words stays.** When the heard words hold no letter and no
+digit (blank, or symbols only), the take keeps the reason "the speech recognition found
+no words in it"; when they hold more than 1000 characters, "it holds more than 1000
+characters of words". Such a take keeps its audio, its row reads "not used: <reason>",
+and no film or test speaks from it: the newest heard take before it speaks instead.
+
+**The voice's state.** The header of the voice names, per language with takes or
+recordable here, the take films and tests speak from ("English · films and tests speak
+from take #12"), a newer take that waits for its words ("· take #14 waits for its
+words") or has none usable ("· take #14 has no usable words"), or why the language is
+not ready ("Russian · no take yet", "Russian · the words of its takes are not heard
+yet", "Russian · no take with usable words"). The stored voice models,
+the snapshot runs and the bake check stay as data (§6, `docs/models.md`); after a
+restart `app` still finishes or cleans up a bake it had started before (`reattach`),
+and no page shows it.
+
+**A `[voice]` bracket targets ONE PASSAGE when a previous cut supplies its position**, and only in an
+Automatic film: a chosen narrator reads every passage, and there the bracket recasts
+nothing (above). The narration is
 spoken in parts — `POST /speak` takes the exact chunks *and* a speaker per chunk — and
 the clips are merged into one WAV, so the film keeps its narrator and returns to it after
 the moment that asked to sound different. *One* passage is load-bearing: keying the
 override to a **photograph** repainted every passage that showed it, and a story that
 returns to one picture five times got five hoarse passages out of a single note. The
-note's position through the film gives a target index; where a previous cut says which
-photograph was on screen, the **nearest** passage showing it wins instead, so the
-instruction follows that picture into a re-cut without spreading across every reuse.
+note's timestamp as a fraction of the previous cut's duration selects one passage by index
+in the new script. The story prompt also receives the photograph that was on screen, when
+known; this context does not move the gate's target. With a bracket but no previous cut to
+measure against, the positional gate imposes no restriction. Without a bracket, no passage
+may override the narrator.
 
 **Same-voice passages are spoken in ONE call** (`audio/segments.py`). Synthesising each
 passage separately restarts the prosody every time, so an eight-passage film came out
@@ -1710,9 +2607,9 @@ are recovered by splitting the run's audio in proportion to its text. That split
 approximation, bounded inside one continuous utterance — a far better trade than exact
 boundaries around a delivery that lurches every few seconds.
 
-**One memory can be retold on its own**, from a **↻ Rebuild** on its Organize card —
-on the memory, not on the film screen, because it changes the memory and every film made
-of it follows (`POST /feed/{key}/rebuild`,
+**One memory can be retold on its own**, from a **↻ Retell memory** on its Organize
+card — on the memory, not on the film screen, because it changes the memory and every
+film made of it follows (`POST /feed/{key}/rebuild`,
 `memories_build.rebuild_memory`). Rebuilding *every* memory re-seeds the clusters, so a
 memory you liked can come back split or merged — a heavy, whole-library operation for
 what is usually one dissatisfaction. The per-memory button asks the same agent one
@@ -1725,24 +2622,89 @@ load-bearing: `replace_memories` drops every group row and takes the group ids w
 and `memory_notes` cascades on those. The viewer's own words must survive a retelling —
 they are the input to it. What does *not* survive is the film: every stored presentation
 for that memory is dropped, because it narrated a memory that no longer exists in that
-shape. A retelling that fails writes nothing and the old memory stands.
+shape. The memory's edited narration goes with it, in every language
+(`narration_drafts`, §6): its photographs, cards and score plan were made for the old
+telling. A retelling that fails writes nothing and the old memory stands, its drafts
+too. The card says
+what the button does, under it: it rewrites the title, description and photo order,
+makes no film, and deletes the films of the languages that have one (or "No film to
+delete."), and, when a draft exists, "Deletes your edited narration in: <Language>, …."
+The narrator choices in `memory_narrators` stay.
 
 **THE PHOTO ORDER BELONGS TO THE MEMORY.** It is decided once, by the memory-composing
 agent (`albums/compose.py`), which now returns an `order` alongside `keep`/`title`/
 `description`: every kept photograph exactly once, pictures of the same thing placed
 next to each other so they read as one beat, and those groups sequenced the way the day
 would be told. The **description is written for that order**. The Organize album shows
-it, and **every film of that memory follows it** — `director.with_script` re-sorts the
-story pass's passages so a photograph can never be introduced out of sequence.
+it, and the story pass of every film of that memory is shown the photographs in that order.
 
-The story pass still chooses which photograph carries each passage, how long the film
-dwells on one, and whether it returns to it: **a repeat is not a reorder**, so the
-constraint is on first appearances only, applied as a stable sort that leaves repeats
-where the story put them. The order changes only when the memory itself is rebuilt.
+**The told order is the film's order.** The passages are never sorted. Sentence `i` of
+the story is passage `i`: its words, its `/speak` chunk, its voice, its shot, its title
+card, its place in the score plan and in the conductor's briefs, and `timeline.passages[i]`
+(`director.with_script` keeps the script's order). A passage's words and its photograph
+never separate.
+
+**Each sentence is matched to its photograph on its own.** Stage 2 picks every photograph
+in one sampled answer, beside the cards, the cast and the score, and on the film of
+2026-11-04 it put "двух котиков … в плетёной корзине" on the photograph of one cat. So
+after stage 2, and after `draft_story` for an edited narration (above),
+`story.match_photographs` makes one small call per passage, at temperature 0, with the schema `{"photo": int}`. The call holds that one sentence and the numbered
+photographs, in the memory's order: their descriptions, else their briefs, through
+`_listing` and `brief_chars`, so a long memory still fits the context. It asks only which
+photograph the sentence describes. It has no order clause: one call sees one sentence, so
+it has no position to judge an order from. A usable answer is that passage's vote, and it
+sets that passage's photograph. An unusable answer (no JSON, no integer, a number outside
+the listing) is no vote: the passage keeps the photograph it came with, stage 2's or the
+draft's. A transport exception stops the calls, and every remaining passage keeps the
+photograph it came with. The step never raises and never rewrites a word. Only the photographs change, so every text, voice, card
+and score entry stays on its passage.
+
+**Votes stand.** Nothing moves a photograph to serve coverage or chronology. A return to
+an earlier photograph, a match out of the memory's order and a photograph no sentence is
+about all stay: a photograph under words it was not matched to is the defect, not the cure.
+**A repeat is not a reorder**, so the memory's order binds first appearances only:
+photograph N first appears only after photographs 1 to N-1 have, and a return to an earlier
+one is always allowed. `decisions["story"]["memory_order"]` records this for the final
+photographs (`story.introduces_in_order`): `kept` or `broken`. It is a diagnostic: `broken`
+logs at info level, and no call and no change follow. `decisions["story"]` also holds
+`votes` (per passage, the 0-based photograph its call chose, or null for no vote), `photos` (the final 0-based photographs) and `matched` (false when
+stage 2's own photographs came from the even fallback, which is not a real match). Removing
+a passage of an edited narration (§11.1 above) can make a later return to a photograph its
+first appearance; that film reads `broken`, and the words and their order stay as the user
+left them.
+
+The conductor never reorders the shots of a film with a script (`with_arrangement`
+with `keep_order`): this order holds for every film, also when the voice's segments do
+not pair with the passages. Exact sync — shot `i` starts on segment `i` — needs paired
+segments (`keep_timing`); without them the conductor's monotonic times stand and every
+passage time stays null. The memory's order changes only when the memory itself is rebuilt.
 Without this the same memory came out in a different sequence on every regeneration and
 never looked like itself twice. The agent's `order` is repaired, never trusted: invented
 ids are dropped and forgotten ones appended, so a memory cannot silently lose a
 photograph it decided to keep.
+
+**EVERY PHOTOGRAPH GETS ITS CHANCE, BEST EFFORT.** A shot is a passage, so a film can
+only show as many photographs as its story has passages — and a memory's photographs were
+all chosen to be in it. The first two rules give every one a passage to be matched to; a
+longer story is the accepted price. The third says what happens when none is about it:
+
+- **The story is cut into at least as many passages as there are photographs**
+  (`story.sentences(text, at_least=…)`). Short sentences are still joined so a picture
+  is not cut every two seconds, but a join stops once the passage is 45 characters
+  long, and no join happens that would leave fewer passages than photographs. The old
+  join had no stop: it glued every short sentence onto the one before, so fourteen
+  sentences under 45 characters became two passages, and a six-photo memory played as
+  a two-photo film.
+- **A story with fewer sentences than photographs is extended** — the same follow-up
+  call as a short story (`_expand`), asked for the missing sentences.
+- **A photograph no sentence is about may be left out, and is recorded.** Neither
+  stage 2 nor the per-sentence match is told to use every photograph, and nothing
+  substitutes one for a sentence's match. The story pass logs each left-out photograph,
+  the difference between `decisions["story"]["photos"]` and the memory's photographs, so
+  an omission can be read after the fact.
+
+`story.MAX_PASSAGES` is 40, the same as the director's `max_shots`, so the passage cap
+never drops a photograph the director kept.
 
 **THE PROMPT IS CUT TO THE SERVER'S CONTEXT.** `llama-server` does not truncate a
 prompt that does not fit — it rejects the whole call ("request (6306 tokens) exceeds
@@ -1795,7 +2757,8 @@ are verified after the call, and any that fail are named back to it in one retry
   told only to include a missing note, the model appended it to the last passage, so a
   remark about the middle of the evening was read over the closing shot. The complaint
   names both positions — "you put this about 92% in; it belongs about 49% in";
-- **casting** — a note carries a bracket and no passage was given a voice.
+- **casting** — in an Automatic film, a note carries a bracket and no passage was given
+  a voice. A chosen narrator casts nothing, so it is never retried for a cast.
 
 The retry is kept only if it answered MORE than the first attempt, so a worse second try
 cannot make the film worse. None of these read what a bracket MEANS: they notice that
@@ -1915,7 +2878,8 @@ the caption model got wrong. So **the film can be annotated while it plays**.
 Pausing opens a panel: every note already on this film, editable, plus a new one stamped
 at wherever the film is standing. Notes may be in **any language**. They are stored in
 `memory_notes(group_id, at_seconds, text)` and cascade with the memory, like a
-presentation.
+presentation. The panel also lists the film's own narration, one editable row per
+passage tagged "narration" (below).
 
 **The editor is hidden only while the film PLAYS.** Watching is the one moment a form
 over the picture is wrong; every other state wants it. So it is open on the title card
@@ -1940,7 +2904,128 @@ first cut. That screen has no canvas, no clock and no `feed-gl.js`, so the panel
 own script: the player borrows it through `window.feedNotes` to float bubbles and to
 stamp a note with the moment it paused at, and everything else works without one.
 
-Two things then happen with them:
+**The film's narration is in the same list, and its words can be changed**
+(`feed/narration.py`, `/feed/{key}/narration`;
+§11.1 "Edited narration is spoken as written"). Each passage of the film is a row tagged "narration": its stamp, its text in an
+auto-grown field, and ×. Passages and notes form ONE list, keyed by passage `n` and note
+id, sorted by time (a passage's `start`, a note's `at`; on a tie the passage first);
+passages with no time come first, in telling order. The count of the folded bar is the
+number of rows. A passage stamp seeks the film to where that passage is spoken, but only
+with a player and when the times are those of the ready film of this language
+(`seekable`); a draft row keeps the time of the film it came from, also after its text
+changed. A draft of an earlier film shows its stamp disabled ("From the film these words
+were taken from"); the Prepare screen shows it disabled with the notes' title; a passage
+with no time shows "–:––". A narration row is **never a note**: it is not stored in
+`memory_notes`, never floats as a bubble (`window.feedNotes.all()` stays the notes), has
+no 600-character cut and no word budget, and no story pass reads it. Whitespace joins to
+single spaces; nothing is cut. A text with `[` or `]` is refused ("The narration is read
+aloud word for word. Put a [bracket] instruction in a note."), because the voice would
+read the bracket aloud. A script over 10 000 characters in all is refused ("The narration
+is longer than this app allows: <N> characters, at most 10000."). There is no "add a
+passage", and photographs and passage voices are not edited here.
+
+A row saves on blur and on Enter, one save at a time, in order. Each save posts the
+`(source, draft, revision)` of the rows the page shows, and the server takes it only when
+that triple is still the current one under its write lock; anything else — another
+window, a new film, a failed build that replaced the film, a rebase, "Write a new story",
+a retelling — answers 409 "Not saved: this narration changed in another window, or a new
+film replaced it." Then the panel saves no more passages, makes every passage field
+read-only with its text kept, and offers "Load the current narration"; nothing typed is
+lost. A refusal or a network failure ("Not saved: the app did not answer. Your text stays
+in its row.") drops the saves queued behind it, and those rows stay unsaved until their
+next blur. A × that has no 200 of its own (refused, failed, or dropped behind a failure)
+leaves its row and counts as unsaved: `settled()` answers false. Click × again, or "Load
+the current narration", which the error line then offers; the fields stay editable. That
+load waits for the save in flight and posts no passage save while it loads. A failed load
+changes nothing. A re-render never replaces a row in focus or one with unsaved text.
+
+The panel says which narration the next film speaks:
+
+- the film's own rows: "The film's narration is in this list with your notes. Change its
+  words, and ↻ Regenerate speaks them as written. With no change, ↻ Regenerate writes a
+  new story.";
+- a draft whose words differ from the ready film's (`changed`, computed, never stored):
+  "Your edited narration. ↻ Regenerate speaks it as written." — and ↻ Regenerate is lit
+  from the page load on;
+- a draft that the ready film speaks: "This film speaks your edited narration.
+  ↻ Regenerate speaks it again as written." — not lit;
+- under either draft line: "Notes cannot rewrite these words or provide a new voice or
+  music interpretation. Existing voice choices still pass current note gating and
+  validation. Effect instructions reach the conductor; matched speech fixes shot timing."
+  and the button **Write a new story**, which asks "Stop using your edited narration? The
+  next Prepare or Regenerate writes a new story." and deletes the draft: the rows are the
+  ready film's own again, or none after a failed build. The next Prepare or ↻ Regenerate
+  runs the story pass;
+- a film made before passages were stored: "This older film has no timed narration text.
+  ↻ Regenerate makes a new film whose narration you can edit here."
+
+With a draft, the picker's Automatic `[voice]` line and the legend's first lead read their
+draft twins (`docs/ui.md`), shown again after every reply, because the first change makes
+the draft without a page load. **Prepare and ↻ Regenerate wait for the panel first**
+(`window.feedNotes.settled()`): the focused field is blurred, the queued saves finish, and
+a build starts only when no passage row is unsaved and no 409 froze the panel; otherwise
+nothing is posted and the form reads "Not started: an edit to the narration is not saved.
+See Tell the story better." "Write a new story" waits the same way. A note's own save is
+not waited for.
+
+**"Ask AI to rephrase" asks a model for new words** (`feed/rephrase.py`,
+`/feed/{key}/narration/rephrase`). It sits under the list in "Tell the story better": a
+transcript, then a field and Send. The AI proposes and the user decides. Nothing changes
+until **Use this**, and a request writes nothing. The form is hidden with no rows (an older
+film, or no film) and disabled while a 409 freezes the panel. The conversation lives in
+the page session (`sessionStorage`, per memory and language), never in a table. A return to
+the page shows it again and polls its job.
+
+- **What the model reads.** The server reads one snapshot: the active rows and their
+  `(source, draft, revision)`, then the title, the description, every note with its time
+  and photograph, and every photograph's brief. Those four are **as they are today**, and
+  the prompt says so: the app keeps no copy of a build's inputs, so a note corrected after
+  the film wins. Automatic tags are labelled as guesses. The film's own record comes only
+  from the **ready row of that language**, and it is exact: its shots with their times,
+  effects, beats, params, moves, transitions and grade, its cards, and
+  `decisions.story`, `cast`, `voice`, `score` and `film`. So the model knows the music
+  sections and the voices asked and used. A draft with no ready film has only
+  `script_json`, and the prompt says so. No audio, no vector and no effect or grade table
+  is sent.
+- **A job, not a request.** `/text/complete` cannot be stopped, so `POST …/rephrase` starts
+  one job in `app` and answers 202. The job has named stages ("reading the film", "writing
+  new words", "checking the words") and a percent. The percent is a time estimate, says so,
+  and holds below 100. A new request replaces the running one, and Cancel or Esc drops it
+  and never waits: the model call runs out, and its answer is thrown away. Esc cancels first
+  (§13.1 rule 7). No database lock is held during the model call. A job is refused while
+  the panel is frozen, with no rows, or while this film is being made or queued. A request
+  is at most 1 000 characters, and the model sees the last 6 messages.
+- **Over the model's context, the request is refused with the reason.** Nothing is cut.
+  The room for the answer comes from the size of the rows. A server that does not say its
+  context has no budget.
+- **The model names only what it changes.** It answers `{reply, changes: [{n, text}]}`, and
+  every other passage keeps its words by identity. A small model asked to copy twenty rows
+  changes some by accident. The page says "Changed N of M passages." and lists each one
+  old → new. A reply with no change is a valid turn: it shows no **Use this**.
+- **Any bad item rejects the whole proposal, with the reason:** an unknown or repeated `n`,
+  an empty text, a `[` or `]`, the wrong language, a complete narration over 10 000
+  characters, or an answer that is not JSON. Whitespace joins to single spaces first.
+  Nothing is dropped silently.
+- **A follow-up refines what is on screen.** The page posts its proposal, which the prompt
+  keeps apart from the saved rows. New changes go on top of it, and the result is the
+  cumulative patch against the saved rows: turn 1 changes passage 1, turn 2 changes passage
+  2, and **Use this** keeps both. The length check counts the complete narration.
+- **Use this is one locked write.** It waits for `settled()`, like Send, and every passage
+  field and × is read-only until the answer comes. `POST …/narration/rewrite` runs
+  `rewrite_passages`: ONE `BEGIN IMMEDIATE` checks `(source, draft, revision)` and writes all
+  the words, or none. Photographs, voices, times and the score plan stay, and a row whose
+  text changed loses its title card (§11.1). An empty
+  text is refused here, because in a row it means "remove". A patch with no difference makes
+  no draft. A 409 is the same freeze as above: the preview and every text stay. Any other
+  refusal or a failure gives the fields back with their text. A reply never replaces a row
+  that holds unsaved text.
+- **An old answer never looks current.** The job's result carries the triple it was
+  written for, and every read of it compares that with the current rows. Any later change
+  shows the proposal as outdated, with Dismiss and no **Use this**, and the next request
+  starts from the saved rows. A job the app no longer knows (a reload of `app`, or one
+  replaced) answers 404: "This did not finish. Ask again."
+
+Four things then happen with the notes:
 
 - **They are visible wherever the memory is, behind a fold.** On its Organize card, and
   under the memory's own title when a photo is opened inside it — above the
@@ -1984,7 +3069,9 @@ Two things then happen with them:
 
 Editing a note to nothing deletes it: this is a scratchpad, not a form, and notes save
 on blur rather than behind a button. A note lost because it was not "submitted" is the
-whole feature failing quietly.
+whole feature failing quietly. A narration passage emptied, or removed with ×, leaves
+the narration; the last one never does ("A film needs narration. Keep at least one
+passage.").
 
 **`[Brackets]` are instructions, not sentences** (`feed/directives.py`). Sometimes the
 viewer does not want to describe the moment, they want to DIRECT it. So anything in
@@ -2001,8 +3088,9 @@ write instructions in their own words, in their own order, in either language, w
 typos; a table only ever recognises the phrasings someone thought to add.
 
 So notes go to the models **verbatim**, and each pass is told that brackets are
-instructions to obey rather than sentences to narrate. The story pass reads them and
-casts the narrator, any per-passage voice, and the score; the conductor reads them and
+instructions to obey rather than sentences to narrate. The story pass reads them,
+casts the narrator and any per-passage voice (in an Automatic film only, §11.1), and
+plans the score; the conductor reads them and
 places effects and lengths. Interpreting "a scary hoarse man's voice" into a speaker is
 judgement, and judgement is what a model is for. Code keeps only the parts a model must
 not be trusted with: `voice.resolve()` checks a cast is a real speaker, `effects` checks
@@ -2014,7 +3102,7 @@ asked for — not a vocabulary, since a model is reading it:
 
 | category | what acts on it | example phrasings |
 |---|---|---|
-| `voice` | **that PASSAGE alone is spoken by another voice.** The film keeps its own narrator; the narration is synthesised per passage and the clips merged | `[low man's voice]` `[страшным хриплым голосом]` `[whisper]` `[excited]` |
+| `voice` | **in an Automatic film, that PASSAGE alone is spoken by another voice of the narrator's kind: a preset in a preset film, a saved voice in a saved-voice film.** The film keeps its own narrator; the narration is synthesised per passage and the clips merged. A chosen narrator (a preset or a saved voice, §11.1) reads the whole film: the bracket is never narrated and recasts no passage | `[low man's voice]` `[страшным хриплым голосом]` `[whisper]` `[excited]` |
 | `music` | **leads the score brief**, ahead of the measured mood and ahead of the story pass's own sentence | `[fun chord]` `[swell]` `[drums]` |
 | `effect` | **`feed/conductor.py`**, on the shot covering that timestamp, told not to substitute a nicer-looking one | `[glitch]` `[bloom]` `[slide]` `[light leak]` |
 | `timing` | **`feed/conductor.py`**: a named length sets that shot's `seconds` and its neighbours absorb the difference; `skip` drops the photograph, `title` gives it a card | `[hold 5s]` `[quick]` `[skip]` `[title]` |
@@ -2086,7 +3174,7 @@ safety rules live in [`docs/sync-cli.md`](sync-cli.md).** The design:
 The app is a **persistent HTMX-boosted shell** — a fixed full-width nav with a live
 resource bar (RAM/CPU always, GPU and board temperatures where readable) over a
 single scrolling `<main>`
-that the four top-level links swap without re-rendering the nav. The routes:
+that the five top-level links swap without re-rendering the nav. The routes:
 
 - **`/upload`** — the folder list (add / delete-from-library, §3.2c), then
   client-side hashing, transfer, and live per-stage processing progress with
@@ -2102,11 +3190,76 @@ that the four top-level links swap without re-rendering the nav. The routes:
   remembered. An **Organize files…** button turns the current principle into a
   stage-2 plan: `/organize/plan` previews the folder tree it would create, asks for
   confirmation, and downloads `ivms777-plan.json` (§12).
+  A **memory card** lists one film per language: a link (▶ Play, Open or Prepare
+  <Language> film), its state, and for a ready film its narrator with "(auto)" or
+  "(your choice)" (§11.1). Under the rows, **↻ Retell memory** says what it does:
+  it rewrites the title, description and photo order, makes no film, and deletes the
+  films in the languages that have one and the edited narration in the languages that
+  have one (§11.1). The film rows refresh in place — on a
+  return from `/feed` restored from bfcache, and by polling while a film of that memory
+  is being made or waits. There is no page reload, so the grid keeps its scroll, its
+  controls and its expanded notes.
+- **`/voices`** — the grid of **Voices**: the people whose own voice can narrate a film
+  (§6, §11.1). **New voice** sits at the head. Each voice is a card, a plain link to its
+  page, with its name, per language with takes the minutes and the number of takes,
+  and one line of the languages it is ready for: "For films: English, Russian" or "Not
+  ready for films yet"; a card plays nothing. A voice being deleted shows "deleting…"
+  with no link, and the grid polls while a card shows "deleting…" (§6). With no voice, the grid reads "No voices yet." Create
+  opens the new voice at once. The grid shows "Voice copy is not available on this device." and no New voice
+  when the catalog lists no cloning entry for the profile (§4.1); existing cards still
+  open, for rename and delete. It is a top-level grid (§13.1). The old address
+  `/organize/voices` answers 308 to `/voices`.
+- **`/voices/{id}`** — one voice, the leaf of the Voices grid (§13.1). The header reads
+  "Voices › <name>", a **⋯** menu (Rename…, Delete voice…) and ×, then the state of the
+  voice on every tab (§11.1): per language the take films and tests speak from, a newer
+  take that waits for its words, or why the language is not ready; **Hear the words**
+  when a take waits and no hearing job runs for this voice; and the hearing job (stage,
+  percent, Cancel; a failure with its reason and Close). Two tabs, **Recordings /
+  Test**, are state of the leaf: the URL carries `?tab` through `replaceState`, never a
+  history entry, and a switch keeps the recorder, the typed text and every selection;
+  an old `?tab=model` opens Recordings. **Recordings** lists the recording kit per
+  language (§11.1): each style with its instruction, each kit text with its takes, then
+  **Other takes** (uploads, and recordings with no kit text). A take row shows ▶,
+  seconds, recorded/uploaded, date, Record again on a kit row, and Delete, which asks
+  nothing; a take not heard yet adds "words not heard yet", and a take whose heard words
+  are unusable adds "not used: <reason>". No row shows, asks for or confirms words.
+  There is no Test button on a take. "Add a take" opens the recorder in place, right
+  under its row; the recorder shows the kit text with the hint "Read it, or say
+  anything else: the app hears what you say.". While it records, the recorder shows
+  the timer, **Pause** and **Stop**; Pause becomes **Resume** and the status reads
+  "Paused — the pause is not recorded.", so the reader can stop to re-read the text. A
+  paused recording is still a live one, and the pauses join into ONE take. The timer and
+  the 30 s limit count recorded time only. A recording or an upload ends in a
+  preview with Save and Discard; a recording also offers Record again, which drops the
+  unsaved take and records the same text at once, in the same place. Save starts the
+  hearing job. **Test** is one test of the person (§11.1): a language the voice is ready
+  for, a text box that is always there, a list of the takes with heard words that
+  fills the box with a take's words, Generate ("from take #<id> only", the take of the
+  chosen language), the job line with stage, percent and Cancel, and a comparison:
+  ▶ Generated with its text, the take that spoke, model, revision and time, and
+  ▶ Original when the test spoke the words of a take that still exists. With no ready
+  language the tab says "Record a take first. Tests speak from the newest take of the
+  language, once its words are heard." and Generate is disabled. No page picks a take
+  for films.
 - **`/feed/{key}`** — the fullscreen **memory film**: one memory played as a directed
   short with camera moves, cuts, a colour grade, a generated soundtrack and optional
-  narration (§11.1). A language selector (English / Русский) sits on the page; each
-  language is prepared and cached separately.
-  Reached from a ▶ Play control on a memory card in `/organize?by=memories`. A
+  narration (§11.1). A **Film language** selector (English / Русский, ✓ on each
+  language with a ready film) sits on the page; each language is prepared and cached
+  separately. A ready film says "This film: <Language> · narrated by <label> — <who
+  chose it>" ("your choice", or "picked automatically" by the story or using the
+  memory's mood), and an "Other voices" line names each passage spoken by another
+  voice. The Prepare and ↻ Regenerate forms carry the always-shown picker **Narrator
+  for the next film** — "Automatic — the app picks a voice for this memory",
+  the preset voices of the film's language, and every saved voice (§11.1) — with its
+  hints and the `[voice]` bracket line. A saved voice that is not ready for the film's
+  language is a disabled option with its reason ("«me» — no English take"), and when
+  the selected voice is not ready, a line under the picker links to its page
+  (`/voices/<id>`). The stored choice is preselected; a choice that can no
+  longer narrate stays selected with its reason, never shown as Automatic.
+  **Tell the story better**, the notes panel, also lists the film's narration as
+  editable rows with their times, tagged "narration"; ↻ Regenerate speaks the edited
+  words as written until **Write a new story** (§11.3).
+  Reached from a film link on a memory card in `/organize?by=memories`. A
   memory with no prepared presentation is offered one, and the page polls while
   the background job runs; otherwise it plays. It is a **leaf** under the memory
   grid (§13.1), and it is the one page that does not use the app shell — a
@@ -2128,8 +3281,9 @@ that the four top-level links swap without re-rendering the nav. The routes:
 
 **Per-route detail — the resource-bar internals, the full `/photo` panel, the feed
 player's controls, throughput readouts — is in [`docs/ui.md`](ui.md).** The nav order **Upload → Library → Chat →
-Organize** follows the workflow: bring photos in, browse, understand, then (last)
-reorganize — Organize feeds stage 2.
+Organize → Voices** follows the workflow: bring photos in, browse, understand, then
+reorganize — Organize feeds stage 2. Voices are the people who narrate the films, a
+resource of their own, so they sit last.
 
 ### 13.1 Navigation model (STRICT — every drill-down obeys this)
 
@@ -2138,7 +3292,7 @@ The UI is **grids** and **leaves**. A *grid* is a browsable list — the library
 view (`/photo/{id}`). The rules below are absolute; every current and future
 drill-down follows them exactly.
 
-**The persistent shell does not touch this model.** Only the four top-level nav
+**The persistent shell does not touch this model.** Only the five top-level nav
 links are HTMX-boosted (§13); every grid↔leaf move here is a plain `<a href>` full
 navigation, so the `history.back()` + bfcache behaviour rules 3–4 rely on is
 unchanged. Never boost a drill-down link — doing so would put htmx's history cache
@@ -2149,6 +3303,10 @@ in front of bfcache and break the `[grid, leaf]` invariant.
    **The memory feed (`/feed/{key}`, §11.1) is a leaf too**: one level under the
    memory grid, it never opens a photo leaf from inside itself (that would be
    leaf-inside-leaf), and every shot change is player state — never a history entry.
+   **Voices (`/voices`) is a top-level grid**, and `/voices/{id}` is its one leaf: a
+   card is a plain link (the one push; Create opens the new voice the same way, with
+   `location.assign`). Tabs (`replaceState`) and every action on the leaf (rename,
+   add a take, delete, hear the words, test) push no history.
 
 2. **The leaf records its grid in a `ctx` URL parameter** — never guessed:
    - `ctx=library` (plus `q`/`f_`/`n_`/`t_`/`sort`/`date_*`) → the library grid.
@@ -2161,6 +3319,9 @@ in front of bfcache and break the `[grid, leaf]` invariant.
      album key, so its grid is never guessed. An optional `ctx` supplies only the
      deep-link `href` fallback that close uses when the feed was opened cold from a
      pasted URL.
+   - The **voice leaf** (`/voices/{id}`) needs no `ctx` either: it has one grid, and
+     that grid has no filter, sort or search to carry. Close goes back only when the
+     leaf was opened from the grid, else to `/voices`.
    - `ctx=chat` → the grid is the **conversation**; close returns to `/chat`. A
      cited thumbnail carries this ctx, and it pages within the photos the current
      chat session cited (its evidence set), never the wider library.
@@ -2197,7 +3358,17 @@ in front of bfcache and break the `[grid, leaf]` invariant.
    is: cancel the recording → stop the playback and return to the title card → and only
    with nothing left to undo, `history.back()` to the grid. The film answers whether it
    consumed the key (`window.feedFilm.escape()`); when it does not, the page closes
-   exactly as before.
+   exactly as before. The voice leaf (`/voices/{id}`) is the second case: Esc stops and
+   discards a live recording, paused or not → discards an unsaved take → closes a prepared recorder →
+   blurs a focused text field → and only then closes. Tabs are not a level, and the
+   test is not one either (it is a tab); a test that runs runs on in `app`, and the
+   page shows it again when it is opened. Close (×, the "Voices" link, Esc) runs
+   `history.back()` only when the leaf was opened from the grid — the page marks
+   itself `data-from-grid` at mount when `document.referrer` has the same origin and
+   the path `/voices`; the mark lives in the DOM, so a bfcache or htmx history restore
+   keeps it and a deep link never has it — else `location.replace("/voices")`. It
+   never reads `history.length`. Leaving through a nav link with a live recording or
+   an unsaved take asks first.
 
 5. **Prev/next move only *within* the current layer's order** (owner-scoped),
    carrying `ctx` forward — never leaking into a sibling album/memory or the wider

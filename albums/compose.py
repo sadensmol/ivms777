@@ -93,7 +93,7 @@ def compose_memory(
         force_answer = round_no == max_rounds
         turn = _complete(client, model, messages, force_answer)
         if turn is None:
-            return None
+            return None  # _complete logged why
         if turn.get("action") == "expand" and not force_answer:
             messages.append({"role": "assistant", "content": json.dumps(turn)})
             messages.append(
@@ -101,15 +101,35 @@ def compose_memory(
             )
             continue
         if turn.get("action") != "answer" or not turn.get("keep"):
+            _skip(candidate, "keep=false or no answer", turn)
             return None
         dropped = set(turn.get("drop_photo_ids") or [])
         kept = [pid for pid in candidate.photo_ids if pid not in dropped]
+        if len(kept) < 2:
+            # keep=true but nothing left to keep: the model contradicted itself (it
+            # has listed EVERY id as dropped). Repaired, not trusted — the keep wins.
+            if dropped:
+                logger.warning("memory candidate %s: drop_photo_ids %s would leave %d "
+                               "photo(s); ignoring the drops", candidate.photo_ids,
+                               sorted(dropped), len(kept))
+            kept = list(candidate.photo_ids)
         title = (turn.get("title") or "").strip()
         description = (turn.get("description") or "").strip()
         if len(kept) < 2 or not title or not description:
+            missing = [name for name, ok in (("2+ photos", len(kept) >= 2),
+                                             ("title", title), ("description", description))
+                       if not ok]
+            _skip(candidate, f"answer lacks {', '.join(missing)}", turn)
             return None
         return Memory(title, description, _ordered(turn.get("order"), kept), signature)
     return None
+
+
+def _skip(candidate: Candidate, reason: str, turn: dict) -> None:
+    """Say why a candidate was dropped, with the model's reply. A rebuild that keeps
+    nothing is otherwise indistinguishable from one that never ran."""
+    logger.warning("memory candidate %s skipped: %s; reply=%s",
+                   candidate.photo_ids, reason, json.dumps(turn, ensure_ascii=False))
 
 
 def _ordered(raw, kept: list[int]) -> list[int]:
@@ -342,8 +362,12 @@ def _complete(
     try:
         start, end = raw.find("{"), raw.rfind("}")
         if start == -1 or end <= start:
-            return None
-        parsed = json.loads(raw[start : end + 1])
-        return parsed if isinstance(parsed, dict) else None
+            parsed = None
+        else:
+            parsed = json.loads(raw[start : end + 1])
     except (json.JSONDecodeError, ValueError, KeyError):
+        parsed = None
+    if not isinstance(parsed, dict):
+        logger.warning("memory composition reply unparseable; skipping: %r", raw)
         return None
+    return parsed

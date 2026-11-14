@@ -1,6 +1,6 @@
 import pytest
 
-from modelsvc.governor import InsufficientMemory, MemoryGovernor
+from modelsvc.governor import InsufficientMemory, MemoryGovernor, UnitLeased
 from modelsvc.registry import ModelRegistry, ModelSpec
 
 
@@ -74,3 +74,58 @@ def test_state_reports_resident_and_budget():
     assert st.used_mb == 1600
     assert st.budget_mb == 6000
     assert st.free_mb == 4000.0
+
+
+def test_a_leased_unit_is_kept_while_others_are_evicted():
+    log = []
+    r = _registry(log, {"a": 1000, "b": 1000, "c": 1000})
+    gov = MemoryGovernor(r, measure_free_mb=lambda: 10000.0, budget_mb=2000, headroom_mb=0)
+    gov.acquire(["b"])  # b is the oldest resident
+    gov.acquire(["a"])
+    log.clear()
+    with gov.lease("b"):
+        gov.acquire(["c"])
+    assert ("free", "a") in log
+    assert ("free", "b") not in log
+    assert r.is_resident("b") and r.is_resident("c")
+
+
+def test_acquire_refuses_when_only_the_leased_unit_could_make_room():
+    log = []
+    r = _registry(log, {"b": 1500, "c": 1000})
+    gov = MemoryGovernor(r, measure_free_mb=lambda: 10000.0, budget_mb=2000, headroom_mb=0)
+    gov.acquire(["b"])
+    log.clear()
+    with gov.lease("b"), pytest.raises(InsufficientMemory):
+        gov.acquire(["c"])
+    assert ("free", "b") not in log
+    assert r.is_resident("b")
+
+
+def test_unloading_a_leased_unit_raises():
+    r = _registry([], {"b": 1000})
+    gov = MemoryGovernor(r, measure_free_mb=lambda: 10000.0, budget_mb=2000)
+    gov.acquire(["b"])
+    with gov.lease("b"), pytest.raises(UnitLeased):
+        gov.unload("b")
+    assert r.is_resident("b")
+
+
+def test_a_released_lease_makes_the_unit_evictable_again():
+    log = []
+    r = _registry(log, {"b": 1500, "c": 1000})
+    gov = MemoryGovernor(r, measure_free_mb=lambda: 10000.0, budget_mb=2000, headroom_mb=0)
+    gov.acquire(["b"])
+    with gov.lease("b"):
+        pass
+    gov.acquire(["c"])
+    assert ("free", "b") in log
+    assert r.is_resident("c")
+
+
+def test_leased_names_the_held_leases():
+    gov = MemoryGovernor(_registry([], {}), measure_free_mb=lambda: 0.0, budget_mb=0)
+    assert gov.leased() == frozenset()
+    with gov.lease("b"):
+        assert gov.leased() == frozenset({"b"})
+    assert gov.leased() == frozenset()

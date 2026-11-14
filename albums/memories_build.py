@@ -34,6 +34,8 @@ def build_memories(
         return _stored_count(conn, owner_id)
     candidates = seed_candidates(conn, owner_id)
     total = len(candidates)
+    logger.warning("memories build: %d candidate(s) %s", total,
+                   [c.photo_ids for c in candidates])
     if progress is not None:
         progress(0, total)
     memories: list[Memory] = []
@@ -54,6 +56,7 @@ def build_memories(
         if progress is not None:
             progress(index + 1, total)
     replace_memories(conn, owner_id, memories)
+    logger.warning("memories build: kept %d of %d candidate(s)", len(memories), total)
     return len(memories)
 
 

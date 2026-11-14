@@ -114,3 +114,103 @@ def test_there_is_no_keyword_reader_left():
     # The keyword tables themselves, not the comment explaining why they went.
     for gone in ("_ASKS_LOW", "_ASKS_HIGH", "_ASKS_MALE", "_ASKS_FEMALE"):
         assert not hasattr(module, gone), gone
+
+
+def test_offered_never_yields_a_voice_copy_entry(monkeypatch):
+    # A cloning entry has no preset speakers; even one declared FIRST, and with speakers,
+    # is never what a preset film casts from.
+    import dataclasses
+
+    from models import catalog
+
+    clone = next(entry for entry in catalog.CATALOG if entry.clones)
+    decoy = dataclasses.replace(clone, key="decoy-clone", speakers=(
+        catalog.Speaker("decoy", "female", "warm", "not a preset"),))
+    monkeypatch.setattr(catalog, "CATALOG", (decoy, *catalog.CATALOG))
+    for language in ("en", "ru"):
+        names = {speaker.name for speaker in offered(language)}
+        assert names and "decoy" not in names
+    assert {s.name for s in offered("en")} <= KOKORO
+    assert {s.name for s in offered("ru")} <= SILERO
+
+
+def test_a_saved_voice_resolves_by_its_name_or_its_token():
+    from feed.voice import SavedCast, resolve_saved
+
+    cast = [SavedCast("saved:1", "Mum"), SavedCast("saved:2", "Дедушка Коля")]
+    assert resolve_saved("Mum", cast) == "saved:1"
+    assert resolve_saved("  mUM ", cast) == "saved:1"              # case-folded
+    assert resolve_saved("ДЕДУШКА КОЛЯ", cast) == "saved:2"         # Cyrillic too
+    assert resolve_saved("saved:2", cast) == "saved:2"              # the token itself
+    assert resolve_saved("saved:3", cast) is None                  # not in this cast
+    assert resolve_saved("af_heart", cast) is None                 # a preset never
+    assert resolve_saved("", cast) is None and resolve_saved(None, cast) is None
+
+
+def test_the_prompt_lists_each_saved_voice_on_its_own_line():
+    from feed.voice import SavedCast, automatic_for_prompt
+
+    text = automatic_for_prompt("en", [SavedCast("saved:1", "Mum"), SavedCast("saved:2", "Dad")])
+    assert text.splitlines()[-2:] == [
+        "  Mum — a saved voice: this person's own voice",
+        "  Dad — a saved voice: this person's own voice",
+    ]
+
+
+def test_a_preset_is_labelled_with_its_gender_and_register():
+    from feed.voice import VoiceLabel, voice_label
+
+    assert voice_label("af_heart", "en") == VoiceLabel("af_heart", "af_heart (female, warm)")
+
+
+def test_a_saved_voice_of_the_cast_is_labelled_with_its_name():
+    from feed.voice import SavedCast, VoiceLabel, voice_label
+
+    cast = [SavedCast("saved:1", "Grandma")]
+    assert voice_label("saved:1", "en", cast) == VoiceLabel("Grandma", "Grandma (saved voice)")
+
+
+def test_a_saved_token_outside_the_cast_reads_a_saved_voice():
+    from feed.voice import SavedCast, VoiceLabel, voice_label
+
+    expected = VoiceLabel("a saved voice", "a saved voice")
+    assert voice_label("saved:3", "en") == expected
+    assert voice_label("saved:3", "en", [SavedCast("saved:1", "Grandma")]) == expected
+
+
+@pytest.mark.parametrize("name, language", [("narrator_x", "en"), ("af_heart", "ru")])
+def test_a_name_the_language_does_not_offer_is_labelled_as_it_is(name, language):
+    from feed.voice import VoiceLabel, voice_label
+
+    assert voice_label(name, language) == VoiceLabel(name, name)
+
+
+@pytest.mark.parametrize("empty", [None, ""])
+def test_no_name_has_no_label(empty):
+    from feed.voice import voice_label
+
+    assert voice_label(empty, "en") is None
+
+
+SAVED_VOICES_LINE = (
+    "  SAVED VOICES — the user's own recordings of real people. How each one sounds is not "
+    "described. Choose one when it suits the memory, for example when the memory is about "
+    "that person or the notes ask for them. Never mix the two kinds: a saved narrator takes "
+    "saved passage voices only, a preset narrator presets only.")
+
+
+def test_automatic_with_no_saved_voice_shows_the_presets_alone():
+    from feed.voice import automatic_for_prompt, catalogue_for_prompt
+
+    assert automatic_for_prompt("en", []) == catalogue_for_prompt("en")
+
+
+def test_automatic_shows_the_presets_then_the_saved_voices_by_name():
+    from feed.voice import SavedCast, automatic_for_prompt, catalogue_for_prompt
+
+    text = automatic_for_prompt("en", [SavedCast("saved:1", "Grandma")])
+    assert text.splitlines() == [
+        *catalogue_for_prompt("en").splitlines(),
+        SAVED_VOICES_LINE,
+        "  Grandma — a saved voice: this person's own voice",
+    ]

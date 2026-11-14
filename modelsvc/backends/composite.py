@@ -12,13 +12,25 @@ A sub-backend not yet wired raises `NotImplementedError` so a premature call
 fails loudly.
 """
 
+import logging
 from collections.abc import Iterator
+from contextlib import nullcontext
 
 from models import catalog
 from modelsvc.activity import Activity
-from modelsvc.backends.base import SlotOff
+from modelsvc.backends.base import (
+    CloningUnavailable,
+    SlotOff,
+    SpeakerEmbedNotOffered,
+    SpeakerEmbedRefused,
+    TranscribeNotOffered,
+    TranscribeRefused,
+)
 from modelsvc.scheduler import Priority
-from modelsvc.slots import LLM_UNITS, catalog_payload
+from modelsvc.slots import ASR_UNIT, LLM_UNITS, SPEAKER_EMBED_UNIT, TRAIN_UNIT, catalog_payload
+from modelsvc.voice_bakes import BakeNotOffered, BakeOnly, VoiceBakes, VoiceGate
+
+log = logging.getLogger(__name__)
 
 
 class CompositeBackend:
@@ -37,6 +49,8 @@ class CompositeBackend:
         slots=None,
         downloads=None,
         profile: str = "mac",
+        activity: Activity | None = None,
+        bakes: VoiceBakes | None = None,
     ) -> None:
         self._embed = embed
         self._caption = caption
@@ -52,8 +66,11 @@ class CompositeBackend:
         self._slots = slots
         self._downloads = downloads
         self._profile = profile
-        # The current in-flight op label, for the resource bar (§13).
-        self._activity = Activity()
+        # The current in-flight op label, for the resource bar (§13). Shared with the
+        # bakes, so a bake shows on the bar too.
+        self._activity = activity if activity is not None else Activity()
+        self._bakes = bakes
+        self._gate = bakes.gate if bakes is not None else VoiceGate()
 
     # --- conveyor plumbing ---
     def _run(self, needed, priority, label, fn):
@@ -106,9 +123,18 @@ class CompositeBackend:
 
     def speak(self, text: str, language: str = "en", voice: str | None = None,
               segments: list[str] | None = None,
-              voices: list[str | None] | None = None) -> dict:
+              voices: list[str | None] | None = None,
+              references: dict | None = None) -> dict:
         if self._voice is None:
             raise SlotOff("voice")
+        # Counted in BEFORE routing: a speak that then waits for a scheduler slot is
+        # still one the bake drains before it unloads `voice` (§8.1).
+        with self._gate.admitted():
+            if references is not None:
+                return self._speak_saved(text, language, voice, segments, voices, references)
+            return self._speak_preset(text, language, voice, segments, voices)
+
+    def _speak_preset(self, text, language, voice, segments, voices) -> dict:
         # The LANGUAGE picks the model, not the user: a film asks to be narrated in
         # Russian and the manager swaps the voice unit to one that speaks Russian.
         # Only `off`, or no voice covering the language at all, is a refusal.
@@ -119,6 +145,89 @@ class CompositeBackend:
             raise SlotOff("voice")
         return self._run(["voice"], Priority.BATCH, "narrating",
                          lambda: self._voice.speak(text, voice, segments, voices))
+
+    def _speak_saved(self, text, language, voice, segments, voices, references) -> dict:
+        """Speak SAVED voices (§11.1): route to the cloning entry for the language, and
+        check that the reply came from the model that was routed (D26). A stored voice
+        identity must never be spoken by another model under its name."""
+        def call() -> dict:
+            return self._voice.speak(text, voice, segments, voices, references)
+
+        if self._slots is None:  # bare unit tests: no routing, no identity to check
+            return self._run(["voice"], Priority.BATCH, "narrating", call)
+        if not self._slots.ensure_voice_for(language, cloning=True):
+            raise CloningUnavailable(f"no voice-copy model speaks {language} on {self._profile}")
+        entry = self._slots.entry("voice")
+        result = self._run(["voice"], Priority.BATCH, "narrating", call)
+        revision = getattr(entry.source, "revision", None)
+        if result.get("model") != entry.key or result.get("revision") != revision:
+            raise RuntimeError(
+                f"voice identity mismatch: routed {entry.key}@{revision}, "
+                f"the voice answered {result.get('model')}@{result.get('revision')}"
+            )
+        return result
+
+    def transcribe(self, audio: bytes, language: str) -> dict:
+        entry = catalog.transcriber_for(self._profile)
+        if self._slots is None or not self._slots.has_unit(ASR_UNIT) or entry is None:
+            raise TranscribeNotOffered("hearing the words of a take is not offered on this device yet")
+        if language not in entry.languages:
+            raise TranscribeRefused(f"{entry.key} does not hear {language!r}; "
+                                    f"it hears {', '.join(entry.languages)}")
+        revision = entry.source.revision
+        # Counted in at the voice gate, so a bake's drain waits for this call and no
+        # Whisper load starts beside the training child (§8.1).
+        with self._gate.admitted():
+            loaded_before = self._registry is not None and self._registry.is_resident(ASR_UNIT)
+            before = self._governor.state() if self._governor is not None else None
+            result = self._run([ASR_UNIT], Priority.BATCH, "hearing the words of a take",
+                               lambda: self._slots.worker(ASR_UNIT).call("transcribe", audio,
+                                                                         language))
+            if (not loaded_before and before is not None and self._registry is not None
+                    and self._registry.is_resident(ASR_UNIT)):
+                self._log_asr_load(entry.key, revision, before, self._governor.state())
+        if result.get("revision") != revision:
+            raise RuntimeError(
+                f"asr identity mismatch: routed {entry.key}@{revision}, "
+                f"the child answered {result.get('revision')}"
+            )
+        return {"text": result["text"], "model": entry.key, "revision": revision,
+                "seconds": result["seconds"], "elapsed_s": result["elapsed_s"]}
+
+    def embed_voice(self, audio: bytes) -> dict:
+        entry = catalog.speaker_embedder_for(self._profile)
+        if entry is None or self._slots is None or not self._slots.has_unit(SPEAKER_EMBED_UNIT):
+            raise SpeakerEmbedNotOffered("measuring a voice is not offered on this device yet")
+        revision = entry.source.revision
+        # Counted in at the voice gate, so a bake's drain waits for this call and no
+        # load starts beside the training child (§8.1).
+        with self._gate.admitted():
+            result = self._run([SPEAKER_EMBED_UNIT], Priority.BATCH, "measuring a voice",
+                               lambda: self._slots.worker(SPEAKER_EMBED_UNIT).call("embed", audio))
+        if result.get("revision") != revision:
+            raise RuntimeError(
+                f"speaker_embed identity mismatch: routed {entry.key}@{revision}, "
+                f"the child answered {result.get('revision')}"
+            )
+        if "refused" in result:
+            raise SpeakerEmbedRefused(result["refused"])
+        if len(result["vector"]) != entry.dim:
+            raise RuntimeError(f"{entry.key} answered {len(result['vector'])} values, "
+                               f"not {entry.dim}")
+        return {"vector": result["vector"], "model": entry.key, "revision": revision,
+                "seconds": result["seconds"], "elapsed_s": result["elapsed_s"],
+                "pipeline": result["pipeline"]}
+
+    @staticmethod
+    def _log_asr_load(key: str, revision: str, before, after) -> None:
+        # The net free-memory change of THIS request: the governor may have evicted
+        # other units to make room, so it is never the model's own cost (§8.1).
+        evicted = sorted(set(before.resident) - set(after.resident))
+        log.info(
+            "asr %s@%s loaded by this request: free_mb %.0f → %.0f, net change %.0f MB; evicted: %s",
+            key, revision[:7], before.free_mb, after.free_mb, after.free_mb - before.free_mb,
+            ", ".join(evicted) or "none",
+        )
 
     def music(
         self, prompt: str = "", seconds: float = 30.0, seed: int | None = None,
@@ -251,14 +360,42 @@ class CompositeBackend:
                 "used_mb": st.used_mb, "active": self._activity.current()} | slots
 
     def model_ensure(self, name: str) -> None:
-        if self._scheduler is not None:
-            self._scheduler.run([name], Priority.INTERACTIVE, lambda: None)
-        elif self._registry is not None:
-            self._registry.ensure(name)
+        if name == TRAIN_UNIT:
+            raise BakeOnly(f"{TRAIN_UNIT} is loaded only by a bake")
+        # A manual load of a gated unit is counted in like a speak, so a bake drains it too.
+        gated = name in ("voice", ASR_UNIT, SPEAKER_EMBED_UNIT)
+        with self._gate.admitted() if gated else nullcontext():
+            if self._scheduler is not None:
+                self._scheduler.run([name], Priority.INTERACTIVE, lambda: None)
+            elif self._registry is not None:
+                self._registry.ensure(name)
 
     def model_unload(self, name: str) -> None:
-        if self._registry is not None:
+        # Through the governor, which refuses a leased unit (`UnitLeased`).
+        if self._governor is not None:
+            self._governor.unload(name)
+        elif self._registry is not None:
             self._registry.unload(name)
+
+    def bake_start(self, request: dict) -> dict:
+        if self._bakes is None:
+            raise BakeNotOffered("baking a voice is not offered on this device yet")
+        return self._bakes.start(request)
+
+    def bake_status(self, bake_id: str) -> dict | None:
+        return None if self._bakes is None else self._bakes.status(bake_id)
+
+    def bake_current(self) -> dict | None:
+        return None if self._bakes is None else self._bakes.current()
+
+    def bake_cancel(self, bake_id: str) -> dict | None:
+        return None if self._bakes is None else self._bakes.cancel(bake_id)
+
+    def bake_adapter(self, bake_id: str) -> bytes | None:
+        return None if self._bakes is None else self._bakes.adapter(bake_id)
+
+    def bake_delete(self, bake_id: str) -> bool:
+        return self._bakes is not None and self._bakes.delete(bake_id)
 
     def resources(self) -> dict:
         """What this service ALONE knows: which models are resident, and the op

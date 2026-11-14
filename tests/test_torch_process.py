@@ -73,3 +73,29 @@ def test_a_child_that_dies_mid_call_raises_and_reports_dead():
         assert not w.is_alive()
     finally:
         w.stop()
+
+
+def test_a_child_that_dies_while_loading_names_its_exit_code():
+    # A bare `EOFError` is all the UI showed ("could not speak en (EOFError)"); the
+    # exit code is what tells a crash (signal, negative) from an exit (positive).
+    w = TorchWorker("tests.worker_fixtures:DiesWhileLoading", (3,))
+    with pytest.raises(RuntimeError, match=r"DiesWhileLoading died while loading.*exit code 3"):
+        w.start()
+    assert not w.is_alive()
+
+
+def test_a_child_that_dies_while_loading_carries_its_stderr():
+    # The child's output went only to the terminal running `make up`; the error the
+    # UI shows must say WHY on its own.
+    w = TorchWorker("tests.worker_fixtures:DiesWhileLoading", (3,))
+    with pytest.raises(RuntimeError, match="fatal: spaCy model missing"):
+        w.start()
+
+
+def test_a_healthy_load_still_works_with_stderr_captured():
+    w = _worker()
+    w.start()
+    try:
+        assert w.call("double", [2]) == [5]
+    finally:
+        w.stop()

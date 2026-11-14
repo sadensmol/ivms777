@@ -25,3 +25,15 @@ class Doubler:
 
     def die(self) -> None:
         os._exit(1)  # simulates llama-server-style SIGABRT: no reply ever comes
+
+
+class DiesWhileLoading:
+    """A model whose load kills the process — a native crash, or a library calling
+    `os._exit` — so no load result is ever sent."""
+
+    def __init__(self, code: int = 3) -> None:
+        import sys
+
+        sys.stderr.write("fatal: spaCy model missing\n")
+        sys.stderr.flush()
+        os._exit(code)

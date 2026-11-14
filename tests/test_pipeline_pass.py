@@ -5,6 +5,8 @@ Regression for the jetson failure where the app/worker could not init CUDA
 blocked the GPU-free thumbnail stage too, so uploaded photos never got a
 `thumb_key` and never appeared in the library (§8: stages are independent)."""
 
+import hashlib
+
 import pytest
 
 from ingest.pipeline import drain_pass
@@ -131,3 +133,62 @@ def test_drain_pass_has_no_coordinator_param():
     from ingest.pipeline import drain_pass as dp
 
     assert "coordinator" not in inspect.signature(dp).parameters
+
+
+def _clip_wav(seconds=6.0, rate=48000) -> bytes:
+    # A mono PCM-16 tone at 48 kHz: the clip contract of `add_example` (D21).
+    import io
+    import math
+    import wave
+
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(rate)
+        handle.writeframes(b"".join(
+            int(6000 * math.sin(2 * math.pi * 220 * i / rate)).to_bytes(2, "little", signed=True)
+            for i in range(round(seconds * rate))
+        ))
+    return buffer.getvalue()
+
+
+def test_a_pass_drains_a_pending_voice_deletion_even_when_the_embedder_is_down(ctx, monkeypatch):
+    # D33: the worker runs the saved-voice deletion outbox in group 1, so a dead
+    # embedder never leaves a voice "deleting…" — rows, files and intent all go.
+    from config import Settings
+    from feed.saved_voices import (
+        add_example,
+        create_voice,
+        pending_voice_deletions,
+        request_voice_deletion,
+    )
+
+    owner = ctx.settings.owner_id
+    voice = create_voice(ctx.conn, owner, "Grandma")
+    example = add_example(
+        ctx.conn, ctx.voices, owner, voice.id,
+        language="en", source="uploaded", data=_clip_wav(),
+    )
+    cond_key = content_key(hashlib.sha256(b"blob").hexdigest(), ".cond")
+    ctx.voices.write(cond_key, b"blob")
+    ctx.conn.execute(
+        "INSERT INTO voice_conditionings(example_id, model_key, revision, storage_key, created_at)"
+        " VALUES (?, 'voxcpm2', 'rev1', ?, '2026-01-01')",
+        (example.id, cond_key),
+    )
+    assert request_voice_deletion(ctx.conn, owner, voice.id)
+    _uploaded_photo(ctx)  # embed work pending → the pass tries to build the embedder
+
+    def boom(self, conn=None):
+        raise RuntimeError("Unexpected error from cudaGetDeviceCount ... Error 801")
+
+    monkeypatch.setattr(Settings, "build_embedder", boom)
+    drain_pass(ctx, load_vocab(VOCAB_PATH))  # must not raise
+
+    assert ctx.conn.execute("SELECT 1 FROM saved_voices WHERE id = ?", (voice.id,)).fetchone() is None
+    assert ctx.conn.execute("SELECT COUNT(*) FROM voice_examples").fetchone()[0] == 0
+    assert ctx.conn.execute("SELECT COUNT(*) FROM voice_conditionings").fetchone()[0] == 0
+    assert not ctx.voices.exists(example.storage_key)
+    assert not ctx.voices.exists(cond_key)
+    assert pending_voice_deletions(ctx.conn) == 0

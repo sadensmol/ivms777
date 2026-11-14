@@ -1,0 +1,19 @@
+{# The voice test job (design §6, §11.1): the one test `app` runs, as `voices.js` polls it
+   from /voices/preview. `data-epoch` names the process and `data-run` the test, so the
+   page never applies an old reply; `data-completed` is the run of the last stored test,
+   so the page knows when to refresh the leaf body. On the page of another voice,
+   voices.js shows `.preview-other` instead of this voice's job line. #}
+<div id="voice-preview-job" data-state="{{ preview.state }}" data-run="{{ preview.run }}"
+     data-epoch="{{ preview.epoch }}" data-completed="{{ preview.completed }}"
+     data-voice-id="{{ preview.voice_id or '' }}" data-language="{{ preview.language or '' }}">
+  {% if preview.state == 'running' %}
+    <p class="preview-what">Testing «{{ preview_voice }}» ({{ language_names.get(preview.language, preview.language) }}): “{{ preview.text }}”</p>
+    <p class="preview-other" hidden>Testing «{{ preview_voice }}» · {{ preview.percent }}%</p>
+    <div class="preview-bar"><span style="width: {{ preview.percent }}%"></span></div>
+    <p class="preview-step">{{ preview.stage }} · {{ preview.percent }}%</p>
+    <button type="button" class="preview-cancel">Cancel</button>
+  {% elif preview.state == 'failed' %}
+    <p class="preview-error">{{ preview.error }}</p>
+    <button type="button" class="preview-dismiss">Close</button>
+  {% endif %}
+</div>

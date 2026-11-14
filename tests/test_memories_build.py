@@ -83,3 +83,28 @@ def test_one_failing_candidate_does_not_abort_the_whole_rebuild(conn):
     n = build_memories(conn, FlakyClient(), "planner", owner_id=1)
     assert n == 1                                            # the good one survived
     assert [m.title for m in read_memories(conn, 1)] == ["Autumn trip"]
+
+
+def test_build_logs_candidates_and_kept_counts(conn, caplog):
+    # "I clicked and nothing appeared" must be answerable from the terminal.
+    _run(conn, (1, 2, 3), "2025-07-12T1{}:00:00")
+    with caplog.at_level("WARNING", logger="albums.memories_build"):
+        build_memories(conn, FakeInferenceClient([_keep("Beach day")]), "planner", 1, force=True)
+    assert "1 candidate" in caplog.text
+    assert "kept 1" in caplog.text
+
+
+def test_albums_logs_also_land_in_the_memories_log_file(tmp_path):
+    import logging
+
+    from web.app import log_albums_to
+
+    path = tmp_path / "memories.log"
+    handlers = log_albums_to(path)
+    try:
+        logging.getLogger("albums.compose").warning("candidate skipped: keep=false")
+    finally:
+        for handler in handlers:
+            logging.getLogger("albums").removeHandler(handler)
+            handler.close()
+    assert "candidate skipped: keep=false" in path.read_text()

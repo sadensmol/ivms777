@@ -12,13 +12,19 @@ with nothing left to evict is not a reason to fail the contract).
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable
+from collections import Counter
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 from modelsvc.registry import ModelRegistry
 
 
 class InsufficientMemory(RuntimeError):
+    pass
+
+
+class UnitLeased(RuntimeError):
     pass
 
 
@@ -44,13 +50,14 @@ class MemoryGovernor:
         self._budget = budget_mb
         self._headroom = headroom_mb
         self._lock = threading.RLock()
+        self._leases: Counter[str] = Counter()
 
     def _resident_cost(self) -> int:
         return sum(self._r.cost_mb(n) for n in self._r.resident())
 
     def acquire(self, needed: list[str], *, pinned: frozenset[str] = frozenset()) -> None:
         with self._lock:
-            keep = set(needed) | set(pinned)
+            keep = set(needed) | set(pinned) | set(self._leases)
             add_cost = sum(self._r.cost_mb(n) for n in needed if not self._r.is_resident(n))
 
             for name in self._r.resident():  # snapshot, LRU oldest first
@@ -75,7 +82,27 @@ class MemoryGovernor:
 
     def unload(self, name: str) -> None:
         with self._lock:
+            if name in self._leases:
+                raise UnitLeased(f"{name} is leased")
             self._r.unload(name)
+
+    @contextmanager
+    def lease(self, name: str) -> Iterator[None]:
+        """Keep `name` resident while the block runs: `acquire` never evicts it, and
+        `unload` refuses it (§8.1)."""
+        with self._lock:
+            self._leases[name] += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._leases[name] -= 1
+                if self._leases[name] == 0:
+                    del self._leases[name]
+
+    def leased(self) -> frozenset[str]:
+        with self._lock:
+            return frozenset(self._leases)
 
     def state(self) -> GovernorState:
         with self._lock:

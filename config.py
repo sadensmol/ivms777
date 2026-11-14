@@ -297,6 +297,13 @@ class Settings(BaseSettings):
         Never a source folder: nothing here is ever read from the user's disk."""
         return self.data_dir / "audio"
 
+    @property
+    def voices_dir(self) -> Path:
+        """Saved-voice example WAVs and their conditioning blobs (§6, §11.1) — USER data,
+        content-addressed. Never walked by the film's audio prune: only the voice
+        deletion drain removes a file here."""
+        return self.data_dir / "voices"
+
     def embed_model_key(self, conn=None) -> str:
         """The name to record against a vector this process produces — the catalog
         key the `image_embed` slot holds right now (§4.1), or `"fake"` when the

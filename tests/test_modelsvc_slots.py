@@ -8,8 +8,16 @@ import pytest
 
 from config import Settings
 from models import catalog
+from modelsvc.governor import MemoryGovernor
 from modelsvc.registry import ModelRegistry
 from modelsvc.slots import SlotManager
+
+VOXCPM2_LORA_JSON = (
+    '{"alpha": 16, "dropout": 0.0, "enable_dit": true, "enable_lm": true, "enable_proj": false, '
+    '"r": 8, "target_modules_dit": ["q_proj", "v_proj", "k_proj", "o_proj"], '
+    '"target_modules_lm": ["q_proj", "v_proj", "k_proj", "o_proj"]}'
+)
+TRAINER_TARGET = "audio.voxcpm_trainer:VoxCPMTrainer"
 
 
 class _FakeWorker:
@@ -255,3 +263,222 @@ def test_a_language_nothing_speaks_is_refused(tmp_path):
     manager, _, _, _ = _manager(tmp_path)
     manager.apply(catalog.DEFAULTS["jetson"])
     assert manager.ensure_voice_for("klingon") is False
+
+
+
+def test_a_saved_voice_routes_to_the_cloning_child_with_its_revision(tmp_path):
+    manager, registry, built, settings = _manager(tmp_path, profile="mac")
+    manager.apply(catalog.DEFAULTS["mac"])
+    generation = manager.generation
+
+    assert manager.ensure_voice_for("en", cloning=True) is True
+    assert manager.entry("voice").key == "voxcpm2"
+    assert manager.generation == generation + 1
+    registry.ensure("voice")
+    worker = built["workers"][-1]
+    source = catalog.get("voice", "voxcpm2").source
+    assert worker.target == "audio.voxcpm_voice:VoxCPMVoice"
+    assert worker.args == (source.repo, settings.embed_device, source.revision, VOXCPM2_LORA_JSON)
+    assert registry.cost_mb("voice") == catalog.get("voice", "voxcpm2").cost_mb
+
+
+def test_preset_routing_never_picks_the_cloning_entry(tmp_path):
+    manager, _, _, _ = _manager(tmp_path, profile="mac")
+    manager.apply(catalog.DEFAULTS["mac"])
+    for language in ("en", "ru"):
+        assert manager.voice_entry_for(language).clones is False
+
+    # Also when the cloning child is the one resident: the selection no longer wins.
+    assert manager.ensure_voice_for("ru", cloning=True) is True
+    assert manager.voice_entry_for("en").key == "kokoro-82m"
+    assert manager.voice_entry_for("ru").key == "silero-v4-ru"
+    assert manager.ensure_voice_for("ru") is True
+    assert manager.entry("voice").key == "silero-v4-ru"
+
+
+def test_a_saved_voice_never_reaches_a_preset_child(tmp_path):
+    manager, _, _, _ = _manager(tmp_path, profile="mac")
+    manager.apply(catalog.DEFAULTS["mac"])
+    assert manager.entry("voice").key == "kokoro-82m"   # selected, speaks en
+    assert manager.voice_entry_for("en", cloning=True).key == "voxcpm2"
+
+
+def test_jetson_has_no_voice_copy_and_keeps_its_voice(tmp_path):
+    manager, _, _, _ = _manager(tmp_path, profile="jetson")
+    manager.apply(catalog.DEFAULTS["jetson"])
+    generation = manager.generation
+    assert manager.ensure_voice_for("en", cloning=True) is False
+    assert manager.entry("voice").key == "kokoro-82m"
+    assert manager.generation == generation
+
+
+def test_an_unpinned_voice_keeps_two_child_args(tmp_path):
+    manager, registry, built, settings = _manager(tmp_path)
+    manager.apply(catalog.DEFAULTS["jetson"])
+    registry.ensure("voice")
+    voice = next(w for w in built["workers"] if w.target == "audio.kokoro_voice:KokoroVoice")
+    assert voice.args == ("hexgrad/Kokoro-82M", settings.embed_device)
+
+
+def test_every_catalog_voice_has_a_child_class():
+    from modelsvc.slots import VOICE_TARGETS
+
+    for entry in catalog.CATALOG:
+        if entry.slot == "voice":
+            assert entry.key in VOICE_TARGETS, entry.key
+
+
+def test_a_voice_with_no_child_class_raises_instead_of_falling_back(tmp_path, monkeypatch):
+    # No silent Kokoro: a stored identity must never be spoken by another model.
+    from modelsvc import slots
+
+    manager, _, _, _ = _manager(tmp_path)
+    manager.apply(catalog.DEFAULTS["jetson"])
+    monkeypatch.delitem(slots.VOICE_TARGETS, "silero-v4-ru")
+    with pytest.raises(KeyError):
+        manager.ensure_voice_for("ru")
+
+
+def test_a_silero_voice_keeps_two_child_args(tmp_path):
+    manager, registry, built, settings = _manager(tmp_path)
+    manager.apply(catalog.DEFAULTS["jetson"])
+    manager.ensure_voice_for("ru")
+    registry.ensure("voice")
+    voice = built["workers"][-1]
+    assert voice.target == "audio.silero_voice:SileroVoice"
+    assert voice.args == (
+        str(tmp_path / "models" / catalog.get("voice", "silero-v4-ru").source.file),
+        settings.embed_device,
+    )
+
+
+
+def test_mac_registers_the_training_unit_from_the_adapter_entry(tmp_path):
+    manager, registry, built, settings = _manager(tmp_path, profile="mac")
+    manager.apply(catalog.DEFAULTS["mac"])
+    registry.ensure("voice_train")
+    worker = built["workers"][-1]
+    source = catalog.get("voice", "voxcpm2").source
+    assert worker.target == TRAINER_TARGET
+    assert worker.args == (
+        source.repo,
+        settings.embed_device,
+        source.revision,
+        VOXCPM2_LORA_JSON,
+        str(tmp_path / "voice-bakes"),
+    )
+    assert worker.warm is None
+    assert registry.cost_mb("voice_train") == 14000
+
+
+def test_config_overrides_the_training_cost(tmp_path):
+    manager, registry, _, _ = _manager(tmp_path, profile="mac", model_cost_mb={"voice_train": 9000})
+    manager.apply(catalog.DEFAULTS["mac"])
+    assert registry.cost_mb("voice_train") == 9000
+
+
+def test_jetson_registers_no_training_unit(tmp_path):
+    manager, registry, _, _ = _manager(tmp_path, profile="jetson")
+    manager.apply(catalog.DEFAULTS["jetson"])
+    assert "voice_train" not in registry._specs
+
+
+def test_a_slot_switch_never_touches_a_leased_training_unit(tmp_path):
+    manager, registry, built, _ = _manager(tmp_path, profile="mac")
+    manager.apply(catalog.DEFAULTS["mac"])
+    governor = MemoryGovernor(registry, measure_free_mb=lambda: 100000.0, budget_mb=100000)
+    governor.acquire(["voice_train"])
+    trainer = built["workers"][-1]
+
+    with governor.lease("voice_train"):
+        manager.apply({"music": "musicgen-small"})
+
+        assert "voice_train" in registry._specs
+        assert registry.is_resident("voice_train")
+        assert trainer.started and not trainer.stopped
+
+
+ASR_TARGET = "audio.whisper_asr:WhisperASR"
+
+
+@pytest.mark.parametrize(("profile", "device"), [("mac", "mps"), ("cloud", "cuda")])
+def test_the_asr_unit_is_registered_from_the_transcriber_entry(tmp_path, profile, device):
+    manager, registry, built, _ = _manager(tmp_path, profile=profile)
+    manager.apply(catalog.DEFAULTS[profile])
+    registry.ensure("asr")
+    worker = built["workers"][-1]
+    source = catalog.transcriber_for(profile).source
+    assert worker.target == ASR_TARGET
+    assert worker.args == (source.repo, device, source.revision)
+    assert worker.warm is None
+    assert registry.cost_mb("asr") == 4000
+
+
+def test_config_overrides_the_asr_cost(tmp_path):
+    manager, registry, _, _ = _manager(tmp_path, profile="mac", model_cost_mb={"asr": 3500})
+    manager.apply(catalog.DEFAULTS["mac"])
+    assert registry.cost_mb("asr") == 3500
+
+
+def test_a_slot_switch_leaves_a_running_asr_child_alone(tmp_path):
+    manager, registry, built, _ = _manager(tmp_path, profile="mac")
+    manager.apply(catalog.DEFAULTS["mac"])
+    registry.ensure("asr")
+    whisper = built["workers"][-1]
+
+    manager.apply({"music": "musicgen-small"})
+
+    assert "asr" in registry._specs
+    assert registry.is_resident("asr")
+    assert whisper.started and not whisper.stopped
+    assert manager.worker("asr") is whisper
+
+
+def test_no_asr_unit_on_jetson(tmp_path):
+    manager, registry, _, _ = _manager(tmp_path, profile="jetson")
+    manager.apply(catalog.DEFAULTS["jetson"])
+    assert "asr" not in registry._specs
+    assert not manager.has_unit("asr")
+
+
+SPEAKER_TARGET = "audio.speaker_embed:SpeakerEmbedder"
+
+
+def test_mac_registers_the_speaker_unit_from_its_catalog_entry(tmp_path):
+    manager, registry, built, settings = _manager(tmp_path, profile="mac")
+    manager.apply(catalog.DEFAULTS["mac"])
+    registry.ensure("speaker_embed")
+    worker = built["workers"][-1]
+    source = catalog.speaker_embedder_for("mac").source
+    assert worker.target == SPEAKER_TARGET
+    assert worker.args == (source.repo, settings.embed_device, source.revision)
+    assert worker.warm is None
+    assert registry.cost_mb("speaker_embed") == 1000
+
+
+def test_config_overrides_the_speaker_cost(tmp_path):
+    manager, registry, _, _ = _manager(tmp_path, profile="mac",
+                                       model_cost_mb={"speaker_embed": 700})
+    manager.apply(catalog.DEFAULTS["mac"])
+    assert registry.cost_mb("speaker_embed") == 700
+
+
+def test_a_slot_switch_leaves_a_running_speaker_child_alone(tmp_path):
+    manager, registry, built, _ = _manager(tmp_path, profile="mac")
+    manager.apply(catalog.DEFAULTS["mac"])
+    registry.ensure("speaker_embed")
+    child = built["workers"][-1]
+
+    manager.apply({"music": "musicgen-small"})
+
+    assert registry.is_resident("speaker_embed")
+    assert manager.worker("speaker_embed") is child
+    assert child.started and not child.stopped
+
+
+@pytest.mark.parametrize("profile", ["jetson", "cloud"])
+def test_no_speaker_unit_where_no_embedder_is_offered(tmp_path, profile):
+    manager, registry, _, _ = _manager(tmp_path, profile=profile)
+    manager.apply(catalog.DEFAULTS[profile])
+    assert "speaker_embed" not in registry._specs
+    assert not manager.has_unit("speaker_embed")
