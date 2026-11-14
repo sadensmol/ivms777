@@ -64,10 +64,25 @@ feed/                  # memory film — offline prepare, thin client (plans 23,
   language.py          # the feed_language setting (en | ru)
   store.py             # memory_presentations(group_id, language) + audio pruning
   build.py             # the prepare job: signals -> direct -> story -> audio -> row
-audio/                 # models-service ONLY — hosts the feed's two models (plan 23)
+  narration.py         # the film's narration as passages + the user's edited draft
+  rephrase.py          # Ask AI to rephrase the narration: one model call, writes nothing
+  saved_voices.py      # saved voices and takes; film_take/reference_for: the take a film speaks from
+  voice_hearing.py     # hearing job: Whisper words of each take after save
+  voice_likeness.py    # ECAPA speaker similarity of a test, mac only
+  voice_preview.py     # the test of one saved voice, spoken as a film speaks it
+  voice_bake.py        # bake client, used only by reattach
+audio/                 # models-service ONLY — hosts the TTS, music, speech-recognition,
+                       #   speaker-embedding and voice-training children (plan 23)
   kokoro_voice.py      # Kokoro-82M TTS (English) in a TorchWorker child (torch)
   silero_voice.py      # Silero v4_ru TTS (Russian) in a TorchWorker child (torch)
   stable_audio.py      # Stable Audio Open 1.0 in a TorchWorker child (torch)
+  voxcpm_voice.py      # VoxCPM2 voice copy of a saved voice in a TorchWorker child (torch)
+  voxcpm_trainer.py    # LoRA trainer child, bake check only
+  whisper_asr.py       # Whisper large-v3 turbo: the words of one take (torch)
+  speaker_embed.py     # ECAPA-TDNN speaker embedding of one clip (torch)
+  espeak_path.py       # an espeak-ng data path under its 160-byte limit (torch-free)
+modelsvc/              # the models service: the one inference gateway (design §5.1)
+  voice_bakes.py       # /voice/bakes: the parent side of a bake, runs the voice_train child
 chat/                  #                                     (plan 06)
   retrieve.py          # off-topic gate + fusion fallback (via core candidates)
   context.py           # photo ids -> compact grounding block
@@ -76,13 +91,18 @@ web/
   app.py
   deps.py              # AppContext
   upload_api.py        # /api/upload/*
+  voices_api.py        # /voices grid + /voices/{id} leaf: takes, hearing, tests, bake reattach
   templates/
   static/
     upload.js          # picker, batching, progress
     hash-worker.js     # Web Worker: SHA-256, one file at a time
+    voices.js          # Voices pages: record or upload a take as a 48 kHz mono WAV, poll jobs
     feed-gl.js         # memory film player: WebGL2 moves, transitions, grade (plan 24)
     feed.css           # the player's own stylesheet — it does not load app.css
 vocab.yaml                                                    (plan 04)
+scripts/               # voice_*: manual checks against the user's running stack
+  voice_check.py       # voice copy of one clip: fresh vs restored conditioning, blind pairs
+  voice_bake_check.py  # bake one saved voice into a LoRA adapter and judge it blind
 ivms777_sync/          # stage 2 — separate package, separate entry point (plan 22)
   cli.py               # apply | undo | verify
   plan.py              # read + validate the downloaded plan document

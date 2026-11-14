@@ -326,7 +326,8 @@ CREATE TABLE IF NOT EXISTS voice_models (
   created_at    TEXT NOT NULL
 );
 -- What a voice model learned: one row per trained take. No foreign key to voice_examples: the row outlives a deleted
--- take, so the page can show the snapshot and count "deleted since vN". The model's languages come from here.
+-- take. No page reads it. The bake check does: stored_model takes the model's languages from here, and --longer-bake
+-- checks each learned take's fingerprint.
 CREATE TABLE IF NOT EXISTS voice_model_takes (
   voice_id    INTEGER NOT NULL REFERENCES voice_models(voice_id) ON DELETE CASCADE,
   example_id  INTEGER NOT NULL,

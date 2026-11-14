@@ -586,6 +586,7 @@ flowchart TB
         infer["inference · llama.cpp llama-server (mac/jetson) | vLLM (cloud)<br/>ONE gemma4-E2B GGUF — text (planner/chat) AND vision (caption), on the GPU<br/>reached ONLY by the models service · (host on mac, container on jetson/cloud)"]
         db[("SQLite WAL<br/>sqlite-vec + FTS5 · named volume")]
         store[("Storage<br/>originals + thumbnails + feed audio<br/>saved-voice examples + voice models + voice tests (data_dir/voices)")]
+        bakecheck["scripts/voice_bake_check.py · manual CLI<br/>bakes one saved voice and judges it blind<br/>reads the database READ-ONLY · the adapter stays in its output folder"]
     end
 
     disk -.->|user selects| browser
@@ -599,11 +600,15 @@ flowchart TB
 
     app <-->|"reads · small short writes"| db
     worker <-->|"owns writes"| db
-    app -->|"read originals / thumbnails · write saved-voice examples, their heard words and voice tests"| store
+    app -->|"read originals / thumbnails · write saved-voice examples, their heard words and voice tests · the voice model of a reattached bake"| store
     worker -->|"write originals / thumbnails · remove deleted saved-voice files"| store
 
     app -->|"ALL inference: query embed · planner · chat · /speak with saved voices' newest heard takes: films and voice tests · /voice/transcribe after a take is saved · /voice/embed (HTTP)"| models
     app -->|"slot switch + downloads: PUT /models/slots · POST /models/download (§4.1)"| models
+    app -->|"start-up reattach only, no new bake: /voice/bakes (find · follow · cancel · store · delete this app's own bake)"| models
+    bakecheck -->|"/voice/bakes · /speak · /voice/embed (HTTP)"| models
+    bakecheck -->|"read-only"| db
+    bakecheck -->|"read takes + voice models"| store
     worker -->|"ALL inference: embed · zero-shot tags · caption (HTTP)"| models
     models -->|"gemma4-E2B: planner/chat + caption/vision (OpenAI /v1)"| infer
     models -->|"fetch weights on demand (HF / GGUF) → model cache volume"| hf[("Hugging Face<br/>weights, fetched once per model")]
@@ -1048,9 +1053,10 @@ The library is one SQLite file. **The full DDL — every table and index, the
   the model key, the revision and the LoRA shape it was trained for, and stored at most
   once per bake. It stays when takes are added or deleted.
 - **`voice_model_takes`** — what a voice model learned: one row per trained take with
-  its language, its length and its fingerprint. A row stays after its take is deleted,
-  so the page can show the snapshot and count the changes since it. The model's
-  languages come from these rows.
+  its language, its length and its fingerprint. A row stays after its take is deleted.
+  No page reads these rows. Only `scripts/voice_bake_check.py` uses them: the model's
+  languages come from them (`stored_model`), and `--longer-bake` checks that each
+  learned take still has its fingerprint.
 - **`voice_bake_runs`** — the immutable snapshot of a bake that `app` started, written
   before the bake starts. The snapshot holds each trained take with the words speech
   recognition heard in it. It holds `cancel_requested_at`, which Cancel, a replace and a
@@ -3397,7 +3403,8 @@ on:
 - **`feed` and `audio` are opposite sides of the one-model-process line** (§5.1).
   `feed` builds and stores memory presentations (§11.1) and is a thin client — it
   holds no model and is covered by the import gate. `audio` is models-service-only:
-  it hosts the TTS and music models inside `TorchWorker` children, so — like
+  it hosts the TTS, music, speech-recognition, speaker-embedding and voice-training
+  models inside `TorchWorker` children, so — like
   `modelsvc` — it is exempt from that gate and is never imported by `app`, `worker`
   or `feed`. `storage/wav.py` is the one piece both use, and it is torch-free
   precisely so it can be.
