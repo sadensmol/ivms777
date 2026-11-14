@@ -29,7 +29,10 @@ Ctrl-C stops the three app processes; the host
 
 The **first** `make up` builds `llama.cpp` with Metal and downloads the gemma
 GGUF (~2 GB) once, and installs the `models` extra (torch/transformers) — later
-runs are fast. There is **no Ollama** any more.
+runs are fast. It also downloads every model the `models` service needs. Among them
+are VoxCPM2 for voice copy (~4.7 GB), Whisper large-v3 turbo for the words of a take
+(~1.5 GB) and ECAPA-TDNN for speaker similarity (~85 MB). A failed download stops
+`make up`. There is **no Ollama** any more.
 
 ### Build llama.cpp for Mac (Metal)
 
@@ -95,9 +98,11 @@ written narration over a composed score on a WebGL canvas (design §11.1).
 1. Open `/organize?by=memories` and hit **▶ Play** on a memory card — or go
    straight to `/feed/<memory-key>`.
 2. The first play needs a **Prepare**. Three models run in turn: the planner
-   (`gemma4-E2B`) writes the story, `kokoro-82m` speaks it, and MusicGen
+   (`gemma4-E2B`) writes the story, a voice speaks it, and MusicGen
    composes a score that is written to end with the film (`musicgen-medium` on a
-   Mac, `musicgen-small` on the Jetson). A named stage, a percentage, and a
+   Mac, `musicgen-small` on the Jetson). The voice is `kokoro-82m` for English and
+   `silero-v4-ru` for Russian. On a Mac or the cloud it may also be a saved voice
+   (see below), spoken by VoxCPM2. A named stage, a percentage, and a
    **Cancel** show the whole way. The language buttons at the top prepare and
    cache each language separately, so switching does not discard the other.
 3. Press **▶ Play**. The film opens paused behind its title card because
@@ -105,6 +110,14 @@ written narration over a composed score on a WebGL canvas (design §11.1).
 4. **↻ Regenerate** writes and scores it again; the story pass is sampled, so a
    second run genuinely differs. One film is prepared at a time per process — ask
    for another and the first is stopped, then yours starts.
+
+### Saved voices
+
+On a Mac or the cloud, a film can speak in the voice of a person you know.
+
+- Open **Voices**, make a voice, and record or upload takes of 5–30 s each.
+- After a take is saved, the app hears its words with Whisper.
+- A film speaks from the newest take of its language whose words were heard.
 
 ### Download it as a video file
 

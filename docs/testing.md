@@ -34,9 +34,12 @@ how that design is verified.
   **real, parseable WAV bytes**, so `duration_seconds` measures a true length and the
   "stretch the slideshow to outlast the narration" rule is tested for real. A slot
   set to `off` is covered too: the prepare job must still produce a playable feed
-  when the voice, the music, or both answer 503. Neither `kokoro` nor `diffusers` is
-  installed by a plain `uv sync`, so no test imports `audio/` — those two children
-  are exercised only on a machine with the `models` extra.
+  when the voice, the music, or both answer 503. No `audio/` module imports torch or
+  a model library at module level, so tests import `audio/` under a plain `uv sync`.
+  They run its pure parts against fakes: a fake model, a fake `torch` or
+  `huggingface_hub` module, `pickle` in place of `torch.save`. No test imports
+  `audio/kokoro_voice.py` or `audio/musicgen.py`; those two children run only on a
+  machine with the `models` extra.
 - `ivms777_sync` tests build a real directory tree in `tmp_path` and run `apply`
   against a plan fixture, then assert the tree matches the plan exactly. Every such
   test also runs `undo` and asserts the tree is byte-identical to how it started.
