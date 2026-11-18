@@ -65,10 +65,11 @@ def test_build_backend_wires_conveyor_on_jetson(tmp_path):
     backend = build_backend(Settings(data_dir=tmp_path, profile="jetson"))
     assert isinstance(backend._scheduler, Scheduler)
     assert backend._scheduler.slots == 1  # jetson serializes the GPU
-    # One managed unit per slot (design §4.1). There is no "off" model any more, so
-    # every slot has one.
+    # One managed unit per slot (design §4.1), plus the face unit, which sits outside
+    # the slots and is registered on every profile (§8.1). There is no "off" model any
+    # more, so every slot has one.
     assert set(backend._registry._specs) == {
-        "image_embed", "text_embed", "llm", "llm_vision", "voice", "music",
+        "image_embed", "text_embed", "llm", "llm_vision", "voice", "music", "faces",
     }
     assert backend._text_embed_needs == ("text_embed",)
 

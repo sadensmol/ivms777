@@ -81,7 +81,7 @@ def test_apply_registers_a_unit_per_slot(tmp_path):
     manager, registry, _, _ = _manager(tmp_path)
     manager.apply(catalog.DEFAULTS["jetson"])
     assert set(registry._specs) == {
-        "image_embed", "text_embed", "llm", "llm_vision", "voice", "music",
+        "image_embed", "text_embed", "llm", "llm_vision", "voice", "music", "faces",
     }
 
 

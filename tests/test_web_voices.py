@@ -2237,7 +2237,7 @@ def test_the_leaf_header_menu_tabs_and_outside_parts(client):
     assert "Delete voice…" in menu
     tabs = re.findall(r'<button type="button" role="tab" class="voice-tab" data-tab="(\w+)"\s+'
                       r'aria-selected="(\w+)">', body)
-    assert tabs == [("recordings", "true"), ("test", "false")]
+    assert tabs == [("recordings", "true"), ("test", "false"), ("faces", "false")]
     end = _voices_end(body)
     for outside in ('id="voice-recorder"', 'id="voice-preview"'):
         assert body.index(outside) > end, outside
