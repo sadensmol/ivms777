@@ -311,6 +311,9 @@ class FakeBackend:
         return {"vector": vector, "model": "fake-speaker", "revision": "fake",
                 "seconds": len(samples) / rate, "elapsed_s": 0.0, "pipeline": PIPELINE}
 
+    def detect_faces(self, image: bytes) -> dict:
+        return {"faces": [], "model": "", "revision": "", "elapsed_s": 0.0}
+
     # --- slots (design §4.1) ---
     def _download_status(self, entry) -> dict:
         total = entry.size_mb * 1024 * 1024

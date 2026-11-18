@@ -151,6 +151,11 @@ class ModelEntry:
     clones: bool = False
     note: str | None = None
     adapter: AdapterSpec | None = None
+    # A face entry's declared use (§4.1, §8.1). None for every other slot.
+    score_floor: float | None = None  # the lowest detection score kept
+    match_threshold: float | None = None  # the lowest cosine similarity that joins a group
+    input_edge: int | None = None  # the long edge, in px, the caller shrinks a photo to
+    min_face_px: int | None = None  # the smallest face side kept, in px of that image
 
 
 _ALL = ("mac", "jetson", "cloud")
@@ -503,6 +508,23 @@ SPEAKER_EMBEDDERS: tuple[ModelEntry, ...] = (
     ),
 )
 
+# No slot and no user choice: it finds and describes the faces of each photo (§4.1, §8).
+FACE_MODELS: tuple[ModelEntry, ...] = (
+    ModelEntry(
+        key="buffalo-l", slot="faces", display="InsightFace buffalo_l · faces",
+        source=HfSource("immich-app/buffalo_l",
+                        revision="d09715916a0778919a770c343533641e250b8699"),
+        size_mb=182, cost_mb=1000, cost_measured=False,
+        profiles=_ALL, dim=512,
+        score_floor=0.7, match_threshold=0.5, input_edge=640, min_face_px=32,
+        note="Finds the faces of a photo and gives each one a 512-value vector (§4.1, §8.1): "
+             "SCRFD-10G detection and ArcFace R50 recognition, ONNX converted to torch. The "
+             "InsightFace weights are NON-COMMERCIAL, personal use only. The cost is an ESTIMATE: "
+             "182 MiB of files + runtime. Measure it and pin it with "
+             "IVMS777_MODEL_COST_MB {\"faces\": ...}.",
+    ),
+)
+
 # Per-profile defaults. These reproduce `config.PROFILE_DEFAULTS` exactly: an
 # untouched install must behave as it did before slots existed.
 DEFAULTS: dict[str, dict[str, str]] = {
@@ -584,6 +606,11 @@ def speaker_embedder_for(profile: str) -> ModelEntry | None:
     for entry in SPEAKER_EMBEDDERS:
         if profile in entry.profiles:
             return entry
+    return None
+
+
+def face_model_for(profile: str) -> ModelEntry | None:
+    """The `FACE_MODELS` entry offered on `profile`, or None (§4.1)."""
     return None
 
 

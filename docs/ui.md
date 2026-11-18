@@ -121,7 +121,10 @@ and Esc/backdrop/× just closes it.
   with scores and source badges (the "AI data"), the full EXIF panel — including GPS
   **coordinates**, which live here as a technical detail and nowhere else — every
   local path the file arrived from with the wasted-space total when there is more than
-  one, and a "similar photos" strip. The photo itself and everything above render on
+  one, a **People** line, and a "similar photos" strip. The People line names the
+  people recognised in the photo (its faces whose group is attached to a person, design
+  §6), each name once, owner-scoped, as **plain text** — a link to a person would open a
+  leaf from a leaf (design §13.1). With no named person the line is absent. The photo itself and everything above render on
   first paint; the similar strip is the one expensive part (a full-library scan), so
   it loads **asynchronously** — the page ships a placeholder that fires
   `GET /photo/{id}/similar` on load and swaps in the finished strip (§9.2) — so opening
@@ -218,6 +221,13 @@ and Esc/backdrop/× just closes it.
   - When the catalog lists no voice-copy model for this device, the head reads "Voice
     copy is not available on this device." and has no New voice. The cards still
     open, for rename and delete.
+  - **Faces to name** follows the cards: every face group of the owner with no person
+    and at least the minimum number of faces (2 by default, env-overridable in
+    `config.py`; one stranger's face never floods the list), newest first. Each group
+    shows up to four face crops (`<img src="/faces/crop/{face_id}">`) and "N faces", and
+    is a plain `<a href="/faces/{id}">` (a full navigation, never boosted — the one
+    grid→leaf push). With no such group the section is absent. It shows on every
+    profile, jetson included.
   - The old page moved: `GET /organize/voices` answers **308** with `Location:
     /voices`, and every other path under `/organize/voices/` is gone. The routes, with
     the status codes, the disk guard and the drain wake-up they had:
@@ -243,6 +253,12 @@ and Esc/backdrop/× just closes it.
     they answer 404 or 405, as every unknown path does. The bake routes were removed:
     `POST /voices/{id}/bake` and `POST /voices/bake/cancel` answer 404, and
     `GET /voices/bake` answers 422 (it reads "bake" as a voice id).
+  - The face routes (`web/faces_api.py`): `GET /faces/{id}` (the group leaf),
+    `POST /faces/{id}/assign` (form `person_id`), `POST /faces/{id}/person` (form
+    `name`: create a person for the group), `POST /faces/{id}/unassign`,
+    `POST /faces/face/{face_id}/release` (Not this person) and
+    `GET /faces/crop/{face_id}` (a JPEG). The literal paths come before
+    `/faces/{id}`. A foreign or unknown id is a 404 on every route.
 - `/voices/{id}` — one voice, the **leaf** of the Voices grid (design §13.1).
   - **Header:** "Voices › <name>" — "Voices" is a link that closes the page (below) —
     a **⋯** menu with **Rename…** (the rules of New voice) and **Delete voice…**, and a
@@ -271,8 +287,8 @@ and Esc/backdrop/× just closes it.
     stay, and the other voices are heard as before. The job runs in `app`, so a return to
     the page shows it again. The page polls while its voice is heard or queued, and when
     that work ends it refreshes the body (the state lines and the Test tab).
-  - **Tabs:** **Recordings** (the default) and **Test**. The URL carries
-    `?tab=recordings|test`; an unknown value, `model` too, shows Recordings. A switch
+  - **Tabs:** **Recordings** (the default), **Test** and **Faces**. The URL carries
+    `?tab=recordings|test|faces`; an unknown value, `model` too, shows Recordings. A switch
     replaces the URL (`history.replaceState`), so Back never walks through tabs and a
     reload keeps the tab. A switch keeps the recorder, the typed test text and every
     selection.
@@ -429,6 +445,30 @@ and Esc/backdrop/× just closes it.
     Close asks the same. ⚙ Settings is an overlay and asks nothing. On leaving, the
     page stops the microphone and its timers; on a return (Back, Forward, or the htmx
     history restore) it reconnects the deleting poll and the test from the server.
+- `/faces/{id}` — one face group, a **leaf** of the Voices grid (design §13.1).
+  - **Header:** "Voices › Faces to name", or "Voices › <person>" when the group is
+    attached, and **×**. Then every face of the group as a crop (cut from the photo's
+    1600 px detail thumbnail by the face box, on request; no file is stored), newest
+    photo first, each with **Not this person**.
+  - **Attach to a person:** a select of the owner's people (the saved voices, by name)
+    and **Attach**. **New person:** a name (the New voice rules: 1-80 characters,
+    unique per owner, case-insensitive) and **Create**; a taken or empty name is
+    refused with its reason and nothing is written. Both work on every profile: a
+    person needs no voice copy. An attached group leaves "Faces to name", and every
+    face that later joins it is that person with no action by the owner.
+  - **Not this person** moves that one face out to a new group of its own and pins it,
+    so grouping never moves it again. A group left with no face closes to the grid.
+  - Every action is a POST answered in place, or by `location.replace`; none pushes
+    history.
+  - **Close** (×, the "Voices" link, Esc) goes up to the grid: `history.back()` when
+    the page carries `data-from-grid` (set at mount when `document.referrer` has the
+    same origin and the path `/voices`), else `location.replace("/voices")`. The page
+    holds no level of its own, so Esc closes at once.
+- `/voices/{id}` **Faces** tab — the face groups attached to this person, in place,
+  each with up to four crops, "N faces" and **Remove from this person** (the group
+  returns to "Faces to name"). No group links to `/faces/{id}`: that would be a leaf
+  inside a leaf. With none it reads "No faces yet.". Deleting the person returns all
+  their groups to "Faces to name" (design §6).
 - `/feed/{key}` — the **memory film**: one memory played fullscreen as a directed
   short (design §11.1). Its controls sit in **one header** at the top: an **action
   row** — the language selector, ↓ Download (ready film only) and the × close — that
@@ -655,5 +695,6 @@ The nav order is **Upload → Library → Chat → Organize → Voices**: bring 
 browse and search them, ask about them to understand the collection, then — once you
 know what you have — group and reorganize them. Organize is the final stage of the
 process (it feeds stage 2, the on-disk reorg); chat is a review-and-understand tool, so
-it sits before it. Voices are the people who narrate the films, a resource of their
-own, so they sit last.
+it sits before it. Voices are the people — who narrates the films and whose faces are
+in the photos — a resource of their own, so they sit last. The page keeps the name
+Voices and its routes.

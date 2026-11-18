@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 # others — queued per photo, counted, reprocessable — but it is DRAINED IN ONE
 # BATCH (pipeline group 2c) rather than photo by photo, because the text embedder
 # loads once and embeds 50 captions in a single call.
-STAGES: tuple[str, ...] = ("thumbnail", "embed", "taxonomy", "caption", "caption_embed")
+STAGES: tuple[str, ...] = ("thumbnail", "embed", "taxonomy", "caption", "caption_embed", "faces")
 MAX_ATTEMPTS = 3
 STATUSES = ("pending", "running", "done", "failed")
 

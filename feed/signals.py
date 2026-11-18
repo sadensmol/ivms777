@@ -42,6 +42,7 @@ class ShotSignal:
     vector: list[float] | None
     camera: str | None = None
     facets: dict[str, str] | None = None   # EXIF, as `FACETS` names them
+    people: tuple[str, ...] = ()           # names of the people recognised in the photo (§11.1)
 
     def brief(self) -> str:
         """One line describing this photograph to the conductor.

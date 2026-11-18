@@ -126,6 +126,7 @@ from search.retriever import Query, candidates
 from search.semantic import similar_photos, similarity_breakdown
 from search.tags import parse_tag_filters, tag_sidebar, tag_where
 from web.deps import AppContext, build_context
+from web.faces_api import register as register_faces_api
 from web.upload_api import register as register_upload_api
 from web.voices_api import language_name
 from web.voices_api import register as register_voices_api
@@ -391,6 +392,7 @@ def create_app(settings: Settings) -> FastAPI:
 
     register_upload_api(app, context, drain_now)
     register_voices_api(app, context, templates)
+    register_faces_api(app, context, templates)
 
     def _filter_where(ctx: AppContext, params: dict[str, str]) -> tuple[str, list]:
         # EXIF facets AND model tags AND date range AND the optional dupes flag.

@@ -165,6 +165,13 @@ class Settings(BaseSettings):
     # nomic text embedder can be dropped from the resident set entirely (§8.1).
     similar_use_captions: bool = True
 
+    # Face groups (§6, §8). The lowest cosine similarity at which a new face joins a
+    # group; None means the face model's declared `match_threshold` (`models/catalog.py`).
+    face_match_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    # The fewest faces a group with no person needs to be listed under "Faces to name":
+    # single faces of strangers would flood the list (§13).
+    face_group_min_faces: int = Field(default=2, ge=1)
+
     # Env override for the `image_embed` slot — a CATALOG KEY (`siglip2-so400m-384`),
     # never a bare HF repo id, exactly like `caption_model`/`planner_model` (§4.1).
     # `None` means "use the profile default". It used to default to the HF id
@@ -345,6 +352,19 @@ class Settings(BaseSettings):
         from inference.remote_embedder import RemoteEmbedder
 
         return RemoteEmbedder(self.build_models_client(), key), key
+
+    def face_threshold(self) -> float:
+        """The match threshold the `faces` stage clusters with: the env override, else
+        the face model of this profile declares it (§4.1). 0.0 when the profile offers
+        no face model, so no `faces` stage runs to read it."""
+        if self.face_match_threshold is not None:
+            return self.face_match_threshold
+        from models.catalog import face_model_for
+
+        entry = face_model_for(self.profile)
+        if entry is None or entry.match_threshold is None:
+            return 0.0
+        return entry.match_threshold
 
     def caption_embed_model_key(self, conn=None) -> str:
         """The name to embed caption text under — the catalog key the `text_embed`

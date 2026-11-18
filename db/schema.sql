@@ -407,3 +407,31 @@ CREATE TABLE IF NOT EXISTS voice_file_deletions (
   UNIQUE(storage_key, deletion_id)
 );
 CREATE INDEX IF NOT EXISTS voice_file_deletions_by_deletion ON voice_file_deletions(deletion_id);
+-- A face group (design §6): faces the worker judged to be one person. person_id is the saved voice the owner attached it to;
+-- NULL = not named yet ("Faces to name"). Deleting the person returns the group to unnamed.
+CREATE TABLE IF NOT EXISTS face_groups (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,   -- never reused: a stale tab never acts on a new group
+  owner_id   INTEGER NOT NULL,
+  person_id  INTEGER REFERENCES saved_voices(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT
+);
+CREATE INDEX IF NOT EXISTS face_groups_by_owner_person ON face_groups(owner_id, person_id);
+-- One face found in a photo by the `faces` stage. The box is in 0..1 of the upright image; vector is the L2-normalised
+-- float32 face embedding. pinned = the owner moved it by hand, so clustering never moves it again.
+CREATE TABLE IF NOT EXISTS faces (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  photo_id   INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+  group_id   INTEGER REFERENCES face_groups(id) ON DELETE SET NULL,
+  box_x      REAL NOT NULL,
+  box_y      REAL NOT NULL,
+  box_w      REAL NOT NULL,
+  box_h      REAL NOT NULL,
+  score      REAL NOT NULL,
+  vector     BLOB NOT NULL,
+  model      TEXT NOT NULL,                       -- '<face model key>@<revision>'
+  pinned     INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS faces_photo_id_idx ON faces(photo_id);
+CREATE INDEX IF NOT EXISTS faces_group_id_idx ON faces(group_id);

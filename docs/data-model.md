@@ -84,7 +84,7 @@ CREATE INDEX photo_tags_tag ON photo_tags(tag_id);
 
 jobs (
   photo_id   INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
-  stage      TEXT NOT NULL,           -- thumbnail | embed | taxonomy | caption | caption_embed
+  stage      TEXT NOT NULL,           -- thumbnail | embed | taxonomy | caption | caption_embed | faces
   status     TEXT NOT NULL,           -- pending | running | done | failed
   attempts   INTEGER NOT NULL DEFAULT 0,
   error      TEXT,
@@ -381,7 +381,41 @@ voice_file_deletions (
   UNIQUE(storage_key, deletion_id)
 );
 CREATE INDEX voice_file_deletions_by_deletion ON voice_file_deletions(deletion_id);
+
+-- A face group (design §6): faces the worker judged to be one person. A person IS a saved_voices row.
+-- person_id NULL = not named yet ("Faces to name", §13). Deleting the person returns the group to unnamed.
+-- The folder-deletion drain deletes a group left with no face (§3.2c).
+face_groups (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,                       -- never reused
+  owner_id   INTEGER NOT NULL,
+  person_id  INTEGER REFERENCES saved_voices(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT
+);
+CREATE INDEX face_groups_by_owner_person ON face_groups(owner_id, person_id);
+
+-- One face found in a photo by the `faces` stage (design §8). A re-run of the stage replaces the photo's rows.
+faces (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,                       -- never reused
+  photo_id   INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+  group_id   INTEGER REFERENCES face_groups(id) ON DELETE SET NULL,
+  box_x      REAL NOT NULL,                                           -- the box, in 0..1 of the upright image
+  box_y      REAL NOT NULL,
+  box_w      REAL NOT NULL,
+  box_h      REAL NOT NULL,
+  score      REAL NOT NULL,                                           -- the detector score
+  vector     BLOB NOT NULL,                                           -- float32, L2-normalised, the entry's dim (512)
+  model      TEXT NOT NULL,                                           -- '<face model key>@<revision>'
+  pinned     INTEGER NOT NULL DEFAULT 0,                              -- 1 = moved by the owner; grouping never moves it
+  created_at TEXT NOT NULL
+);
+CREATE INDEX faces_photo_id_idx ON faces(photo_id);
+CREATE INDEX faces_group_id_idx ON faces(group_id);
 ```
+
+The schema version is 15: version 15 adds `face_groups` and `faces` and changes no
+existing table. A face stores no file; a crop is cut from the detail thumbnail on
+request (design §13).
 
 Plus an FTS5 virtual table `photo_fts(caption, tags_text)`, its rows keyed by
 `photos.id` and refreshed by the taxonomy and caption stages. Because `tags_text`

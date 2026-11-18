@@ -29,7 +29,8 @@ API.
 
 ## 2. Non-goals (v1)
 
-- Face detection and person clustering. Deferred to v2.
+- Search, filters and chat answers by person. Faces are found, grouped and named
+  (§4.1, §8, §13), but no query reads them yet; see `docs/roadmap.md`.
 - Authentication, signup, and per-user quotas. Deferred to v02; see section 3.2.
 - Editing or rating photos in the cloud UI. The only thing that ever writes to
   your disk is `ivms777-sync`, and only on explicit confirmation.
@@ -297,9 +298,10 @@ folder on the user's machine is a *source* and is never read, moved, or deleted 
 the app (§3.2b) — deletion only removes the library's uploaded copies and their
 derived state. It removes: the folder's `uploads` rows, every photo sourced only
 from that folder, and *all* of each deleted photo's metadata — `photo_vec`,
-`caption_vec`, tags, facets, FTS row, jobs, group memberships, thumbnails, and the
-stored original. A photo whose identical bytes still belong to another folder is
-kept; only that folder's `photo_sources` path is dropped.
+`caption_vec`, tags, facets, FTS row, jobs, group memberships, faces, thumbnails,
+and the stored original. A photo whose identical bytes still belong to another folder is
+kept with its faces; only that folder's `photo_sources` path is dropped. A face group
+(§6) left with no face after the cascade is deleted in the same drain.
 
 A memory (§11) whose photos all lived in the deleted folder is left with no
 `group_photos`; the cascade prunes that now-empty `groups(kind='memory')` row and
@@ -470,6 +472,39 @@ own, `catalog.SPEAKER_EMBEDDERS`:
   never calls it. Only the speaker-similarity step of a test (§11.1) and
   `scripts/voice_bake_check.py` ask for it.
 
+**The face model.** The `faces` ingest stage (§8) finds the faces of each photo and
+describes each one with a vector, so the worker can group the faces of one person and
+the owner can name the group (§6, §13). So the catalog declares one face model beside
+the slots, in a tuple of its own, `catalog.FACE_MODELS`:
+
+- `buffalo-l` — InsightFace `buffalo_l` from `immich-app/buffalo_l` pinned to the Hub
+  commit `d097159…` (the ONNX export Immich uses for the same feature): the SCRFD-10G
+  detector (`detection/model.onnx`, a box, a score and 5 landmarks per face) and the
+  ArcFace R50 recogniser (`recognition/model.onnx`, a 512-value vector of a face aligned
+  to 112×112 by its 5 landmarks). `dim` 512, `profiles=("mac", "jetson", "cloud")`,
+  `size_mb` 182 for the two ONNX files, `cost_mb` 1000 with `cost_measured=False` — an
+  **estimate** (`docs/models.md`).
+- **The weights are non-commercial.** InsightFace licenses its model zoo for
+  non-commercial research only. The app is a private family library, so it is allowed
+  here, like MusicGen's CC-BY-NC weights: never ship it in a commercial build. The
+  catalog `note` says the same.
+- **It runs on the GPU through torch, never ONNX Runtime.** The child converts both
+  ONNX graphs to torch with `onnx2torch` at load and runs them on `mps` or `cuda`; a CPU
+  device is a load error, and there is no CPU fallback (§3.1). The models service keeps
+  one GPU runtime, torch.
+- **Its use is declared, not chosen at the call site** (CLAUDE.md § "A model's own
+  metadata is DECLARED"): `score_floor` 0.7 (a lower detection score is dropped),
+  `match_threshold` 0.5 (the lowest cosine similarity that joins a face to a group,
+  §8), `input_edge` 640 (the long edge the worker shrinks a photo to before it sends
+  it) and `min_face_px` 32 (a smaller face side is dropped). The floor and the
+  threshold are Immich's public defaults for this model, not tuned on this library;
+  `config.py` lets an env value override the threshold and the minimum group size of
+  "Faces to name" (2, §13).
+- It is **no slot and no user choice**: `SLOTS`, `DEFAULTS`, `CATALOG` and the settings
+  popup do not list it. `catalog.face_model_for(profile)` names the entry offered on a
+  profile, else `None`.
+- Only the `faces` stage asks for it, through `POST /faces/detect` (§5.1).
+
 `caption` and `planner` are **separately selectable but share one `llama-server`
 child** — one process, one port. If they resolve to different GGUFs the child
 restarts when the role changes, which is exactly the cost shape the existing
@@ -580,9 +615,9 @@ flowchart TB
     end
 
     subgraph gpu["The GPU box · docker compose (jetson/cloud) · host processes (mac)"]
-        app["app · FastAPI + Jinja + HTMX<br/>UI · read queries · upload receipt · saved-voice receipt · hearing the words of a take · voice tests · /api/plan (stage-2 plan document)<br/>NO models, NO torch — a thin client of the models service"]
-        worker["worker · ingest pipeline (primary writer)<br/>facets · thumbs · taxonomy · caption · memories · feed audio · deletions (folders · saved voices)<br/>NO models, NO torch — a thin client of the models service"]
-        models["models · THE ONE INFERENCE GATEWAY (§5.1)<br/>the only process that imports torch/transformers AND the only client of the inference server<br/>hosts the image/text embedder in KILLABLE TorchWorker children (parent imports no torch) on the GPU — mps (mac) / cuda (jetson, cloud), NEVER cpu (§3.1) · memory governor swaps embedder↔LLM under budget (§8.1)<br/>owns the model slots + downloads (§4.1)<br/>trains a saved voice's LoRA adapter in a killable voice_train child (§8.1)<br/>hears the words of a saved voice's takes in a killable asr child (§8.1)<br/>measures speaker embeddings of takes and tests in a killable speaker_embed child (§8.1)<br/>HTTP: /embed/image · /embed/text · /embed/spec · /tag · /caption · /speak · /music · /plan · /chat · /resources · /models/* · /voice/bakes · /voice/transcribe · /voice/embed"]
+        app["app · FastAPI + Jinja + HTMX<br/>UI · read queries · upload receipt · saved-voice receipt · naming face groups · face crops from thumbnails · hearing the words of a take · voice tests · /api/plan (stage-2 plan document)<br/>NO models, NO torch — a thin client of the models service"]
+        worker["worker · ingest pipeline (primary writer)<br/>facets · thumbs · taxonomy · caption · faces + face groups · memories · feed audio · deletions (folders · saved voices)<br/>NO models, NO torch — a thin client of the models service"]
+        models["models · THE ONE INFERENCE GATEWAY (§5.1)<br/>the only process that imports torch/transformers AND the only client of the inference server<br/>hosts the image/text embedder in KILLABLE TorchWorker children (parent imports no torch) on the GPU — mps (mac) / cuda (jetson, cloud), NEVER cpu (§3.1) · memory governor swaps embedder↔LLM under budget (§8.1)<br/>owns the model slots + downloads (§4.1)<br/>trains a saved voice's LoRA adapter in a killable voice_train child (§8.1)<br/>hears the words of a saved voice's takes in a killable asr child (§8.1)<br/>measures speaker embeddings of takes and tests in a killable speaker_embed child (§8.1)<br/>finds faces and their vectors in a killable faces child (§8.1)<br/>HTTP: /embed/image · /embed/text · /embed/spec · /tag · /caption · /speak · /music · /plan · /chat · /resources · /models/* · /voice/bakes · /voice/transcribe · /voice/embed · /faces/detect"]
         infer["inference · llama.cpp llama-server (mac/jetson) | vLLM (cloud)<br/>ONE gemma4-E2B GGUF — text (planner/chat) AND vision (caption), on the GPU<br/>reached ONLY by the models service · (host on mac, container on jetson/cloud)"]
         db[("SQLite WAL<br/>sqlite-vec + FTS5 · named volume")]
         store[("Storage<br/>originals + thumbnails + feed audio<br/>saved-voice examples + voice models + voice tests (data_dir/voices)")]
@@ -609,7 +644,7 @@ flowchart TB
     bakecheck -->|"/voice/bakes · /speak · /voice/embed (HTTP)"| models
     bakecheck -->|"read-only"| db
     bakecheck -->|"read takes + voice models"| store
-    worker -->|"ALL inference: embed · zero-shot tags · caption (HTTP)"| models
+    worker -->|"ALL inference: embed · zero-shot tags · caption · /faces/detect (HTTP)"| models
     models -->|"gemma4-E2B: planner/chat + caption/vision (OpenAI /v1)"| infer
     models -->|"fetch weights on demand (HF / GGUF) → model cache volume"| hf[("Hugging Face<br/>weights, fetched once per model")]
 
@@ -621,7 +656,8 @@ flowchart TB
 `worker` owns the ingest pipeline and is the primary writer. Both open the same
 SQLite file in WAL mode with a busy timeout — SQLite permits one writer at a
 time, and `app`'s writes are small and short (recording a received upload,
-accepting a group, editing vocabulary, saving a voice example or a voice test), so contention stays
+accepting a group, editing vocabulary, saving a voice example or a voice test, naming a
+face group), so contention stays
 negligible at this scale. If public traffic ever makes that false, the fix is Postgres, and the
 repository layer is the only thing that changes.
 
@@ -661,8 +697,9 @@ the inference server (`llama-server` / vLLM). `app`, `worker`, and the CLI hold
 the 8 GB unified-memory Jetson a duplicated SigLIP plus two torch CUDA contexts is
 exactly what exhausted memory.
 
-**The service owns three supervised children, and its own process holds no model.**
-gemma is the `llama-server` child (§3.1); SigLIP and nomic are one `TorchWorker`
+**The service owns supervised children, and its own process holds no model.**
+gemma is the `llama-server` child (§3.1); SigLIP, nomic and every other model (voice,
+music, training, speech recognition, speaker embedding, faces) are one `TorchWorker`
 child each (§8.1, `modelsvc/torch_process.py`). The FastAPI parent imports **no**
 torch at all — it starts, calls, and **kills** children, because ending the process
 is the only way a CUDA context's memory comes back. This is the one-model-process
@@ -921,6 +958,26 @@ HTTP.
     values.
   - The call runs at `Priority.BATCH`, label "measuring a voice": a measure never
     preempts a search or a chat turn.
+- **`POST /faces/detect` — the faces of one photo.** The `faces` ingest stage (§8)
+  sends one photo and gets back every face in it. The service runs
+  `catalog.FACE_MODELS` (§4.1) in the `faces` child (§8.1) and holds no database: **the
+  `worker` stores the faces and does the grouping**.
+  - **The request:** `{image}` — base64 of one upright image (EXIF rotation already
+    applied by the worker), its long edge shrunk to the entry's `input_edge`. **The
+    reply (200):** `{faces: [{box, score, vector}], model, revision, elapsed_s}`. `box`
+    is `[x, y, w, h]`, each in 0..1 of the image; `score` is the detector score;
+    `vector` is the L2-normalised 512-value face embedding. A face under the entry's
+    `score_floor`, or with a side under `min_face_px`, is not in the reply. A photo with
+    no face answers an empty `faces`.
+  - **422** with the reason for bad base64 or an image the child cannot decode.
+  - **503** "finding faces is not offered on this device yet" when the service has no
+    `faces` unit (no `FACE_MODELS` entry on this profile).
+  - **500** with the model's own message for a load or model error, for example
+    "buffalo_l weights for <revision> are not on disk: run `make models`". After the
+    call the reply's `revision` must equal the entry's pinned commit, else a 500
+    (`faces identity mismatch`), and every vector must hold the entry's `dim` values.
+  - The call runs at `Priority.BATCH`, label "finding faces": it never preempts a
+    search or a chat turn. It is not in the voice gate: a bake does not stop it.
 - `POST /music` — `{sections | prompt, seconds, seed, temperature, guidance}` →
   `{audio (base64 WAV), sample_rate, model, segments}`: the whole SCORE for a memory
   film in one call (§11.1). `sections` is `[{brief, seconds}]` in running order, and
@@ -1114,6 +1171,21 @@ The library is one SQLite file. **The full DDL — every table and index, the
 - **`voice_deletions` / `voice_file_deletions`** — the outbox of saved-voice deletion
   (below): one owner-scoped, idempotent intent per voice or example, and one row per
   file in `data_dir/voices` that may have lost its last row, or may never get one.
+- **`face_groups` / `faces`** — the faces the `faces` stage found (§8) and the groups
+  it put them in. **A person IS a `saved_voices` row**: one list of people, the same
+  list a voice belongs to, and a face group attaches to it. There is no second person
+  table. A `face_groups` row is one owner's group, with `person_id` = the saved voice
+  it is attached to, NULL while it waits under "Faces to name" (§13).
+  `person_id` is `ON DELETE SET NULL`, so deleting a person returns their groups to
+  "Faces to name". A `faces` row is one face of one photo: the box in 0..1 of the
+  upright image (`box_x`, `box_y`, `box_w`, `box_h`), the detector `score`, the
+  L2-normalised float32 `vector`, `model` = `<key>@<revision>`, and `pinned` = the
+  owner moved it by hand ("Not this person"), so grouping never moves it again.
+  `photo_id` is `ON DELETE CASCADE` (a deleted photo takes its faces with it) and
+  `group_id` is `ON DELETE SET NULL`. Both ids use `AUTOINCREMENT`, so a stale page
+  never acts on a new group or face. A face group with no face is deleted by the
+  folder-deletion drain (§3.2c). No file is stored for a face: a crop is cut from the
+  detail thumbnail when a page asks for it (§13).
 - **`data_dir/voices`** — the saved-voice files: example WAVs, conditioning blobs,
   voice model files and test WAVs, content-addressed (`storage/keys.py`). It is a store of its own, apart from the film
   audio in `data_dir/audio`, so the film's orphan-audio prune never sees it.
@@ -1241,7 +1313,7 @@ in [`docs/taxonomy.md`](taxonomy.md#vocabulary-mining).
 
 Every photo flows through a **resumable, per-stage job queue** (`jobs`, §6):
 `receive` → `facets` → `thumbnail` → `embed` → `taxonomy` → `caption` →
-`caption_embed`. `receive`
+`caption_embed` → `faces`. `receive`
 runs synchronously in `app`; everything after is drained by the `worker`, and
 killing/restarting the container resumes exactly where it stopped. **The exact
 per-stage mechanics, reprocess endpoints, and failure handling are in
@@ -1257,6 +1329,24 @@ The design decisions that matter:
   `caption_embed` — queued and counted per photo like every other stage, so it shows
   its own progress row, but **drained in one batch** (the text embedder loads once
   and embeds up to 50 captions per call), never interleaved per photo.
+- **`faces` is the last stage**, drained after `caption_embed` in a guarded group of
+  its own, so a Reprocess of `faces` re-runs only faces, and on jetson the `faces`
+  unit is never needed beside the caption model (§8.1). Every photo gets a `faces`
+  job (a self-healing backfill, like `embed`). The handler opens the original upright
+  (EXIF rotation applied), shrinks its long edge to the entry's `input_edge`, calls
+  `POST /faces/detect` (§5.1), and in one transaction **replaces** that photo's faces.
+  A photo with no face completes with no rows. A `models` service outage leaves the
+  job pending and never fails the pass. A re-run replaces the photo's faces, so a
+  "Not this person" fix on that photo is lost; Reprocess is a manual action.
+- **Grouping is nearest group by mean vector, one threshold.** Each new face joins
+  the owner's group whose mean face vector has the highest cosine similarity with it,
+  when that similarity reaches the entry's `match_threshold` (0.5, §4.1); else it
+  starts a new group. It runs in the `worker` with numpy, incrementally per face, so
+  it needs no model and never moves a face already grouped. A pinned face never moves.
+  A face that joins a group attached to a person is that person at once, with no
+  action by the owner. The result depends on upload order, so one person can end up
+  in two groups; attaching both groups to the same person shows one name. A full
+  re-cluster (DBSCAN/HDBSCAN) is not used: it would move faces the owner reviewed.
 - **Degrade, never crash.** A drain pass runs the GPU-free stages (thumbnail, place
   facets, deletions) first, then the inference stages; if the `models` service is
   down the inference group is skipped and retried next pass, so photos still appear
@@ -1414,6 +1504,28 @@ float32 weights plus an unmeasured allowance for activations and gradients), and
 - **Its cost is an estimate.** `cost_mb` 1000 with `cost_measured=False`: 85 MiB of
   files plus an unmeasured allowance for the torch runtime and the activations of a
   43 s clip (`docs/models.md`). `IVMS777_MODEL_COST_MB='{"speaker_embed": <measured>}'`
+  overrides it.
+
+**The `faces` unit** hosts the face child (`embedding.face_model:FaceModel`, the
+`catalog.FACE_MODELS` entry of §4.1, `POST /faces/detect` in §5.1). It is no slot and
+no catalog choice. The rules:
+
+- **Registered once.** `SlotManager` registers it once, when the catalog offers a
+  face model on the profile (`face_model_for`, §4.1; mac, jetson and cloud), as it
+  registers `speaker_embed`: a registration first unloads its unit, so a later slot
+  switch never ends a detect call. It holds ONE child with the detector and the
+  recogniser, converted from ONNX to torch with `onnx2torch` and loaded on the GPU
+  (`mps` or `cuda`; a CPU device is a load error, and there is no CPU fallback) from
+  the pinned snapshot on disk only. The module imports no torch, onnx or `onnx2torch`
+  at module scope; only the child does.
+- **An ordinary governor unit.** It is not in the voice gate and holds no lease. On
+  jetson it swaps against gemma like SigLIP does; the `faces` stage drains after the
+  caption stage, so it never needs the caption model at the same time. A call runs at
+  `Priority.BATCH`.
+- **A hot reload ends it**, like any child.
+- **Its cost is an estimate.** `cost_mb` 1000 with `cost_measured=False`: 182 MiB of
+  ONNX files plus an unmeasured allowance for the torch runtime and the activations of
+  a 640 px image (`docs/models.md`). `IVMS777_MODEL_COST_MB='{"faces": <measured>}'`
   overrides it.
 
 **Residency is a claim about the world, not a note to self.** gemma lives in a
@@ -2078,7 +2190,11 @@ previous film playable.
 
    - every photograph's **full signal set** (`ShotSignal.brief()`): the rich
      description, all ten taxonomy dimensions, place, time, camera, aperture, ISO,
-     orientation — so it can answer *which picture is this sentence about?*;
+     orientation, and `people=Ann, Bob` — the names of the people recognised in it
+     (its faces whose group is attached to a person, §6, each name once) — so it can
+     answer *which picture is this sentence about?*. A shot with no named person has
+     no `people=` part, so its brief is the same as before. The story pass reads the
+     same brief, so the story can name the people in a photograph;
    - **where every narration sentence starts and ends**, to the millisecond;
    - **where every musical downbeat falls** (`feed/beats.py`), plus the tempo;
    - the **effect library** (`feed/effects.py`), each entry describing what it looks
@@ -3189,7 +3305,9 @@ that the five top-level links swap without re-rendering the nav. The routes:
   facets, apply-on-change), sort, search box, and parsed-filter chips (§9).
 - **`/photo/{id}`** — the one **leaf** view: the photo shown inside the collection it
   was opened from (`ctx`), its AI title/description, tags, full EXIF (incl. the GPS
-  coordinates, which live only here), source paths, and an async "similar" strip with
+  coordinates, which live only here), source paths, the **People** line — the names of
+  the people recognised in it (§6), each once, as plain text, never a link (a link to a
+  person would open a leaf from a leaf, §13.1) — and an async "similar" strip with
   why-it-matched reasons (§9). All drill-down navigation obeys §13.1.
 - **`/organize`** — a principle dropdown (date grain / camera / place / memories) over
   album cards; memories has the background Rebuild control; the last-opened view is
@@ -3213,15 +3331,30 @@ that the five top-level links swap without re-rendering the nav. The routes:
   with no link, and the grid polls while a card shows "deleting…" (§6). With no voice, the grid reads "No voices yet." Create
   opens the new voice at once. The grid shows "Voice copy is not available on this device." and no New voice
   when the catalog lists no cloning entry for the profile (§4.1); existing cards still
-  open, for rename and delete. It is a top-level grid (§13.1). The old address
-  `/organize/voices` answers 308 to `/voices`.
+  open, for rename and delete. A voice is a person: the same list holds the people
+  whose faces are named (§6). Under the cards, **Faces to name** lists every face group
+  of the owner with no person and at least the minimum face count (2, §4.1): up to four
+  face crops and the number of faces, each a plain link to the group leaf
+  `/faces/{id}`; it is hidden when no group waits. It is a top-level grid (§13.1). The
+  old address `/organize/voices` answers 308 to `/voices`.
+- **`/faces/{id}`** — one face group, a leaf of the Voices grid (§13.1). The header
+  reads "Voices › Faces to name" (or "Voices › <person>" for an attached group) and ×,
+  then every face of the group as a crop. The owner **attaches** the group to an
+  existing person (a select of the saved voices), or types a name to **create a new
+  person** for it — the New voice rules (1-80 characters, unique per owner,
+  case-insensitive; a taken name is refused with its reason), on every profile, jetson
+  included, because a person needs no voice copy. An attached group leaves "Faces to
+  name". **Not this person** on a face moves it out to a new group of its own and pins
+  it, so it never rejoins a group automatically. A face crop
+  (`/faces/crop/{face_id}`) is cut from the detail thumbnail on request; another
+  owner's face answers 404.
 - **`/voices/{id}`** — one voice, the leaf of the Voices grid (§13.1). The header reads
   "Voices › <name>", a **⋯** menu (Rename…, Delete voice…) and ×, then the state of the
   voice on every tab (§11.1): per language the take films and tests speak from, a newer
   take that waits for its words, or why the language is not ready; **Hear the words**
   when a take waits and no hearing job runs for this voice; and the hearing job (stage,
-  percent, Cancel; a failure with its reason and Close). Two tabs, **Recordings /
-  Test**, are state of the leaf: the URL carries `?tab` through `replaceState`, never a
+  percent, Cancel; a failure with its reason and Close). Three tabs, **Recordings /
+  Test / Faces**, are state of the leaf: the URL carries `?tab` through `replaceState`, never a
   history entry, and a switch keeps the recorder, the typed text and every selection;
   an old `?tab=model` opens Recordings. **Recordings** lists the recording kit per
   language (§11.1): each style with its instruction, each kit text with its takes, then
@@ -3246,7 +3379,9 @@ that the five top-level links swap without re-rendering the nav. The routes:
   ▶ Original when the test spoke the words of a take that still exists. With no ready
   language the tab says "Record a take first. Tests speak from the newest take of the
   language, once its words are heard." and Generate is disabled. No page picks a take
-  for films.
+  for films. **Faces** lists the face groups attached to this person in place, each
+  with its crops and count (no link: §13.1), and **Remove from this person**, which returns the group to "Faces to
+  name". With none it reads "No faces yet.".
 - **`/feed/{key}`** — the fullscreen **memory film**: one memory played as a directed
   short with camera moves, cuts, a colour grade, a generated soundtrack and optional
   narration (§11.1). A **Film language** selector (English / Русский, ✓ on each
@@ -3288,8 +3423,9 @@ that the five top-level links swap without re-rendering the nav. The routes:
 **Per-route detail — the resource-bar internals, the full `/photo` panel, the feed
 player's controls, throughput readouts — is in [`docs/ui.md`](ui.md).** The nav order **Upload → Library → Chat →
 Organize → Voices** follows the workflow: bring photos in, browse, understand, then
-reorganize — Organize feeds stage 2. Voices are the people who narrate the films, a
-resource of their own, so they sit last.
+reorganize — Organize feeds stage 2. Voices are the people — who narrates the films and
+whose faces are in the photos — a resource of their own, so they sit last. The page
+keeps the name Voices and its routes.
 
 ### 13.1 Navigation model (STRICT — every drill-down obeys this)
 
@@ -3313,6 +3449,12 @@ in front of bfcache and break the `[grid, leaf]` invariant.
    card is a plain link (the one push; Create opens the new voice the same way, with
    `location.assign`). Tabs (`replaceState`) and every action on the leaf (rename,
    add a take, delete, hear the words, test) push no history.
+   **A face group (`/faces/{id}`) is a leaf of the Voices grid too**, one level under
+   it: a "Faces to name" crop is a plain link (the one push). Every action on it
+   (attach, create a person, Not this person) is a POST answered in place or by
+   `location.replace`, never a push. A person's Faces tab shows the groups in place and
+   links to no group leaf (that would be leaf-to-leaf). The photo page's People line
+   holds no link either.
 
 2. **The leaf records its grid in a `ctx` URL parameter** — never guessed:
    - `ctx=library` (plus `q`/`f_`/`n_`/`t_`/`sort`/`date_*`) → the library grid.
@@ -3328,6 +3470,8 @@ in front of bfcache and break the `[grid, leaf]` invariant.
    - The **voice leaf** (`/voices/{id}`) needs no `ctx` either: it has one grid, and
      that grid has no filter, sort or search to carry. Close goes back only when the
      leaf was opened from the grid, else to `/voices`.
+   - The **face-group leaf** (`/faces/{id}`) needs no `ctx` either, for the same
+     reason: its grid is `/voices`.
    - `ctx=chat` → the grid is the **conversation**; close returns to `/chat`. A
      cited thumbnail carries this ctx, and it pages within the photos the current
      chat session cited (its evidence set), never the wider library.
@@ -3374,7 +3518,9 @@ in front of bfcache and break the `[grid, leaf]` invariant.
    the path `/voices`; the mark lives in the DOM, so a bfcache or htmx history restore
    keeps it and a deep link never has it — else `location.replace("/voices")`. It
    never reads `history.length`. Leaving through a nav link with a live recording or
-   an unsaved take asks first.
+   an unsaved take asks first. The face-group leaf closes the same way: × and Esc run
+   `history.back()` when it carries `data-from-grid` (same origin, path `/voices`),
+   else `location.replace("/voices")`. It holds no level of its own.
 
 5. **Prev/next move only *within* the current layer's order** (owner-scoped),
    carrying `ctx` forward — never leaking into a sibling album/memory or the wider
@@ -3408,6 +3554,9 @@ on:
   `modelsvc` — it is exempt from that gate and is never imported by `app`, `worker`
   or `feed`. `storage/wav.py` is the one piece both use, and it is torch-free
   precisely so it can be.
+  In `embedding`, `siglip.py`, `text_embedder.py` and `face_model.py` are
+  models-service-only too, and exempt from the gate file by file; the import gate
+  forbids `onnx` and `onnx2torch` beside torch everywhere else (§4.1).
 - **`ivms777_sync` is a standalone package** that imports nothing from `ivms777` —
   no database, no Pillow, no models, only the stdlib plus `httpx` — so it installs
   on a user's machine in seconds and runs anywhere Python does.
@@ -3435,7 +3584,7 @@ resumable indexing, HEIC/RAW handling, `sqlite-vec` portability, and
 ## 18. Future work
 
 The future-work backlog lives in [`docs/roadmap.md`](roadmap.md): auth/quotas
-(v02), face clustering, object storage, XMP export, a read-only MCP server, video
+(v02), search and chat by person, object storage, XMP export, a read-only MCP server, video
 support, an `ivms777-sync` watch mode, and a browser-side apply wherever the File
 System Access API is actually available (§3.2b) — plus the
 already-shipped retrieval-core and chat-degradation items kept there for history.

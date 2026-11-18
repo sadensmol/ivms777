@@ -218,6 +218,9 @@ class CompositeBackend:
                 "seconds": result["seconds"], "elapsed_s": result["elapsed_s"],
                 "pipeline": result["pipeline"]}
 
+    def detect_faces(self, image: bytes) -> dict:
+        return {"faces": [], "model": "", "revision": "", "elapsed_s": 0.0}
+
     @staticmethod
     def _log_asr_load(key: str, revision: str, before, after) -> None:
         # The net free-memory change of THIS request: the governor may have evicted
