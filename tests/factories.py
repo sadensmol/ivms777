@@ -1,6 +1,7 @@
 """Row builders for tests. Keep every INSERT INTO photos in here."""
 
 import sqlite3
+import struct
 from collections.abc import Sequence
 
 from storage.keys import content_key
@@ -56,3 +57,31 @@ def add_photo(
                 (new_id, upload_id, rel_path, rel_path.rsplit("/", 1)[-1]),
             )
     return new_id
+
+
+def add_face_group(
+    conn: sqlite3.Connection, *, owner_id: int = 1, person_id: int | None = None
+) -> int:
+    cursor = conn.execute(
+        "INSERT INTO face_groups(owner_id, person_id, created_at) VALUES (?, ?, ?)",
+        (owner_id, person_id, NOW),
+    )
+    return int(cursor.lastrowid)
+
+
+def add_face(
+    conn: sqlite3.Connection,
+    *,
+    photo_id: int,
+    group_id: int | None,
+    vector: Sequence[float],
+    box: tuple[float, float, float, float] = (0.25, 0.25, 0.5, 0.5),
+    pinned: bool = False,
+) -> int:
+    """Insert one face; `vector` is stored as float32 bytes, the `faces.vector` format."""
+    cursor = conn.execute(
+        "INSERT INTO faces(photo_id, group_id, box_x, box_y, box_w, box_h, score, vector,"
+        " model, pinned, created_at) VALUES (?, ?, ?, ?, ?, ?, 0.9, ?, 'buffalo-l@test', ?, ?)",
+        (photo_id, group_id, *box, struct.pack(f"<{len(vector)}f", *vector), int(pinned), NOW),
+    )
+    return int(cursor.lastrowid)

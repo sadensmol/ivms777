@@ -285,3 +285,35 @@ def test_a_loose_thumbnail_pages_within_the_expanded_set(client):
     body = client.get(f"/photo/{nearby}?ctx=similar:{base}:more").text
     assert "Similar to" in body
     assert f'class="photo-close" href="/photo/{base}?ctx=library"' in body
+
+
+
+def _named_faces(client, photo, names_per_face):
+    from feed.saved_voices import create_voice
+    from tests.factories import add_face, add_face_group
+
+    conn = client.app.state.context.conn
+    people = {}
+    for name in names_per_face:
+        if name not in people:
+            people[name] = create_voice(conn, 1, name).id
+        group = add_face_group(conn, person_id=people[name])
+        add_face(conn, photo_id=photo, group_id=group, vector=(1.0, 0.0))
+    return people
+
+
+def test_photo_page_names_the_recognised_people_as_plain_text(client):
+    photo = _first_id(client)
+    people = _named_faces(client, photo, ["Zebediah", "Quillon"])
+
+    body = client.get(f"/photo/{photo}").text
+
+    assert "Zebediah" in body and "Quillon" in body
+    assert all(f'href="/voices/{person}"' not in body for person in people.values())
+
+
+def test_photo_page_names_a_person_found_in_two_groups_once(client):
+    photo = _first_id(client)
+    _named_faces(client, photo, ["Zebediah", "Zebediah"])
+
+    assert client.get(f"/photo/{photo}").text.count("Zebediah") == 1

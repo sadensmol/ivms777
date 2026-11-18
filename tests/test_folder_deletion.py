@@ -105,3 +105,45 @@ def test_list_folders_reports_counts_and_deleting_flag(conn):
     by_name = {f["name"]: f for f in list_folders(conn, 1)}
     assert by_name["A"]["photos"] == 1 and by_name["A"]["deleting"] is True
     assert by_name["B"]["photos"] == 1 and by_name["B"]["deleting"] is False
+
+
+def test_delete_folder_removes_the_faces_and_the_groups_left_empty(conn, tmp_path):
+    from tests.factories import add_face, add_face_group
+
+    originals, derived = _storages(tmp_path)
+    up_trip, up_keep = add_upload(conn, root_label="Trip"), add_upload(conn, root_label="Keep")
+    gone = add_photo(conn, content_hash="e1" * 32, sources=("Trip/a.jpg",), upload_id=up_trip)
+    shared = add_photo(conn, content_hash="e2" * 32, sources=("Trip/b.jpg",), upload_id=up_trip)
+    conn.execute("INSERT INTO photo_sources(photo_id, upload_id, rel_path, filename)"
+                 " VALUES (?, ?, 'Keep/b.jpg', 'b.jpg')", (shared, up_keep))
+    emptied = add_face_group(conn)
+    survivor = add_face_group(conn)
+    lost = add_face(conn, photo_id=gone, group_id=emptied, vector=(1.0, 0.0))
+    add_face(conn, photo_id=gone, group_id=survivor, vector=(0.0, 1.0))
+    kept = add_face(conn, photo_id=shared, group_id=survivor, vector=(0.0, 1.0))
+
+    enqueue_folder_deletion(conn, 1, "Trip")
+    process_folder_deletions(conn, originals, derived, 1, 320, 1600)
+
+    faces = [r["id"] for r in conn.execute("SELECT id FROM faces ORDER BY id")]
+    groups = [r["id"] for r in conn.execute("SELECT id FROM face_groups ORDER BY id")]
+    assert lost not in faces
+    assert faces == [kept]
+    assert groups == [survivor]
+
+
+def test_pruning_deletes_only_the_owners_groups_with_no_face(conn):
+    from ingest.people import prune_empty_groups
+    from tests.factories import add_face, add_face_group
+
+    photo = add_photo(conn, content_hash="f1" * 32)
+    empty_mine = add_face_group(conn, owner_id=1)
+    full_mine = add_face_group(conn, owner_id=1)
+    empty_theirs = add_face_group(conn, owner_id=2)
+    add_face(conn, photo_id=photo, group_id=full_mine, vector=(1.0, 0.0))
+
+    assert prune_empty_groups(conn, 1) == 1
+
+    groups = {r["id"] for r in conn.execute("SELECT id FROM face_groups")}
+    assert empty_mine not in groups
+    assert groups == {full_mine, empty_theirs}

@@ -176,3 +176,30 @@ def test_the_brief_carries_every_signal_the_library_has(conn):
     assert "2023-01-01" in brief
     assert "iPhone SE" in brief and "aperture=1.8" in brief
     assert "portrait" in brief
+
+
+def test_the_brief_names_the_people_of_the_shot():
+    from feed.signals import ShotSignal
+
+    shot = ShotSignal(photo_id=1, width=4000, height=3000, shot_at=None, caption="",
+                      description="Two friends at a table", place=None, tags={}, scores={},
+                      vector=None, people=("Ann", "Bob"))
+    assert "people=Ann, Bob" in shot.brief()
+
+
+def test_each_shot_carries_the_named_people_recognised_in_it_once(conn, group):
+    from feed.saved_voices import create_voice
+    from tests.factories import add_face, add_face_group
+
+    ann = create_voice(conn, 1, "Ann").id
+    named = add_face_group(conn, person_id=ann)
+    unnamed = add_face_group(conn)
+    add_face(conn, photo_id=2, group_id=named, vector=(1.0, 0.0))
+    add_face(conn, photo_id=2, group_id=named, vector=(1.0, 0.0))
+    add_face(conn, photo_id=2, group_id=unnamed, vector=(0.0, 1.0))
+
+    signals = {s.photo_id: s for s in read_signals(conn, group)}
+
+    assert signals[2].people == ("Ann",)
+    assert "people=Ann" in signals[2].brief()
+    assert signals[1].people == ()
