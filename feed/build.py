@@ -169,7 +169,7 @@ class Cancelled(RuntimeError):
 
 
 @contextmanager
-def voice_turn(lock: threading.Lock | None, progress, cancelled, fraction: float):
+def voice_turn(lock: "threading.Lock | None", progress, cancelled, fraction: float):
     """Hold `lock`, the app's one voice call at a time (D52), for the body.
 
     A caller that waits says so on its bar ("waiting for the voice model" at `fraction`)
@@ -230,7 +230,7 @@ def build_presentation(
     progress=None,
     cancelled=None,
     voices: Storage | None = None,
-    voice_lock: threading.Lock | None = None,
+    voice_lock: "threading.Lock | None" = None,
     profile: str | None = None,
 ) -> Presentation:
     """Generate, store and record one memory's film.

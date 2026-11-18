@@ -43,7 +43,7 @@ def hear_takes(
     owner_id: int,
     voice_id: int,
     *,
-    voice_lock: threading.Lock | None = None,
+    voice_lock: "threading.Lock | None" = None,
     progress=None,
     cancelled=None,
 ) -> int:
