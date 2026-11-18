@@ -611,6 +611,9 @@ def speaker_embedder_for(profile: str) -> ModelEntry | None:
 
 def face_model_for(profile: str) -> ModelEntry | None:
     """The `FACE_MODELS` entry offered on `profile`, or None (§4.1)."""
+    for entry in FACE_MODELS:
+        if profile in entry.profiles:
+            return entry
     return None
 
 

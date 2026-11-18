@@ -9,6 +9,7 @@ import sqlite3
 from dataclasses import dataclass
 
 from embedding.store import read_vectors
+from ingest.people import people_in_photos
 
 # Every dimension the taxonomy produces. The director reads a handful of them; the
 # CONDUCTOR reads all of them, because its job is to put the photograph of the cat under
@@ -71,6 +72,8 @@ class ShotSignal:
             shot_with.insert(0, f"camera={self.camera}")
         if shot_with:
             parts.append(" ".join(shot_with))
+        if self.people:
+            parts.append(f"people={', '.join(self.people)}")
         parts.append("portrait" if is_portrait(self) else "landscape")
         return " · ".join(parts)
 
@@ -143,8 +146,9 @@ def read_signals(conn: sqlite3.Connection, group_id: int) -> list[ShotSignal]:
         # The story pass needs the RICH description, not the four-word label:
         # "People by Flower Arch" cannot carry a film, while "Three individuals are
         # posing behind a colorful arrangement of flowers…" can.
-        " COALESCE(p.ai_description, p.caption, '') AS description, p.camera"
+        " COALESCE(p.ai_description, p.caption, '') AS description, p.camera, g.owner_id"
         " FROM group_photos gp JOIN photos p ON p.id = gp.photo_id"
+        " JOIN groups g ON g.id = gp.group_id"
         " WHERE gp.group_id = ? AND p.thumb_key IS NOT NULL"
         " ORDER BY gp.rank",
         (group_id,),
@@ -156,6 +160,7 @@ def read_signals(conn: sqlite3.Connection, group_id: int) -> list[ShotSignal]:
     places = _places(conn, ids)
     facets = _facets(conn, ids)
     vectors = read_vectors(conn, ids)
+    people = people_in_photos(conn, int(rows[0]["owner_id"]), ids)
     return [
         ShotSignal(
             photo_id=int(r["id"]),
@@ -170,6 +175,7 @@ def read_signals(conn: sqlite3.Connection, group_id: int) -> list[ShotSignal]:
             vector=vectors.get(int(r["id"])),
             camera=r["camera"],
             facets=facets.get(int(r["id"]), {}),
+            people=tuple(people.get(int(r["id"]), [])),
         )
         for r in rows
     ]

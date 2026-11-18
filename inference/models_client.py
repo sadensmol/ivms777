@@ -29,6 +29,12 @@ class DetectedFace:
     model: str
 
 
+def _detected_face(face: dict, model: str) -> DetectedFace:
+    x, y, w, h = face["box"]
+    return DetectedFace(box=(x, y, w, h), score=face["score"],
+                        vector=tuple(face["vector"]), model=model)
+
+
 def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode()
 
@@ -327,5 +333,12 @@ class ModelsClient:
         return response.json()
 
     def detect_faces(self, image: bytes, *, timeout: float = 600.0) -> list[DetectedFace]:
-        """The faces in one upright image, as `POST /faces/detect` answers them."""
-        return []
+        """The faces in one upright image, as `POST /faces/detect` answers them. 600 s
+        covers the first call's load and a wait for a scheduler slot. A non-2xx raises
+        `httpx.HTTPStatusError`."""
+        response = self._client.post(
+            "/faces/detect", json={"image": _b64(image)}, timeout=timeout)
+        response.raise_for_status()
+        body = response.json()
+        model = f"{body['model']}@{body['revision']}"
+        return [_detected_face(face, model) for face in body["faces"]]

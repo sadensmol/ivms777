@@ -105,6 +105,7 @@ from ingest.jobs import (
     stage_counts,
     stage_speed,
 )
+from ingest.people import people_in_photos
 from ingest.pipeline import drain_pass
 from ingest.thumbs import thumb_key
 from ingest.vocab import load_vocab, seed_tags
@@ -1863,6 +1864,9 @@ def create_app(settings: Settings) -> FastAPI:
                 "similarity": similarity,
                 "embedded": photo["embedding_model"] is not None,
                 "tags": tags,
+                "people": people_in_photos(
+                    ctx.conn, ctx.settings.owner_id, [photo_id]
+                ).get(photo_id, []),
                 "prev_id": prev_id, "next_id": next_id,
                 "ctx_query": urlencode(keep),
                 "origin_url": _origin_url(ctx_param, params),

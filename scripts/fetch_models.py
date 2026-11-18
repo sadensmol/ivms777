@@ -45,10 +45,12 @@ def wanted(settings: Settings, conn=None) -> list[tuple[str, str]]:
                 pairs.append((slot, f"{repo}@{revision}" if revision else repo))
             elif isinstance(entry.source, UrlSource):
                 pairs.append((slot, entry.source.url))
-    # The speech recognition and the speaker-similarity meter are no slots (§4.1): each is
-    # fetched on every profile that offers it, so neither stalls on a download.
+    # The speech recognition, the speaker-similarity meter and the face model are no
+    # slots (§4.1): each is fetched on every profile that offers it, so none stalls on a
+    # download.
     for unit, entry in (("asr", catalog.transcriber_for(settings.profile)),
-                        ("speaker_embed", catalog.speaker_embedder_for(settings.profile))):
+                        ("speaker_embed", catalog.speaker_embedder_for(settings.profile)),
+                        ("faces", catalog.face_model_for(settings.profile))):
         if entry is not None:
             source = entry.source
             pairs.append((unit, f"{source.repo}@{source.revision}"))

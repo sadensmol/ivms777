@@ -13,6 +13,8 @@ backend never blocks the light stage (§8, stages are independent):
    observed `RuntimeError 801`), these are skipped THIS pass and retried on the
    next one, never blocking group 1. Search/tags/captions fill in once the backend
    is healthy; the photos are already browsable in the grid.
+3. **Faces** — the `faces` stage, last and guarded on its own (§8): an outage
+   defers it to a later pass and never fails the pass.
 """
 
 import logging
@@ -25,12 +27,14 @@ from ingest.caption import (
     caption_handler,
 )
 from ingest.embed import backfill_embeds, embed_handler, relabel_legacy_embeds
+from ingest.faces import FaceStageParams, backfill_faces, faces_handler
 from ingest.facets import backfill_place_facets
 from ingest.folders import process_folder_deletions
 from ingest.jobs import stage_counts
 from ingest.taxonomy import backfill_taxonomy, taxonomy_handler
 from ingest.thumbs import backfill_thumbnails
 from ingest.worker import Preempted, drain, thumbnail_handler
+from models.catalog import face_model_for
 
 logger = logging.getLogger("ivms777.pipeline")
 
@@ -130,3 +134,27 @@ def drain_pass(context, vocab, should_preempt=lambda: False) -> None:
             backfill_caption_vectors(conn, client, settings.caption_embed_model_key(conn))
         except Exception:  # never crash the pass on the §9 enhancement
             logger.exception("caption-vector embed deferred this pass")
+
+    # Group 3 — the `faces` stage (§8), last and guarded on its own, ONLY if pending. The
+    # face model is reached through the `models` service; the worker stores the faces and
+    # groups them. A job whose call fails stays pending (the queue retries it), and any
+    # other outage defers the stage to the next pass, never failing it.
+    backfill_faces(conn)
+    if not stage_counts(conn, "faces")["pending"]:
+        return
+    face_model = face_model_for(settings.profile)
+    if face_model is None or face_model.input_edge is None:
+        logger.info("faces deferred: profile %s offers no face model", settings.profile)
+        return
+    try:
+        drain(conn, {
+            "faces": faces_handler(
+                context.originals, settings.build_models_client(),
+                FaceStageParams(match_threshold=settings.face_threshold(),
+                                input_edge=face_model.input_edge),
+            ),
+        }, ("faces",), should_preempt=should_preempt)
+    except Preempted:
+        return
+    except Exception:
+        logger.exception("faces deferred this pass")

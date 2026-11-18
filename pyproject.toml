@@ -55,6 +55,11 @@ models = [
     # The speaker-similarity meter (design §4.1): ECAPA-TDNN of a saved voice's takes and
     # a test. Pinned: `audio/speaker_embed.py` loads through this version's fetch API.
     "speechbrain==1.1.2",
+    # The face model (design §4.1): InsightFace `buffalo_l` ships ONNX graphs, which
+    # `embedding/face_model.py` converts to torch so they run on mps or cuda in the one
+    # torch runtime of the service, never on an ONNX CPU provider.
+    "onnx>=1.17",
+    "onnx2torch>=1.5.15",
 ]
 
 [dependency-groups]

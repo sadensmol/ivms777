@@ -578,3 +578,27 @@ a.voice-card:focus-visible { outline: 2px solid #8ab4f8; outline-offset: 2px; }
   font-weight: 600; }
 .voice-preview .preview-generate:hover:not(:disabled) { background: #3a68e4; }
 .preview-what { overflow-wrap: anywhere; }
+/* Face groups (design §13): "Faces to name" on the Voices grid, the group leaf and a
+   person's Faces tab. */
+.faces-to-name { margin-top: 24px; }
+.face-groups { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 12px; }
+.face-group-card { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px;
+  background: #191919; border: 1px solid #262626; border-radius: 10px; color: #ddd;
+  text-decoration: none; }
+a.face-group-card:hover { border-color: #3a3a3a; background: #1e1e1e; color: #fff; }
+a.face-group-card:focus-visible { outline: 2px solid #8ab4f8; outline-offset: 2px; }
+.face-group-crops { display: flex; gap: 4px; flex-wrap: wrap; }
+.face-group-crops img { width: 64px; height: 64px; object-fit: cover; border-radius: 6px;
+  background: #222; }
+.voice-faces { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 12px; margin-top: 12px; }
+.voice-faces .hint { grid-column: 1 / -1; }
+.face-name { display: flex; flex-wrap: wrap; gap: 16px; margin: 12px 0; }
+.face-name form, .face-unassign { display: flex; align-items: center; gap: 8px; }
+.face-crops { list-style: none; padding: 0; margin: 16px 0 0; display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 12px; }
+.face-crop { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.face-crop img { width: 120px; height: 120px; object-fit: cover; border-radius: 8px;
+  background: #222; }
+.photo-people { margin: 8px 0; color: #ddd; }

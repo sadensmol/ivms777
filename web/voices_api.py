@@ -73,6 +73,7 @@ from feed.voice_preview import (
     preview_text,
     run_preview,
 )
+from ingest.people import groups_to_name, person_groups
 from models.catalog import adapter_entry_for, cloning_entry_for, cloning_languages, transcriber_for
 from web.deps import AppContext
 from web.upload_api import FREE_SPACE_FLOOR
@@ -99,7 +100,9 @@ READY_PROBLEMS: dict[str, str] = {
 }
 
 # The leaf's tabs (§13.1): state of the leaf, carried in `?tab`, never history.
-TABS: tuple[tuple[str, str], ...] = (("recordings", "Recordings"), ("test", "Test"))
+TABS: tuple[tuple[str, str], ...] = (
+    ("recordings", "Recordings"), ("test", "Test"), ("faces", "Faces"),
+)
 
 
 def language_name(code: str) -> str:
@@ -843,6 +846,7 @@ def register(
             "not_available": NOT_AVAILABLE,
             "languages": [(code, language_name(code)) for code in languages],
             "recordings": _recordings(voice, languages),
+            "face_groups": person_groups(ctx.conn, ctx.settings.owner_id, voice_id),
         } | ({} if voice.deleting else _voice_context(ctx, voice, languages))
 
     def _body(ctx: AppContext, voice_id: int) -> str:
@@ -882,6 +886,9 @@ def register(
             _cards_context(ctx) | {
                 "available": bool(cloning_languages(ctx.settings.profile)),
                 "not_available": NOT_AVAILABLE,
+                "face_groups": groups_to_name(
+                    ctx.conn, ctx.settings.owner_id, min_faces=ctx.settings.face_group_min_faces
+                ),
             },
         )
 

@@ -95,6 +95,10 @@
       {% endif %}
     {% endif %}
 
+    {# The people recognised in the photo (§6, §13): plain text — a link to a person
+       would open a leaf from a leaf (§13.1). #}
+    {% if people %}<p class="photo-people">People: {{ people|join(', ') }}</p>{% endif %}
+
     <h3>AI</h3>
     {% if embedded %}
       <p>Embedded for semantic search ({{ photo['embedding_model'] }}).</p>

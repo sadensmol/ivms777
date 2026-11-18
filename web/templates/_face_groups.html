@@ -1,0 +1,21 @@
+{# "Faces to name" on the Voices grid (design §13): every face group of the owner with no
+   person and at least the minimum face count, with up to four crops and its count. Each
+   group is a plain link to its leaf /faces/{id} — the one grid→leaf push (§13.1). Hidden
+   when no group waits. #}
+{% if face_groups %}
+  <section class="faces-to-name">
+    <h2>Faces to name</h2>
+    <div class="face-groups">
+      {% for group in face_groups %}
+        <a class="face-group-card" href="/faces/{{ group.id }}">
+          <span class="face-group-crops">
+            {% for face in group.faces[:4] %}
+              <img src="/faces/crop/{{ face.id }}" alt="" loading="lazy" width="64" height="64">
+            {% endfor %}
+          </span>
+          <span class="voice-card-line">{{ group.face_count }} face{{ '' if group.face_count == 1 else 's' }}</span>
+        </a>
+      {% endfor %}
+    </div>
+  </section>
+{% endif %}

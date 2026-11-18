@@ -5,7 +5,8 @@
    up one level — history.back() when the page was opened from the grid
    (`data-from-grid`, set by voices.js at mount), else location.replace("/voices"). Tabs
    are state of the leaf (`?tab` through replaceState). Every action is a fetch that
-   swaps #voices; none pushes history. #}
+   swaps #voices; none pushes history. The Faces tab's "Remove from this person" is
+   faces.js's (§13). #}
 <div class="voices-shell voice-leaf" id="voices-page" data-voice-id="{{ voice.id }}">
   <p id="voices-error" class="voices-error" role="alert" hidden></p>
 
@@ -62,4 +63,5 @@
   {% endif %}
 </div>
 <script src="/static/voices.js?v={{ static_v('voices.js') }}" defer></script>
+<script src="/static/faces.js?v={{ static_v('faces.js') }}" defer></script>
 {% endblock %}
