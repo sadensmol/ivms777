@@ -1,5 +1,5 @@
 import sqlite3
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 # `caption_embed` is the §9 caption-meaning vector. It is a real stage like the
 # others — queued per photo, counted, reprocessable — but it is DRAINED IN ONE
@@ -11,7 +11,7 @@ STATUSES = ("pending", "running", "done", "failed")
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def enqueue(conn: sqlite3.Connection, photo_id: int, stage: str) -> None:

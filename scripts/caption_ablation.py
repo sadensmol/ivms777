@@ -127,7 +127,7 @@ def main() -> None:
             worst.append((len(rescued), seed, caps))
 
     n = len(seeds)
-    pct = lambda x: f"{100 * x / n:5.1f}%"  # noqa: E731 — local formatting shorthand
+    pct = lambda x: f"{100 * x / n:5.1f}%"
     print("--- what the caption signal changes ------------------------------")
     print(f"seeds whose result SET changed          : {seeds_with_any:4d} / {n}  {pct(seeds_with_any)}")
     print(f"seeds whose #1 result changed           : {top1_changed:4d} / {n}  {pct(top1_changed)}")
