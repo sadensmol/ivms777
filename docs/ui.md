@@ -447,19 +447,24 @@ and Esc/backdrop/× just closes it.
     history restore) it reconnects the deleting poll and the test from the server.
 - `/faces/{id}` — one face group, a **leaf** of the Voices grid (design §13.1).
   - **Header:** "Voices › Faces to name", or "Voices › <person>" when the group is
-    attached, and **×**. Then every face of the group as a crop (cut from the photo's
-    1600 px detail thumbnail by the face box, on request; no file is stored), newest
-    photo first, each with **Not this person**.
+    attached, and **×**, then "N faces". Then every face of the group as a crop (cut
+    from the photo's 1600 px detail thumbnail by the face box plus a margin of 20% of
+    its side, on request; no file is stored), newest photo first, each with **Not this
+    person** when the group holds more than one face.
   - **Attach to a person:** a select of the owner's people (the saved voices, by name)
     and **Attach**. **New person:** a name (the New voice rules: 1-80 characters,
     unique per owner, case-insensitive) and **Create**; a taken or empty name is
     refused with its reason and nothing is written. Both work on every profile: a
     person needs no voice copy. An attached group leaves "Faces to name", and every
-    face that later joins it is that person with no action by the owner.
+    face that later joins it is that person with no action by the owner. An attached
+    group shows **Remove from this person** instead of Attach and New person; the group
+    returns to "Faces to name".
   - **Not this person** moves that one face out to a new group of its own and pins it,
-    so grouping never moves it again. A group left with no face closes to the grid.
-  - Every action is a POST answered in place, or by `location.replace`; none pushes
-    history.
+    so grouping never moves it again. A one-face group has no such button: the move
+    would only pin the same face.
+  - Every action is a `fetch` POST that answers the group leaf; `faces.js` swaps it in
+    place. A refused action shows its reason in the page's error line. None pushes
+    history: the URL changes only through `history.replaceState`.
   - **Close** (×, the "Voices" link, Esc) goes up to the grid: `history.back()` when
     the page carries `data-from-grid` (set at mount when `document.referrer` has the
     same origin and the path `/voices`), else `location.replace("/voices")`. The page

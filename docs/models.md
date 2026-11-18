@@ -770,10 +770,13 @@ of one person (design §4.1, §5.1 `/faces/detect`, §8, §8.1). One model does 
 | Package | Licence | Note |
 |---|---|---|
 | `onnx` | Apache-2.0 | requires `protobuf`, `ml_dtypes`, `numpy`, `typing_extensions` |
-| `onnx2torch` | Apache-2.0 | requires `torchvision`, which `uv.lock` does not hold yet |
+| `onnx2torch` | Apache-2.0 | requires `torchvision` |
 
-`torchvision` must match the locked `torch` build on every profile (the jetson CUDA 13
-wheel included). That is checked when the lock is updated.
+`uv.lock` holds `onnx` 1.23.2, `onnx2torch` 1.5.15 and the two packages they added:
+`ml-dtypes` 0.7.0 and `torchvision` 0.28.0, the PyPI build that matches the locked
+`torch` 2.13.0 on mac and cloud. On jetson `Dockerfile.models.jetson` reinstalls
+`torch` and `torchvision` together from the CUDA 13.2 index (design §3.1), so the pair
+stays matched there too.
 
 ## Switching a slot
 

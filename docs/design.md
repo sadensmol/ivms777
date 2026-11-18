@@ -3344,10 +3344,12 @@ that the five top-level links swap without re-rendering the nav. The routes:
   person** for it — the New voice rules (1-80 characters, unique per owner,
   case-insensitive; a taken name is refused with its reason), on every profile, jetson
   included, because a person needs no voice copy. An attached group leaves "Faces to
-  name". **Not this person** on a face moves it out to a new group of its own and pins
-  it, so it never rejoins a group automatically. A face crop
-  (`/faces/crop/{face_id}`) is cut from the detail thumbnail on request; another
-  owner's face answers 404.
+  name", and its leaf offers **Remove from this person** instead. **Not this person**
+  on a face moves it out to a new group of its own and pins it, so it never rejoins a
+  group automatically; a one-face group does not offer it. Every action answers the
+  group leaf, swapped in place. A face crop (`/faces/crop/{face_id}`) is cut from the
+  detail thumbnail on request, by the face box plus a margin of 20% of its side;
+  another owner's face answers 404.
 - **`/voices/{id}`** — one voice, the leaf of the Voices grid (§13.1). The header reads
   "Voices › <name>", a **⋯** menu (Rename…, Delete voice…) and ×, then the state of the
   voice on every tab (§11.1): per language the take films and tests speak from, a newer
@@ -3451,8 +3453,8 @@ in front of bfcache and break the `[grid, leaf]` invariant.
    add a take, delete, hear the words, test) push no history.
    **A face group (`/faces/{id}`) is a leaf of the Voices grid too**, one level under
    it: a "Faces to name" crop is a plain link (the one push). Every action on it
-   (attach, create a person, Not this person) is a POST answered in place or by
-   `location.replace`, never a push. A person's Faces tab shows the groups in place and
+   (attach, create a person, Remove from this person, Not this person) is a POST
+   answered in place, never a push: the URL changes only through `replaceState`. A person's Faces tab shows the groups in place and
    links to no group leaf (that would be leaf-to-leaf). The photo page's People line
    holds no link either.
 
