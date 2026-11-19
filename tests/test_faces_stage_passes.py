@@ -3,7 +3,9 @@ models service finds, an outage of any length keeps the job pending with no atte
 counted, and a refused image or an unreadable original still fails the job. The models
 service is a fake HTTP transport under the real `ModelsClient`; no model."""
 
+import base64
 import io
+import json
 
 import httpx
 import pytest
@@ -34,11 +36,21 @@ class _ModelsService:
     def __init__(self) -> None:
         self.state = "up"
         self.face_calls = 0
+        self.poison: str | None = None
+        self.poison_calls = 0
+
+    def _poisoned(self, request: httpx.Request) -> httpx.Response:
+        self.poison_calls += 1
+        if self.poison == "read-timeout":
+            raise httpx.ReadTimeout("timed out", request=request)
+        return httpx.Response(500, json={"detail": "a face vector is not finite"})
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         if request.url.path != "/faces/detect":
             return httpx.Response(503, json={"detail": "not in this test"})
         self.face_calls += 1
+        if self.poison is not None and _is_poison(request):
+            return self._poisoned(request)
         if self.state == "refused":
             return httpx.Response(422, json={"detail": "cannot identify image file"})
         if self.state == "connect-error":
@@ -56,10 +68,16 @@ class _ModelsService:
         return ModelsClient("http://models.test", transport=httpx.MockTransport(self.handle))
 
 
-def _jpeg() -> bytes:
+def _jpeg(color: str = "gray") -> bytes:
     buffer = io.BytesIO()
-    Image.new("RGB", (800, 600), "gray").save(buffer, format="JPEG")
+    Image.new("RGB", (800, 600), color).save(buffer, format="JPEG")
     return buffer.getvalue()
+
+
+def _is_poison(request: httpx.Request) -> bool:
+    image = base64.b64decode(json.loads(request.content)["image"])
+    red, green, blue = Image.open(io.BytesIO(image)).convert("RGB").getpixel((0, 0))
+    return red > 200 and green < 60 and blue < 60
 
 
 @pytest.fixture
@@ -116,7 +134,7 @@ def test_a_drain_pass_stores_the_faces_the_models_service_finds(ctx, service):
     assert service.face_calls == 1
 
 
-@pytest.mark.parametrize("outage", ["connect-error", "read-timeout", "server-error"])
+@pytest.mark.parametrize("outage", ["connect-error", "server-error"])
 def test_an_outage_longer_than_the_attempts_keeps_the_jobs_pending_until_the_service_is_up(
     ctx, service, outage
 ):
@@ -173,3 +191,24 @@ def test_an_outage_stops_the_stage_with_faces_deferred(ctx, service, outage):
 
     job = _job(ctx.conn, photo)
     assert (job["status"], job["attempts"], bool(job["error"])) == ("pending", 0, True)
+
+
+@pytest.mark.parametrize("poison", ["server-error", "read-timeout"])
+def test_a_poison_photo_fails_after_its_attempts_and_never_stops_a_good_photo(ctx, service, poison):
+    bad = _photo(ctx, "d1" * 32, data=_jpeg("red"))
+    good = _photo(ctx, "d2" * 32)
+    service.poison = poison
+
+    _pass(ctx)
+
+    assert _job(ctx.conn, good)["status"] == "done"
+    assert len(_faces(ctx.conn, good)) == 1
+
+    for _ in range(MAX_ATTEMPTS - 1):
+        _pass(ctx)
+
+    job = _job(ctx.conn, bad)
+    assert (job["status"], job["attempts"]) == ("failed", MAX_ATTEMPTS)
+    assert service.poison_calls == MAX_ATTEMPTS
+    assert _faces(ctx.conn, bad) == []
+    assert _job(ctx.conn, good)["status"] == "done"
