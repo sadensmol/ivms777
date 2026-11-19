@@ -16,7 +16,7 @@ from ingest.jobs import enqueue, reprocess_one
 from ingest.people import people_in_photos
 from ingest.pipeline import drain_pass
 from ingest.vocab import load_vocab
-from ingest.worker import drain
+from ingest.worker import Preempted, drain
 from storage.local import LocalStorage
 from tests.factories import add_face, add_face_group, add_photo
 from web.app import VOCAB_PATH
@@ -156,12 +156,18 @@ def test_a_models_service_outage_leaves_the_job_pending_with_no_faces(conn, orig
     photo = _photo(conn, originals)
     client = _FaceClient(error=httpx.ConnectError("connection refused"))
 
-    _run(conn, originals, client, photo)
+    try:
+        _run(conn, originals, client, photo)
+    except Preempted:
+        stage_stopped = True
+    else:
+        stage_stopped = False
 
     job = _job(conn, photo)
     assert len(client.images) == 1
     assert (job["status"], bool(job["error"])) == ("pending", True)
     assert _faces(conn, photo) == []
+    assert stage_stopped
 
 
 def test_a_drain_pass_with_the_models_service_down_defers_the_faces_job(settings):
