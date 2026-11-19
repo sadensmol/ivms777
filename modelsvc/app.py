@@ -18,6 +18,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt
 
 from audio.whisper_asr import MAX_SECONDS as TRANSCRIBE_MAX_SECONDS
+from embedding.face_model import WEIGHTS_MISSING as FACE_WEIGHTS_MISSING
 from modelsvc.backends.base import (
     CloningUnavailable,
     FaceImageRefused,
@@ -701,7 +702,8 @@ def create_models_app(backend: ModelBackend) -> FastAPI:
         except FaceImageRefused as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except Exception as exc:  # a load or model error, with its own message
-            raise HTTPException(status_code=500, detail=str(exc) or type(exc).__name__) from exc
+            status = 503 if FACE_WEIGHTS_MISSING in str(exc) else 500
+            raise HTTPException(status_code=status, detail=str(exc) or type(exc).__name__) from exc
         return FaceDetectResponse(**result)
 
     return app

@@ -127,8 +127,11 @@ app's inline drain) runs in two groups: first the **GPU/inference-free** stages 
 thumbnail, EXIF place facets, folder deletions, saved-voice deletions
 (`process_voice_deletions`, §6) — then the **embedder/inference**
 stages (embed, taxonomy, caption, and the batched caption_embed), then `faces` in a
-guarded group of its own: a `models` service outage (or a 503 because the profile has
-no face model) logs, leaves the `faces` jobs pending, and never fails the pass. The embedder (`RemoteEmbedder`, an HTTP shim over
+guarded group of its own: a `models` service outage (a connect error or connect
+timeout, or a 503 because the profile has no face model or its weights are absent) logs,
+leaves the `faces` jobs pending with no attempt counted, and never fails the pass. A 500
+or a read timeout on one photo fails that photo's job like any other error, so it never
+stops the photos after it. The embedder (`RemoteEmbedder`, an HTTP shim over
 the `models` service, §5.1) is built **inside the pass**, not eagerly at process
 start; if a call through it fails — e.g. the `models` service is unreachable, or its
 own CUDA init fails on jetson (the previously observed `RuntimeError 801`, now inside

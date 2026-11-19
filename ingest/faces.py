@@ -164,9 +164,11 @@ class FacesDeferred(Preempted):
 
 
 def _is_outage(error: httpx.HTTPError) -> bool:
-    if isinstance(error, httpx.TransportError):
+    # A ReadTimeout or a 500 can belong to one image, so it fails that job instead: a
+    # deferred job is claimed first again, and one poison photo would stop the stage.
+    if isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout)):
         return True
-    return isinstance(error, httpx.HTTPStatusError) and error.response.is_server_error
+    return isinstance(error, httpx.HTTPStatusError) and error.response.status_code == 503
 
 
 def faces_handler(
@@ -175,9 +177,10 @@ def faces_handler(
     """The `faces` stage: send the original, upright and shrunk to the face model's input
     edge, to `POST /faces/detect`, then replace the photo's faces and group each one.
 
-    A models-service outage (no connection, a timeout, a 5xx) keeps the job pending with
-    no attempt counted and raises `FacesDeferred`, which stops the stage for this pass.
-    A refused image (4xx) or an unreadable original raises as is and fails the attempt."""
+    A models-service outage (a connect error or connect timeout, a 503) keeps the job
+    pending with no attempt counted and raises `FacesDeferred`, which stops the stage for
+    this pass. Any other error — a 500 or a read timeout on this image, a refused image
+    (4xx), an unreadable original — raises as is and fails the attempt."""
 
     def handle(conn: sqlite3.Connection, photo_id: int) -> None:
         row = conn.execute("SELECT storage_key FROM photos WHERE id = ?", (photo_id,)).fetchone()

@@ -137,8 +137,9 @@ def drain_pass(context, vocab, should_preempt=lambda: False) -> None:
 
     # Group 3 — the `faces` stage (§8), last and guarded on its own, ONLY if pending. The
     # face model is reached through the `models` service; the worker stores the faces and
-    # groups them. A models-service outage returns the claimed job to pending with no
-    # attempt counted and stops the stage until the next pass, never failing it.
+    # groups them. A models-service outage (connect error or timeout, a 503) returns the
+    # claimed job to pending with no attempt counted and stops the stage until the next
+    # pass, never failing it; a 500 or a read timeout fails only that photo's job.
     backfill_faces(conn)
     if not stage_counts(conn, "faces")["pending"]:
         return

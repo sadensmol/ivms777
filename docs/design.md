@@ -972,8 +972,11 @@ HTTP.
   - **422** with the reason for bad base64 or an image the child cannot decode.
   - **503** "finding faces is not offered on this device yet" when the service has no
     `faces` unit (no `FACE_MODELS` entry on this profile).
-  - **500** with the model's own message for a load or model error, for example
-    "buffalo_l weights for <revision> are not on disk: run `make models`". After the
+  - **503** with the load error when the face weights are absent ("face weights are not
+    on disk: revision <revision>, run `make models`"): every photo would fail the same
+    way, so it is an outage, not a fault of this image.
+  - **500** with the model's own message for any other load or model error, for example
+    "a face vector is not finite or has a zero norm". After the
     call the reply's `revision` must equal the entry's pinned commit, else a 500
     (`faces identity mismatch`), and every vector must hold the entry's `dim` values.
   - The call runs at `Priority.BATCH`, label "finding faces": it never preempts a
@@ -1335,8 +1338,11 @@ The design decisions that matter:
   job (a self-healing backfill, like `embed`). The handler opens the original upright
   (EXIF rotation applied), shrinks its long edge to the entry's `input_edge`, calls
   `POST /faces/detect` (§5.1), and in one transaction **replaces** that photo's faces.
-  A photo with no face completes with no rows. A `models` service outage leaves the
-  job pending and never fails the pass. A re-run replaces the photo's faces, so a
+  A photo with no face completes with no rows. A `models` service outage — a connect
+  error or connect timeout, or a 503 (no face model, or its weights absent) — leaves
+  the job pending with no attempt counted, stops the stage for this pass, and never
+  fails the pass. A 500 or a read timeout can belong to one photo, so it fails that
+  job like any error (up to 3 attempts): one poison photo never stops later photos. A re-run replaces the photo's faces, so a
   "Not this person" fix on that photo is lost; Reprocess is a manual action.
 - **Grouping is nearest group by mean vector, one threshold.** Each new face joins
   the owner's group whose mean face vector has the highest cosine similarity with it,

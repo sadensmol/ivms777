@@ -30,6 +30,9 @@ NMS_IOU = 0.4
 DETECT_MEAN, DETECT_STD = 127.5, 128.0
 RECOGNIZE_MEAN, RECOGNIZE_STD = 127.5, 127.5
 ALIGNED_EDGE = 112
+# The start of the load error for absent weights. It crosses the child pipe as text, so
+# `/faces/detect` finds it there and answers 503: an outage, not a fault of one image.
+WEIGHTS_MISSING = "face weights are not on disk"
 # The five ArcFace reference points (eyes, nose, mouth corners) of a 112x112 face, from
 # InsightFace `face_align.arcface_dst`: the recogniser was trained on faces aligned to them.
 ARCFACE_POINTS = np.array([[38.2946, 51.6963], [73.5318, 51.5014], [56.0252, 71.7366],
@@ -57,7 +60,7 @@ class FaceModel:
             path = snapshot_download(repo, revision=revision, local_files_only=True)
         except LocalEntryNotFoundError as exc:
             raise RuntimeError(
-                f"face weights for {revision} are not on disk: run `make models`"
+                f"{WEIGHTS_MISSING}: revision {revision}, run `make models`"
             ) from exc
         # The snapshot folder is the commit; anything else is another revision.
         if Path(path).name != revision:
