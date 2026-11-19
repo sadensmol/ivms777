@@ -150,6 +150,17 @@ def requeue_running(conn: sqlite3.Connection, photo_id: int, stage: str) -> None
     )
 
 
+def defer(conn: sqlite3.Connection, photo_id: int, stage: str, error: str) -> None:
+    """Return one claimed job to 'pending' WITHOUT counting an attempt, and record why —
+    for a stage whose service is down (§8): an outage is not the photo's fault, so it
+    must never use up the photo's attempts."""
+    conn.execute(
+        "UPDATE jobs SET status = 'pending', error = ?, updated_at = ?"
+        " WHERE photo_id = ? AND stage = ?",
+        (error, _now(), photo_id, stage),
+    )
+
+
 def requeue_stalled(conn: sqlite3.Connection) -> int:
     """Return every 'running' job to 'pending' — call once at worker startup.
 

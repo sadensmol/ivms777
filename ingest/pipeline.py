@@ -27,7 +27,7 @@ from ingest.caption import (
     caption_handler,
 )
 from ingest.embed import backfill_embeds, embed_handler, relabel_legacy_embeds
-from ingest.faces import FaceStageParams, backfill_faces, faces_handler
+from ingest.faces import FacesDeferred, FaceStageParams, backfill_faces, faces_handler
 from ingest.facets import backfill_place_facets
 from ingest.folders import process_folder_deletions
 from ingest.jobs import stage_counts
@@ -137,8 +137,8 @@ def drain_pass(context, vocab, should_preempt=lambda: False) -> None:
 
     # Group 3 — the `faces` stage (§8), last and guarded on its own, ONLY if pending. The
     # face model is reached through the `models` service; the worker stores the faces and
-    # groups them. A job whose call fails stays pending (the queue retries it), and any
-    # other outage defers the stage to the next pass, never failing it.
+    # groups them. A models-service outage returns the claimed job to pending with no
+    # attempt counted and stops the stage until the next pass, never failing it.
     backfill_faces(conn)
     if not stage_counts(conn, "faces")["pending"]:
         return
@@ -154,6 +154,8 @@ def drain_pass(context, vocab, should_preempt=lambda: False) -> None:
                                 input_edge=face_model.input_edge),
             ),
         }, ("faces",), should_preempt=should_preempt)
+    except FacesDeferred as error:
+        logger.info("faces deferred: models service unavailable: %s", error)
     except Preempted:
         return
     except Exception:

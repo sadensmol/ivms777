@@ -12,12 +12,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+import httpx
 import numpy as np
 from PIL import Image, ImageOps
 
 from inference.models_client import DetectedFace, ModelsClient
-from ingest.jobs import enqueue
-from ingest.worker import StageHandler
+from ingest.jobs import defer, enqueue
+from ingest.worker import Preempted, StageHandler
 from storage.base import Storage
 
 # Vectors are stored as float32, so a similarity computed from them carries float32
@@ -155,17 +156,39 @@ def _store_faces(
     conn.execute("COMMIT")
 
 
+class FacesDeferred(Preempted):
+    """The models service is down, so the `faces` stage stops for this pass (§8).
+
+    It is a `Preempted` so `drain` returns the claimed job to pending without counting
+    an attempt and stops the stage, exactly as for an interactive yield."""
+
+
+def _is_outage(error: httpx.HTTPError) -> bool:
+    if isinstance(error, httpx.TransportError):
+        return True
+    return isinstance(error, httpx.HTTPStatusError) and error.response.is_server_error
+
+
 def faces_handler(
     originals: Storage, client: ModelsClient, params: FaceStageParams
 ) -> StageHandler:
     """The `faces` stage: send the original, upright and shrunk to the face model's input
-    edge, to `POST /faces/detect`, then replace the photo's faces and group each one. A
-    models-service error raises, so the queue keeps the job and retries it."""
+    edge, to `POST /faces/detect`, then replace the photo's faces and group each one.
+
+    A models-service outage (no connection, a timeout, a 5xx) keeps the job pending with
+    no attempt counted and raises `FacesDeferred`, which stops the stage for this pass.
+    A refused image (4xx) or an unreadable original raises as is and fails the attempt."""
 
     def handle(conn: sqlite3.Connection, photo_id: int) -> None:
         row = conn.execute("SELECT storage_key FROM photos WHERE id = ?", (photo_id,)).fetchone()
         image = _upright_image(originals.read(row["storage_key"]), params.input_edge)
-        faces = client.detect_faces(image)
+        try:
+            faces = client.detect_faces(image)
+        except httpx.HTTPError as error:
+            if not _is_outage(error):
+                raise
+            defer(conn, photo_id, "faces", str(error))
+            raise FacesDeferred(str(error)) from error
         _store_faces(conn, photo_id, faces, params.match_threshold)
 
     return handle
