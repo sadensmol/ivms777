@@ -223,7 +223,9 @@ and Esc/backdrop/× just closes it.
     open, for rename and delete.
   - **Faces to name** follows the cards: every face group of the owner with no person
     and at least the minimum number of faces (2 by default, env-overridable in
-    `config.py`; one stranger's face never floods the list), newest first. Each group
+    `config.py`; one stranger's face never floods the list), plus every such group that
+    holds a face the owner released (Not this person) whatever its size, the largest
+    first. Each group
     shows up to four face crops (`<img src="/faces/crop/{face_id}">`) and "N faces", and
     is a plain `<a href="/faces/{id}">` (a full navigation, never boosted — the one
     grid→leaf push). With no such group the section is absent. It shows on every
@@ -460,7 +462,8 @@ and Esc/backdrop/× just closes it.
     group shows **Remove from this person** instead of Attach and New person; the group
     returns to "Faces to name".
   - **Not this person** moves that one face out to a new group of its own and pins it,
-    so grouping never moves it again. A one-face group has no such button: the move
+    so grouping never moves it again. The new group is listed under "Faces to name",
+    so the released face can be named. A one-face group has no such button: the move
     would only pin the same face.
   - Every action is a `fetch` POST that answers the group leaf; `faces.js` swaps it in
     place. A refused action shows its reason in the page's error line. None pushes

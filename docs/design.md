@@ -2354,14 +2354,14 @@ no training wait are involved (§4.1).
 ```mermaid
 flowchart TB
     trigger["Prepare film (manual, background thread)<br/>one at a time per process · per LANGUAGE<br/>narrator: Automatic · a preset voice · a saved voice"] --> sig
-    sig["1 · Signals (PURE SQL, no model)<br/>orientation · tags (vibe/palette/light/quality/subject)<br/>place_city · shot_at · SigLIP vector"] --> dir
+    sig["1 · Signals (PURE SQL, no model)<br/>orientation · tags (vibe/palette/light/quality/subject)<br/>place_city · shot_at · SigLIP vector<br/>people: the names of the persons recognised in it (faces → group → person, §6)"] --> dir
     dir["2 · Direct (PURE, no model)<br/>camera move per shot (one eased PUSH, never a pan)<br/>burst → hard cuts · hero → long push-in<br/>palette+light → grade · a DEFAULT effect per shot<br/>this is the film if no model ever runs"] --> story
-    story["3 · Story (model call 1, POST /text/complete)<br/>narration WRITTEN from each photo's description, in memory order (no guessed labels)<br/>sparse title cards · music prompt<br/>+ SCORE PLAN: where the music changes, and to what<br/>written DIRECTLY in en or ru<br/>passages ≥ photos, best effort · told order = film order<br/>then ONE temperature-0 call per passage matches its photograph: a vote stands, no vote keeps stage 2's photograph<br/>memory order recorded kept or broken, never corrected · a photo no sentence is about is left out and logged<br/>Automatic only: casts the narrator + a per-passage voice from the preset table and the saved voices ready for the language<br/>an edited narration (narration_drafts): no story call, its words are the script<br/>only the per-passage match runs: no vote keeps the stored photograph"] --> narr
+    story["3 · Story (model call 1, POST /text/complete)<br/>narration WRITTEN from each photo's description + the people named in it, in memory order (no guessed labels)<br/>sparse title cards · music prompt<br/>+ SCORE PLAN: where the music changes, and to what<br/>written DIRECTLY in en or ru<br/>passages ≥ photos, best effort · told order = film order<br/>then ONE temperature-0 call per passage matches its photograph: a vote stands, no vote keeps stage 2's photograph<br/>memory order recorded kept or broken, never corrected · a photo no sentence is about is left out and logged<br/>Automatic only: casts the narrator + a per-passage voice from the preset table and the saved voices ready for the language<br/>an edited narration (narration_drafts): no story call, its words are the script<br/>only the per-passage match runs: no vote keeps the stored photograph"] --> narr
     narr["4a · Narration (POST /speak, BATCH) — MANDATORY<br/>kokoro (en) · silero v4_ru (ru, split at sentences)<br/>voxcpm2 — a SAVED voice (mac/cloud): its newest heard take of the language, with its words<br/>a CHOSEN narrator (preset or saved) reads EVERY passage<br/>Automatic: a [voice] bracket may give ONE passage another voice of the narrator's kind<br/>returns segments [{text,start,end}] — the film's SPINE<br/>no script in the language, or no speech → FAIL"] --> music
     narr -- "cannot speak · chosen or picked narrator unavailable" --> failed["status='failed' + the reason<br/>the page shows the error, never a mute film"]
     music["4b · SCORE (POST /music, BATCH) — feed/score.py plans it<br/>2-4 sections on the story's own turns, each a CONTINUATION of the last<br/>brief per section = mood + THAT stretch's photographs + role (open/lift/turn/close)<br/>covers the runtime and ENDS — no loop · 503 when the slot is off"] --> beats
     beats["4c · Beats (PURE numpy, feed/beats.py)<br/>spectral flux → onset envelope → tempo → downbeats<br/>NO model"] --> cond
-    cond["5 · Conduct (model call 2, feed/conductor.py)<br/>briefed with: every photo's description + 10 tag dimensions +<br/>place/time/EXIF · every narration sentence's timing ·<br/>every downbeat · the whole effect library<br/>returns: WHEN each shot plays, with which effect + params<br/>never reorders a film with a script: the shots keep the told order<br/>repaired by director.with_arrangement · fallback = even + snapped"] --> persist
+    cond["5 · Conduct (model call 2, feed/conductor.py)<br/>briefed with: every photo's description + 10 tag dimensions +<br/>place/time/EXIF + people · every narration sentence's timing ·<br/>every downbeat · the whole effect library<br/>returns: WHEN each shot plays, with which effect + params<br/>never reorders a film with a script: the shots keep the told order<br/>repaired by director.with_arrangement · fallback = even + snapped"] --> persist
     persist["6 · Persist<br/>WAVs → data_dir/audio (content-addressed, §6.1)<br/>row → memory_presentations(group_id, language)<br/>saved film: voice check → WAVs → row in one transaction<br/>timeline.passages + script · a used draft is rebased in the same transaction"] --> play
     persist -- "a used saved voice was deleted (no WAV written)" --> failed
     play["/feed/{key}?lang=… — WebGL2 player<br/>CLOCK = the soundtrack's currentTime, never a timer<br/>36 shot effects + 14 transitions, one fragment shader<br/>NO model · NO ffmpeg · a LEAF under the memory grid (§13.1)"] --> save
@@ -3333,7 +3333,9 @@ that the five top-level links swap without re-rendering the nav. The routes:
   when the catalog lists no cloning entry for the profile (§4.1); existing cards still
   open, for rename and delete. A voice is a person: the same list holds the people
   whose faces are named (§6). Under the cards, **Faces to name** lists every face group
-  of the owner with no person and at least the minimum face count (2, §4.1): up to four
+  of the owner with no person and at least the minimum face count (2, §4.1), plus every
+  such group that holds a face the owner released (Not this person) whatever its size,
+  the largest first: up to four
   face crops and the number of faces, each a plain link to the group leaf
   `/faces/{id}`; it is hidden when no group waits. It is a top-level grid (§13.1). The
   old address `/organize/voices` answers 308 to `/voices`.
@@ -3346,7 +3348,8 @@ that the five top-level links swap without re-rendering the nav. The routes:
   included, because a person needs no voice copy. An attached group leaves "Faces to
   name", and its leaf offers **Remove from this person** instead. **Not this person**
   on a face moves it out to a new group of its own and pins it, so it never rejoins a
-  group automatically; a one-face group does not offer it. Every action answers the
+  group automatically; that group is listed under "Faces to name", so the face can be
+  named; a one-face group does not offer it. Every action answers the
   group leaf, swapped in place. A face crop (`/faces/crop/{face_id}`) is cut from the
   detail thumbnail on request, by the face box plus a margin of 20% of its side;
   another owner's face answers 404.

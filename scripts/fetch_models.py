@@ -64,10 +64,12 @@ def _fetch(target: str, settings: Settings) -> None:
     from huggingface_hub import snapshot_download
 
     repo, _, revision = target.partition("@")
-    if revision:
-        snapshot_download(repo, revision=revision)
-    else:
-        snapshot_download(repo)
+    options: dict[str, object] = {"revision": revision} if revision else {}
+    face = catalog.face_model_for(settings.profile)
+    if face is not None and face.source.repo == repo and face.files:
+        # The face model loads two ONNX files; the repo also holds ARM NN and RKNN builds.
+        options["allow_patterns"] = list(face.files)
+    snapshot_download(repo, **options)
 
 
 def _fetch_url(url: str, settings: Settings) -> None:

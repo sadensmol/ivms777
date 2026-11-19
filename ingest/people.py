@@ -67,13 +67,15 @@ _GROUP_SELECT = (
 def groups_to_name(
     conn: sqlite3.Connection, owner_id: int, *, min_faces: int = DEFAULT_MIN_FACES
 ) -> list[FaceGroup]:
-    """Groups with no person and at least `min_faces` faces ("Faces to name"), the
-    largest first."""
+    """Groups with no person ("Faces to name"), the largest first: each one with at least
+    `min_faces` faces, and each one holding a face the owner released ("Not this person")
+    whatever its size, so a released face can still be named."""
     rows = conn.execute(
         "SELECT g.id, g.person_id, NULL AS person_name FROM face_groups g"
         " JOIN faces f ON f.group_id = g.id"
         " WHERE g.owner_id = ? AND g.person_id IS NULL"
-        " GROUP BY g.id HAVING COUNT(*) >= ? ORDER BY COUNT(*) DESC, g.id",
+        " GROUP BY g.id HAVING COUNT(*) >= ? OR MAX(f.pinned) = 1"
+        " ORDER BY COUNT(*) DESC, g.id",
         (owner_id, min_faces),
     ).fetchall()
     return _groups(conn, rows)

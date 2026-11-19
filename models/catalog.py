@@ -151,6 +151,9 @@ class ModelEntry:
     clones: bool = False
     note: str | None = None
     adapter: AdapterSpec | None = None
+    # The snapshot files the entry loads, fetched instead of the whole Hub repo. Empty
+    # fetches the whole snapshot.
+    files: tuple[str, ...] = ()
     # A face entry's declared use (§4.1, §8.1). None for every other slot.
     score_floor: float | None = None  # the lowest detection score kept
     match_threshold: float | None = None  # the lowest cosine similarity that joins a group
@@ -514,6 +517,7 @@ FACE_MODELS: tuple[ModelEntry, ...] = (
         key="buffalo-l", slot="faces", display="InsightFace buffalo_l · faces",
         source=HfSource("immich-app/buffalo_l",
                         revision="d09715916a0778919a770c343533641e250b8699"),
+        files=("detection/model.onnx", "recognition/model.onnx"),
         size_mb=182, cost_mb=1000, cost_measured=False,
         profiles=_ALL, dim=512,
         score_floor=0.7, match_threshold=0.5, input_edge=640, min_face_px=32,
