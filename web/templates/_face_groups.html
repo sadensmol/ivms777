@@ -1,7 +1,8 @@
-{# "Faces to name" on the Voices grid (design §13): every face group of the owner with no
+{# "Faces to name" on the People grid (design §13): every face group of the owner with no
    person and at least the minimum face count, with up to four crops and its count. Each
-   group is a plain link to its leaf /faces/{id} — the one grid→leaf push (§13.1). Hidden
-   when no group waits. #}
+   group is a plain link to its leaf /faces/{id} — the one grid→leaf push (§13.1). The
+   #faces-to-name wrapper stays when no group waits, so people.js can refresh it. #}
+<div id="faces-to-name">
 {% if face_groups %}
   <section class="faces-to-name">
     <h2>Faces to name</h2>
@@ -19,3 +20,4 @@
     </div>
   </section>
 {% endif %}
+</div>

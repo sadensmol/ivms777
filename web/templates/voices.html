@@ -3,7 +3,9 @@
 {% block content %}
 {# Voices (design §6, §11.1, §13): a TOP-LEVEL grid (§13.1) — no ×, no ctx. A card is a
    plain link to its voice (a full navigation, the one grid→leaf push). Create answers
-   the cards, and voices.js opens the one marked `data-created`. #}
+   the cards, and voices.js opens the one marked `data-created`. Every voice belongs to a
+   person: New voice picks one, by default a new person with the voice's name (D8).
+   "Faces to name" lives on /people. #}
 <div class="voices-shell voices-grid" id="voices-page">
   <h1>Voices</h1>
   {% if not available %}
@@ -14,6 +16,13 @@
       <label for="voice-new-name">New voice</label>
       <input type="text" id="voice-new-name" name="name" maxlength="80" required
              placeholder="Grandma">
+      <label for="voice-new-person">Person</label>
+      <select id="voice-new-person" name="person_id">
+        <option value="" selected>New person with this name</option>
+        {% for person in people %}
+          <option value="{{ person.id }}">{{ person.name }}</option>
+        {% endfor %}
+      </select>
       <button type="submit">Create</button>
     </form>
   {% endif %}
@@ -21,8 +30,6 @@
   <p id="voices-error" class="voices-error" role="alert" hidden></p>
 
   {% include "_voice_cards.html" %}
-
-  {% include "_face_groups.html" %}
 </div>
 <script src="/static/voices.js?v={{ static_v('voices.js') }}" defer></script>
 {% endblock %}

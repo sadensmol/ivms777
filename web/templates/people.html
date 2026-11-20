@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}People — ivms777{% endblock %}
+{% block content %}
+{# People (design §6, §13): a TOP-LEVEL grid (§13.1) — no ×, no ctx. A card is a plain
+   link to its person (a full navigation, the one grid→leaf push), and so is each group of
+   "Faces to name". Create answers the cards; people.js swaps them in place. #}
+<div class="voices-shell people-grid" id="people-page">
+  <h1>People</h1>
+  <form class="voices-new js-people-form" method="post" action="/people" data-swap="people-cards">
+    <label for="person-new-name">New person</label>
+    <input type="text" id="person-new-name" name="name" maxlength="80" required
+           placeholder="Grandma">
+    <button type="submit">Create</button>
+  </form>
+
+  <p id="people-error" class="voices-error" role="alert" hidden></p>
+
+  {% include "_people_cards.html" %}
+
+  {% include "_face_groups.html" %}
+</div>
+<script src="/static/people.js?v={{ static_v('people.js') }}" defer></script>
+{% endblock %}

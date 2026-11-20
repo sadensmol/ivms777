@@ -1,9 +1,9 @@
 {% extends "base.html" %}
-{% block title %}{{ group.person_name or 'Faces to name' }} — Voices — ivms777{% endblock %}
+{% block title %}{{ group.person_name or 'Faces to name' }} — People — ivms777{% endblock %}
 {% block content %}
-{# One face group: a LEAF of the Voices grid (design §13, §13.1). ×, the "Voices" link and
+{# One face group: a LEAF of the People grid (design §13, §13.1). ×, the "People" link and
    Esc go up one level — history.back() when the page was opened from the grid
-   (`data-from-grid`, set by faces.js at mount), else location.replace("/voices"). Every
+   (`data-from-grid`, set by faces.js at mount), else location.replace("/people"). Every
    action is a fetch POST that answers this page; faces.js swaps its #face-group in place
    and pushes no history. #}
 <div class="voices-shell face-leaf" id="faces-page">
@@ -11,7 +11,7 @@
 
   <div id="face-group" data-group-id="{{ group.id }}">
     <header class="voice-head">
-      <h1 class="voice-title"><a class="faces-up" href="/voices">Voices</a>
+      <h1 class="voice-title"><a class="faces-up" href="/people">People</a>
         <span class="voice-crumb">›</span>
         <span class="voice-name">{{ group.person_name or 'Faces to name' }}</span></h1>
       <button class="voices-close faces-close" type="button" aria-label="Close">×</button>

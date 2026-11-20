@@ -17,7 +17,7 @@
   const MIN_SECONDS = 5;
   const MAX_SECONDS = 30;
   const POLL_MS = 2000;
-  const TABS = ['recordings', 'faces', 'test'];
+  const TABS = ['recordings', 'test'];
   const STATUS_URL = '/voices/preview';
   const HEARING_URL = '/voices/hearing';
   const DISCARD = 'Discard the recording you have not saved?';

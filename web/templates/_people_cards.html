@@ -1,0 +1,17 @@
+{# The People grid's cards (design §13). GET /people and POST /people render this
+   fragment; people.js swaps it in for #people-cards. Each card is a plain link to the
+   person's leaf. #}
+<div id="people-cards" class="voice-cards">
+  {% if not people %}
+    <p class="hint">No people yet.</p>
+  {% endif %}
+  {% for person in people %}
+    <a class="voice-card person-card" href="/people/{{ person.id }}" data-person-id="{{ person.id }}">
+      <span class="voice-card-name">{{ person.name }}</span>
+      {% if person.voice_names %}
+        <span class="voice-card-line">Voices: {{ person.voice_names|join(', ') }}</span>
+      {% endif %}
+      <span class="voice-card-line">{{ person.face_count }} face{{ '' if person.face_count == 1 else 's' }}</span>
+    </a>
+  {% endfor %}
+</div>

@@ -601,4 +601,11 @@ a.face-group-card:focus-visible { outline: 2px solid #8ab4f8; outline-offset: 2p
 .face-crop { display: flex; flex-direction: column; align-items: center; gap: 6px; }
 .face-crop img { width: 120px; height: 120px; object-fit: cover; border-radius: 8px;
   background: #222; }
+.person-leaf section { margin-top: 20px; }
+.person-leaf h2 { font-size: 16px; margin: 0 0 8px; }
+.person-voice-list { margin: 0; padding-left: 20px; color: #ddd; }
+.person-photo-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: 6px; }
+.person-photo-grid img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 6px;
+  background: #222; }
 .photo-people { margin: 8px 0; color: #ddd; }

@@ -1,15 +1,13 @@
-// Face groups (design §13, §13.1): the group leaf /faces/{id} and the Faces tab of a
-// person's leaf /voices/{id}.
+// Face groups (design §13, §13.1): the group leaf /faces/{id} under the People grid.
 //
-// Every action is a fetch POST of a `.js-faces-form`. On the group leaf a 2xx reply is the
-// leaf page of the group; its #face-group is swapped in place, and when the group shown
-// changed (the last face left it) the URL is replaced, never added to history. On a
-// person's Faces tab a 2xx reply takes the group out of the list. A 4xx/5xx reply shows
-// its `detail` in the page's error line.
+// Every action is a fetch POST of a `.js-faces-form`. A 2xx reply is the leaf page of the
+// group; its #face-group is swapped in place, and when the group shown changed (the last
+// face left it) the URL is replaced, never added to history. A 4xx/5xx reply shows its
+// `detail` in the page's error line.
 //
-// Close (×, the "Voices" link, Esc) goes up one level: history.back() when the leaf was
-// opened from the grid — marked `data-from-grid` at mount when the referrer is /voices of
-// this origin — else location.replace("/voices"). The leaf holds no level of its own.
+// Close (×, the "People" link, Esc) goes up one level: history.back() when the leaf was
+// opened from the grid — marked `data-from-grid` at mount when the referrer is /people of
+// this origin — else location.replace("/people"). The leaf holds no level of its own.
 //
 // htmx runs this script again on a boosted nav and on a history restore, so the wiring
 // happens ONCE (`window.__facesWired`) and every listener resolves its nodes at event time.
@@ -22,7 +20,7 @@
   }
 
   function errorLine() {
-    return document.getElementById('faces-error') || document.getElementById('voices-error');
+    return document.getElementById('faces-error');
   }
 
   function showError(text) {
@@ -44,7 +42,7 @@
     } catch (_) {
       return false;
     }
-    return url.origin === origin && url.pathname === '/voices';
+    return url.origin === origin && url.pathname === '/people';
   }
 
   function mount() {
@@ -59,7 +57,7 @@
     if (page && page.hasAttribute('data-from-grid')) {
       history.back();
     } else {
-      location.replace('/voices');
+      location.replace('/people');
     }
   }
 
@@ -82,15 +80,6 @@
     if (location.pathname !== path) { history.replaceState(history.state, '', path); }
   }
 
-  function dropOwnedGroup(form) {
-    const card = form.closest('.face-group-owned');
-    const list = card && card.parentElement;
-    if (!card) { return; }
-    card.remove();
-    const none = list && list.querySelector('.voice-faces-none');
-    if (none && !list.querySelector('.face-group-owned')) { none.hidden = false; }
-  }
-
   document.addEventListener('submit', async (event) => {
     const form = event.target;
     if (!form.matches || !form.matches('.js-faces-form')) { return; }
@@ -109,10 +98,6 @@
     }
     if (!response.ok) {
       showError(await detailOf(response));
-      return;
-    }
-    if (form.closest('.face-group-owned')) {
-      dropOwnedGroup(form);
       return;
     }
     swapLeaf(await response.text());

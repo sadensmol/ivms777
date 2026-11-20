@@ -1,4 +1,4 @@
-"""The face-group pages (design §13, §13.1): the leaf `/faces/{id}` under the Voices grid,
+"""The face-group pages (design §13, §13.1): the leaf `/faces/{id}` under the People grid,
 its actions, and the face crops.
 
 Every action is a `fetch` POST that answers the group leaf it was taken on (faces.js swaps
@@ -14,17 +14,19 @@ from fastapi.responses import HTMLResponse, Response
 from fastapi.templating import Jinja2Templates
 from PIL import Image, UnidentifiedImageError
 
-from feed.saved_voices import VoiceDeleting, VoiceError, VoiceNameTaken, list_voices
 from ingest.people import (
     FaceGroup,
+    PersonError,
     assign_group,
     create_person_for_group,
     group_detail,
+    list_people,
     release_face,
     unassign_group,
 )
 from ingest.thumbs import thumb_key
 from web.deps import AppContext
+from web.people_api import refuse_person
 
 GROUP_NOT_FOUND = "This face group does not exist."
 FACE_NOT_FOUND = "This face does not exist."
@@ -56,16 +58,10 @@ def register(
     templates: Jinja2Templates,
 ) -> None:
     def _leaf(request: Request, ctx: AppContext, group: FaceGroup) -> HTMLResponse:
-        people = [
-            voice for voice in list_voices(ctx.conn, ctx.settings.owner_id) if not voice.deleting
-        ]
+        people = list_people(ctx.conn, ctx.settings.owner_id)
         return templates.TemplateResponse(
             request, "face_group.html", {"group": group, "people": people}
         )
-
-    def _refuse(error: VoiceError) -> HTTPException:
-        status = 409 if isinstance(error, VoiceNameTaken | VoiceDeleting) else 400
-        return HTTPException(status_code=status, detail=str(error))
 
     @app.get("/faces/crop/{face_id}")
     def face_crop(face_id: int) -> Response:
@@ -104,10 +100,7 @@ def register(
         owner_id = ctx.settings.owner_id
         if group_detail(ctx.conn, owner_id, group_id) is None:
             raise HTTPException(status_code=404, detail=GROUP_NOT_FOUND)
-        try:
-            group = assign_group(ctx.conn, owner_id, group_id, person_id)
-        except VoiceError as error:
-            raise _refuse(error) from error
+        group = assign_group(ctx.conn, owner_id, group_id, person_id)
         if group is None:
             raise HTTPException(status_code=404, detail=PERSON_NOT_FOUND)
         return _leaf(request, ctx, group)
@@ -119,8 +112,8 @@ def register(
         ctx = context()
         try:
             group = create_person_for_group(ctx.conn, ctx.settings.owner_id, group_id, name)
-        except VoiceError as error:
-            raise _refuse(error) from error
+        except PersonError as error:
+            raise refuse_person(error) from error
         if group is None:
             raise HTTPException(status_code=404, detail=GROUP_NOT_FOUND)
         return _leaf(request, ctx, group)
