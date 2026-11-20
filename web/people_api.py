@@ -6,6 +6,8 @@ error; none pushes history. Every lookup is scoped to the owner: another owner's
 404.
 """
 
+import json
+import sqlite3
 from collections.abc import Callable
 
 from fastapi import FastAPI, Form, HTTPException, Request
@@ -41,6 +43,18 @@ def refuse_person(error: PersonError) -> HTTPException:
     return HTTPException(status_code=status, detail=str(error))
 
 
+def newest_shot_first(conn: sqlite3.Connection, photo_ids: list[int]) -> list[int]:
+    """The photos newest shot first; a photo with no shot time comes last."""
+    return [
+        row["id"]
+        for row in conn.execute(
+            "SELECT id FROM photos WHERE id IN (SELECT value FROM json_each(?))"
+            " ORDER BY shot_at IS NULL, shot_at DESC, id DESC",
+            (json.dumps(photo_ids),),
+        )
+    ]
+
+
 def register(
     app: FastAPI,
     context: Callable[[], AppContext],
@@ -58,8 +72,9 @@ def register(
                 "person": person,
                 "voices": person_voices(ctx.conn, owner_id, person_id),
                 "groups": person_groups(ctx.conn, owner_id, person_id),
-                # The doc shows the newest photo first; person_photos gives the oldest first.
-                "photo_ids": list(reversed(person_photos(ctx.conn, owner_id, person_id))),
+                "photo_ids": newest_shot_first(
+                    ctx.conn, person_photos(ctx.conn, owner_id, person_id)
+                ),
             },
         )
 
