@@ -9,7 +9,6 @@ import httpx
 import pytest
 from PIL import Image
 
-from feed.saved_voices import create_voice
 from inference.models_client import DetectedFace
 from ingest.faces import FaceStageParams, backfill_faces, faces_handler
 from ingest.jobs import enqueue, reprocess_one
@@ -18,7 +17,7 @@ from ingest.pipeline import drain_pass
 from ingest.vocab import load_vocab
 from ingest.worker import Preempted, drain
 from storage.local import LocalStorage
-from tests.factories import add_face, add_face_group, add_photo
+from tests.factories import add_face, add_face_group, add_person, add_photo
 from web.app import VOCAB_PATH
 from web.deps import build_context
 
@@ -185,7 +184,7 @@ def test_a_drain_pass_with_the_models_service_down_defers_the_faces_job(settings
 
 def test_a_new_face_that_matches_a_named_group_is_that_person_at_once(conn, originals):
     known = add_photo(conn, content_hash="k1")
-    ann = create_voice(conn, 1, "Ann").id
+    ann = add_person(conn, name="Ann")
     group = add_face_group(conn, person_id=ann)
     add_face(conn, photo_id=known, group_id=group, vector=_basis(0))
     add_face(conn, photo_id=known, group_id=group, vector=_basis(0))

@@ -1,6 +1,7 @@
 """The `/faces/*` routes refuse what the owner does not hold (design §6, §13): another
-owner's group or face, a missing person, a person being deleted, a crop with no readable
-detail thumbnail. Each refusal leaves the rows as they were."""
+owner's group or face, another owner's person, a crop with no readable detail thumbnail.
+Each refusal leaves the rows as they were. A person is a `people` row; a voice being deleted
+never blocks its person (D7)."""
 
 import io
 import itertools
@@ -11,7 +12,7 @@ from PIL import Image
 
 from feed.saved_voices import create_voice, request_voice_deletion
 from ingest.thumbs import thumb_key
-from tests.factories import add_face, add_face_group, add_photo
+from tests.factories import add_face, add_face_group, add_person, add_photo
 from web.app import create_app
 
 OWNER = 1
@@ -80,6 +81,10 @@ def _face_row(client, face: int) -> tuple:
     )
 
 
+def _people_names(client) -> list[str]:
+    return [r[0] for r in _conn(client).execute("SELECT name FROM people ORDER BY id")]
+
+
 def _voice_names(client) -> list[str]:
     return [r[0] for r in _conn(client).execute("SELECT name FROM saved_voices ORDER BY id")]
 
@@ -92,34 +97,35 @@ def test_the_leaf_of_another_owners_group_is_a_404(client):
 
 
 def test_another_owners_group_is_never_attached_to_my_person(client):
-    person = create_voice(_conn(client), OWNER, "Ann")
+    person = add_person(_conn(client), name="Ann")
     theirs, _ = _group(client, 2, owner_id=OTHER_OWNER)
 
-    response = client.post(f"/faces/{theirs}/assign", data={"person_id": person.id})
+    response = client.post(f"/faces/{theirs}/assign", data={"person_id": person})
 
     assert response.status_code == 404
     assert _person_of(client, theirs) is None
 
 
 def test_my_group_is_never_attached_to_another_owners_person(client):
-    theirs = create_voice(_conn(client), OTHER_OWNER, "Bob")
+    theirs = add_person(_conn(client), owner_id=OTHER_OWNER, name="Bob")
     mine, _ = _group(client, 2)
 
-    response = client.post(f"/faces/{mine}/assign", data={"person_id": theirs.id})
+    response = client.post(f"/faces/{mine}/assign", data={"person_id": theirs})
 
     assert response.status_code == 404
     assert _person_of(client, mine) is None
 
 
-def test_attaching_to_a_person_being_deleted_is_a_409(client):
-    person = create_voice(_conn(client), OWNER, "Ann")
-    assert request_voice_deletion(_conn(client), OWNER, person.id)
+def test_attaching_to_a_person_whose_voice_is_being_deleted_attaches_the_group(client):
+    person = add_person(_conn(client), name="Ann")
+    voice = create_voice(_conn(client), OWNER, "Ann's voice", person_id=person)
+    assert request_voice_deletion(_conn(client), OWNER, voice.id)
     group, _ = _group(client, 2)
 
-    response = client.post(f"/faces/{group}/assign", data={"person_id": person.id})
+    response = client.post(f"/faces/{group}/assign", data={"person_id": person})
 
-    assert response.status_code == 409
-    assert _person_of(client, group) is None
+    assert response.status_code == 200
+    assert _person_of(client, group) == person
 
 
 def test_a_new_person_for_another_owners_group_is_a_404_and_creates_no_person(client):
@@ -128,7 +134,7 @@ def test_a_new_person_for_another_owners_group_is_a_404_and_creates_no_person(cl
     response = client.post(f"/faces/{theirs}/person", data={"name": "Ann"})
 
     assert response.status_code == 404
-    assert _voice_names(client) == []
+    assert _people_names(client) == [] and _voice_names(client) == []
     assert _person_of(client, theirs) is None
 
 
@@ -142,13 +148,13 @@ def test_releasing_another_owners_face_is_a_404_and_moves_nothing(client):
 
 
 def test_removing_another_owners_group_from_its_person_is_a_404(client):
-    their_person = create_voice(_conn(client), OTHER_OWNER, "Bob")
-    theirs, _ = _group(client, 2, owner_id=OTHER_OWNER, person_id=their_person.id)
+    their_person = add_person(_conn(client), owner_id=OTHER_OWNER, name="Bob")
+    theirs, _ = _group(client, 2, owner_id=OTHER_OWNER, person_id=their_person)
 
     response = client.post(f"/faces/{theirs}/unassign")
 
     assert response.status_code == 404
-    assert _person_of(client, theirs) == their_person.id
+    assert _person_of(client, theirs) == their_person
 
 
 def test_releasing_the_only_face_of_a_group_answers_its_new_group_and_drops_the_old(client):

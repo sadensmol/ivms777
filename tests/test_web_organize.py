@@ -80,9 +80,9 @@ def test_organize_no_longer_links_to_voices(client):
     assert 'href="/voices"' not in head
 
 
-def test_the_nav_lists_five_destinations_in_order(client):
+def test_the_nav_lists_six_destinations_in_order(client):
     body = client.get("/library").text
     nav = body[body.index('<nav class="nav"'):body.index("</nav>")]
     assert re.findall(r'<a href="(/[a-z]+)">', nav) == [
-        "/upload", "/library", "/chat", "/organize", "/voices"]
+        "/upload", "/library", "/chat", "/organize", "/people", "/voices"]
     assert 'id="settings-open"' in nav

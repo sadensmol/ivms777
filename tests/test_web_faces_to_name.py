@@ -1,4 +1,4 @@
-"""Who shows in "Faces to name" (design §6, §13, AC6): at the default minimum of two faces a
+"""Who shows in "Faces to name" on the People grid (design §6, §13, AC18): at the default minimum of two faces a
 1-face group is hidden, and a face the owner released ("Not this person") is still reached
 from there and can be named, whatever the size of its new group."""
 
@@ -10,9 +10,8 @@ import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from feed.saved_voices import create_voice
 from ingest.thumbs import thumb_key
-from tests.factories import add_face, add_face_group, add_photo
+from tests.factories import add_face, add_face_group, add_person, add_photo
 from web.app import create_app
 
 OWNER = 1
@@ -70,22 +69,22 @@ def test_at_the_default_minimum_a_one_face_group_is_hidden_and_a_two_face_group_
     single, _ = _group(client, 1)
     pair, _ = _group(client, 2)
 
-    body = client.get("/voices").text
+    body = client.get("/people").text
 
     assert not _links_to(body, single)
     assert _links_to(body, pair)
 
 
 def test_a_released_face_is_listed_in_faces_to_name_and_can_be_named(client):
-    ann = create_voice(_conn(client), OWNER, "Ann").id
-    bob = create_voice(_conn(client), OWNER, "Bob").id
+    ann = add_person(_conn(client), name="Ann")
+    bob = add_person(_conn(client), name="Bob")
     ann_group, faces = _group(client, 2, person_id=ann)
 
     released = client.post(f"/faces/face/{faces[0]}/release")
     new_group = _group_of(client, faces[0])
-    listed = client.get("/voices").text
+    listed = client.get("/people").text
     named = client.post(f"/faces/{new_group}/assign", data={"person_id": str(bob)})
-    after = client.get("/voices").text
+    after = client.get("/people").text
 
     assert released.status_code == 200
     assert new_group != ann_group

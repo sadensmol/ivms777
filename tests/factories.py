@@ -59,6 +59,18 @@ def add_photo(
     return new_id
 
 
+def add_person(conn: sqlite3.Connection, *, owner_id: int = 1, name: str) -> int:
+    """Insert one person (design §6: a person is its own record, not a saved voice)."""
+    has_people = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'people'"
+    ).fetchone()
+    assert has_people is not None, "the schema has no people table"
+    cursor = conn.execute(
+        "INSERT INTO people(owner_id, name, created_at) VALUES (?, ?, ?)", (owner_id, name, NOW)
+    )
+    return int(cursor.lastrowid)
+
+
 def add_face_group(
     conn: sqlite3.Connection, *, owner_id: int = 1, person_id: int | None = None
 ) -> int:

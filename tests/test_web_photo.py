@@ -289,14 +289,13 @@ def test_a_loose_thumbnail_pages_within_the_expanded_set(client):
 
 
 def _named_faces(client, photo, names_per_face):
-    from feed.saved_voices import create_voice
-    from tests.factories import add_face, add_face_group
+    from tests.factories import add_face, add_face_group, add_person
 
     conn = client.app.state.context.conn
     people = {}
     for name in names_per_face:
         if name not in people:
-            people[name] = create_voice(conn, 1, name).id
+            people[name] = add_person(conn, name=name)
         group = add_face_group(conn, person_id=people[name])
         add_face(conn, photo_id=photo, group_id=group, vector=(1.0, 0.0))
     return people
@@ -309,7 +308,8 @@ def test_photo_page_names_the_recognised_people_as_plain_text(client):
     body = client.get(f"/photo/{photo}").text
 
     assert "Zebediah" in body and "Quillon" in body
-    assert all(f'href="/voices/{person}"' not in body for person in people.values())
+    assert all(f'href="/people/{person}"' not in body and f'href="/voices/{person}"' not in body
+               for person in people.values())
 
 
 def test_photo_page_names_a_person_found_in_two_groups_once(client):
@@ -317,3 +317,19 @@ def test_photo_page_names_a_person_found_in_two_groups_once(client):
     _named_faces(client, photo, ["Zebediah", "Zebediah"])
 
     assert client.get(f"/photo/{photo}").text.count("Zebediah") == 1
+
+
+def test_photo_page_names_the_person_not_their_voice_and_follows_a_rename(client):
+    from feed.saved_voices import create_voice
+
+    photo = _first_id(client)
+    person = _named_faces(client, photo, ["Zebediah"])["Zebediah"]
+    create_voice(client.app.state.context.conn, 1, "Quillon", person_id=person)
+
+    before = client.get(f"/photo/{photo}").text
+    renamed = client.post(f"/people/{person}/rename", data={"name": "Ozymandias"})
+    after = client.get(f"/photo/{photo}").text
+
+    assert "Zebediah" in before and "Quillon" not in before
+    assert renamed.status_code == 200
+    assert "Ozymandias" in after and "Zebediah" not in after and "Quillon" not in after

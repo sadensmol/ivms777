@@ -188,10 +188,9 @@ def test_the_brief_names_the_people_of_the_shot():
 
 
 def test_each_shot_carries_the_named_people_recognised_in_it_once(conn, group):
-    from feed.saved_voices import create_voice
-    from tests.factories import add_face, add_face_group
+    from tests.factories import add_face, add_face_group, add_person
 
-    ann = create_voice(conn, 1, "Ann").id
+    ann = add_person(conn, name="Ann")
     named = add_face_group(conn, person_id=ann)
     unnamed = add_face_group(conn)
     add_face(conn, photo_id=2, group_id=named, vector=(1.0, 0.0))
@@ -203,3 +202,22 @@ def test_each_shot_carries_the_named_people_recognised_in_it_once(conn, group):
     assert signals[2].people == ("Ann",)
     assert "people=Ann" in signals[2].brief()
     assert signals[1].people == ()
+
+
+def test_a_shot_names_the_person_not_their_voice_and_follows_a_rename(conn, group):
+    from feed.saved_voices import create_voice
+    from ingest import people
+    from tests.factories import add_face, add_face_group, add_person
+
+    ann = add_person(conn, name="Ann")
+    create_voice(conn, 1, "Grandma's voice", person_id=ann)
+    named = add_face_group(conn, person_id=ann)
+    add_face(conn, photo_id=2, group_id=named, vector=(1.0, 0.0))
+
+    before = {s.photo_id: s for s in read_signals(conn, group)}[2].people
+    people.rename_person(conn, 1, ann, "Anna")
+    after = {s.photo_id: s for s in read_signals(conn, group)}[2]
+
+    assert before == ("Ann",)
+    assert after.people == ("Anna",)
+    assert "people=Anna" in after.brief() and "Grandma" not in after.brief()

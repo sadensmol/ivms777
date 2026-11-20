@@ -39,3 +39,27 @@ def test_the_models_extra_installs_the_onnx_converter_the_docs_name():
     models_extra = _requirement_names(project["project"]["optional-dependencies"]["models"])
     assert {"onnx", "onnx2torch"} <= models_extra
     assert not {"onnx", "onnx2torch"} & _requirement_names(project["project"]["dependencies"])
+
+
+def _section(text: str, heading: str, next_heading: str) -> str:
+    return text[text.index(heading):text.index(next_heading)]
+
+
+def test_the_docs_describe_people_as_their_own_record():
+    plan = REPO_ROOT / "docs/plans/28-people.md"
+    assert plan.exists()
+    design = (REPO_ROOT / "docs/design.md").read_text(encoding="utf-8")
+    data_model = (REPO_ROOT / "docs/data-model.md").read_text(encoding="utf-8")
+    ui = (REPO_ROOT / "docs/ui.md").read_text(encoding="utf-8")
+    data_section = _section(design, "## 6. Data model", "## 6.1 ")
+    ui_section = _section(design, "## 13. UI", "### 13.1 ")
+    navigation = design[design.index("### 13.1 "):]
+
+    assert "A person IS a `saved_voices` row" not in design
+    assert "**`people`**" in data_section
+    assert "/people" in ui_section and "/people/{id}" in ui_section
+    assert "/people" in navigation
+    assert "people pages" in design[:design.index("## 6. Data model")]
+    assert "REFERENCES people(id)" in data_model
+    assert "/people/{id}" in ui
+    assert "people" in plan.read_text(encoding="utf-8")
