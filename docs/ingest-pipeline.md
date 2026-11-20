@@ -49,8 +49,8 @@ the column existed backfills the same way — no re-caption needed.
    then puts each new face into a group: the owner's group whose mean face vector has
    the highest cosine similarity with it, when that similarity reaches
    `match_threshold` (0.5, env-overridable in `config.py`); else a new `face_groups`
-   row. A pinned face never moves. A face that joins a group attached to a person is
-   that person at once. A photo with no face completes with no rows.
+   row. A pinned face never moves. A face that joins a group attached to a person (a
+   `people` row, design §6) is that person at once. A photo with no face completes with no rows.
 
 **Stages are drained in order across the whole library, not per photo.** Every
 photo is embedded and scored before any photo is captioned. This keeps the Jetson

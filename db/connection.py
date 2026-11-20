@@ -5,7 +5,7 @@ from pathlib import Path
 import sqlite_vec
 
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 
 class SchemaTooOldError(RuntimeError):
@@ -74,6 +74,7 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("voice_tests", "likeness_json", "TEXT"),
     ("voice_tests", "likeness_error", "TEXT"),
     ("voice_tests", "prompt_example_id", "INTEGER REFERENCES voice_examples(id) ON DELETE SET NULL"),
+    ("saved_voices", "person_id", "INTEGER REFERENCES people(id) ON DELETE RESTRICT"),
 )
 
 
@@ -101,11 +102,22 @@ def _migrate_locked(conn: sqlite3.Connection) -> None:
     # Both steps are idempotent, so migrate always converges the schema regardless
     # of the stamped version: create any missing tables, add any missing columns.
     _rebuild_presentations_for_language(conn)
+    # Before the schema script: it indexes added columns, and an index on a missing column fails.
+    _ensure_columns(conn)
+    legacy_faces = _set_aside_faces_linked_to_voices(conn)
     # Not executescript: it COMMITs first, which would drop the lock taken above.
     for statement in _statements(SCHEMA_PATH.read_text()):
         conn.execute(statement)
-    _ensure_columns(conn)
+    _give_each_voice_a_person(conn)
+    if legacy_faces:
+        _move_legacy_faces_to_people(conn)
     _backfill_memory_fts(conn)
+    for table in ("saved_voices", "face_groups", "faces"):
+        broken = conn.execute(f"PRAGMA foreign_key_check({table})").fetchall()
+        if broken:
+            raise sqlite3.IntegrityError(
+                f"migration left {len(broken)} rows of {table} with a broken foreign key"
+            )
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
@@ -129,6 +141,85 @@ def _rebuild_presentations_for_language(conn: sqlite3.Connection) -> None:
     columns = {r["name"] for r in conn.execute("PRAGMA table_info(memory_presentations)")}
     if columns and "language" not in columns:
         conn.execute("DROP TABLE memory_presentations")
+
+
+def _give_each_voice_a_person(conn: sqlite3.Connection) -> None:
+    """Schema 16 (design §6): a voice with no person gets the owner's person of the same
+    name, or a new person with the voice's name. Idempotent: a voice that has a person is
+    never touched."""
+    voices = conn.execute(
+        "SELECT id, owner_id, name, created_at FROM saved_voices WHERE person_id IS NULL ORDER BY id"
+    ).fetchall()
+    if not voices:
+        return
+    # Python casefold, not COLLATE NOCASE: SQLite folds ASCII only, and names are often Cyrillic.
+    people: dict[tuple[int, str], int] = {
+        (row["owner_id"], row["name"].casefold()): row["id"]
+        # Descending, so the oldest person of a name wins.
+        for row in conn.execute("SELECT id, owner_id, name FROM people ORDER BY id DESC")
+    }
+    for voice in voices:
+        key = (voice["owner_id"], voice["name"].casefold())
+        if key not in people:
+            people[key] = conn.execute(
+                "INSERT INTO people(owner_id, name, created_at) VALUES (?, ?, ?)",
+                (voice["owner_id"], voice["name"], voice["created_at"]),
+            ).lastrowid
+        conn.execute(
+            "UPDATE saved_voices SET person_id = ? WHERE id = ?", (people[key], voice["id"])
+        )
+
+
+def _set_aside_faces_linked_to_voices(conn: sqlite3.Connection) -> bool:
+    """Schema 16 moved `face_groups.person_id` from `saved_voices` to `people`. SQLite
+    cannot change a foreign key in place, and dropping `face_groups` would null the group
+    of every face, so both tables are renamed aside (the rename keeps `faces` linked to
+    the renamed groups) and their indexes dropped; the schema script then creates the new
+    ones. True when the tables were set aside."""
+    if "face_groups" not in _table_names(conn):
+        return False
+    parents = {row["table"] for row in conn.execute("PRAGMA foreign_key_list(face_groups)")}
+    if "saved_voices" not in parents:
+        return False
+    for index in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL"
+        " AND tbl_name IN ('faces', 'face_groups')"
+    ).fetchall():
+        conn.execute(f"DROP INDEX {index['name']}")
+    conn.execute("ALTER TABLE face_groups RENAME TO legacy_face_groups")
+    conn.execute("ALTER TABLE faces RENAME TO legacy_faces")
+    return True
+
+
+def _move_legacy_faces_to_people(conn: sqlite3.Connection) -> None:
+    """Copy every face group and face with its id into the new tables, a group's voice
+    becoming that voice's person, then drop the set-aside tables. The AUTOINCREMENT
+    counters carry over, so a deleted id is still never reused."""
+    conn.execute(
+        "INSERT INTO face_groups(id, owner_id, person_id, created_at, updated_at)"
+        " SELECT g.id, g.owner_id, v.person_id, g.created_at, g.updated_at"
+        " FROM legacy_face_groups g LEFT JOIN saved_voices v ON v.id = g.person_id ORDER BY g.id"
+    )
+    conn.execute(
+        "INSERT INTO faces(id, photo_id, group_id, box_x, box_y, box_w, box_h, score, vector,"
+        " model, pinned, created_at)"
+        " SELECT id, photo_id, group_id, box_x, box_y, box_w, box_h, score, vector,"
+        " model, pinned, created_at FROM legacy_faces ORDER BY id"
+    )
+    for table in ("face_groups", "faces"):
+        conn.execute(
+            "UPDATE sqlite_sequence SET seq = MAX(seq,"
+            " (SELECT seq FROM sqlite_sequence WHERE name = ?)) WHERE name = ?",
+            (f"legacy_{table}", table),
+        )
+        conn.execute(
+            "INSERT INTO sqlite_sequence(name, seq)"
+            " SELECT ?, seq FROM sqlite_sequence WHERE name = ?"
+            " AND NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = ?)",
+            (table, f"legacy_{table}", table),
+        )
+    conn.execute("DROP TABLE legacy_faces")
+    conn.execute("DROP TABLE legacy_face_groups")
 
 
 def _backfill_memory_fts(conn: sqlite3.Connection) -> None:

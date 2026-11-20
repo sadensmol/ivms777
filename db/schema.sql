@@ -207,14 +207,26 @@ CREATE TABLE IF NOT EXISTS app_settings (
   PRIMARY KEY (owner_id, key)
 );
 
+-- A PERSON (design §6): someone the owner knows. Owns saved voices and face groups. The name is unique per owner,
+-- compared case-blind in code (ingest/people.py); this UNIQUE is case-sensitive.
+CREATE TABLE IF NOT EXISTS people (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,   -- never reused: a stale tab never acts on a new person
+  owner_id   INTEGER NOT NULL,
+  name       TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT,
+  UNIQUE(owner_id, name)
+);
 -- A SAVED VOICE (design §6, §11.1): the name the user gave a person's voice. User data — never a catalog Speaker.
 CREATE TABLE IF NOT EXISTS saved_voices (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,   -- never reused: a delete intent, a stale tab or a narrator id never hits a new voice
   owner_id   INTEGER NOT NULL,
   name       TEXT NOT NULL,
   created_at TEXT NOT NULL,
+  person_id  INTEGER REFERENCES people(id) ON DELETE RESTRICT,  -- NULL only on a row written outside create_voice
   UNIQUE(owner_id, name)
 );
+CREATE INDEX IF NOT EXISTS saved_voices_person_id_idx ON saved_voices(person_id);
 -- One example clip of a saved voice, in ONE language. The model-independent source of truth.
 CREATE TABLE IF NOT EXISTS voice_examples (
   id           INTEGER PRIMARY KEY AUTOINCREMENT, -- never reused, as saved_voices.id
@@ -407,12 +419,12 @@ CREATE TABLE IF NOT EXISTS voice_file_deletions (
   UNIQUE(storage_key, deletion_id)
 );
 CREATE INDEX IF NOT EXISTS voice_file_deletions_by_deletion ON voice_file_deletions(deletion_id);
--- A face group (design §6): faces the worker judged to be one person. person_id is the saved voice the owner attached it to;
+-- A face group (design §6): faces the worker judged to be one person. person_id is the person the owner attached it to;
 -- NULL = not named yet ("Faces to name"). Deleting the person returns the group to unnamed.
 CREATE TABLE IF NOT EXISTS face_groups (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,   -- never reused: a stale tab never acts on a new group
   owner_id   INTEGER NOT NULL,
-  person_id  INTEGER REFERENCES saved_voices(id) ON DELETE SET NULL,
+  person_id  INTEGER REFERENCES people(id) ON DELETE SET NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT
 );

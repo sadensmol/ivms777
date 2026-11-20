@@ -615,7 +615,7 @@ flowchart TB
     end
 
     subgraph gpu["The GPU box · docker compose (jetson/cloud) · host processes (mac)"]
-        app["app · FastAPI + Jinja + HTMX<br/>UI · read queries · upload receipt · saved-voice receipt · naming face groups · face crops from thumbnails · hearing the words of a take · voice tests · /api/plan (stage-2 plan document)<br/>NO models, NO torch — a thin client of the models service"]
+        app["app · FastAPI + Jinja + HTMX<br/>UI · read queries · upload receipt · saved-voice receipt · people pages (/people grid · /people/{id} leaf) · naming face groups · face crops from thumbnails · hearing the words of a take · voice tests · /api/plan (stage-2 plan document)<br/>NO models, NO torch — a thin client of the models service"]
         worker["worker · ingest pipeline (primary writer)<br/>facets · thumbs · taxonomy · caption · faces + face groups · memories · feed audio · deletions (folders · saved voices)<br/>NO models, NO torch — a thin client of the models service"]
         models["models · THE ONE INFERENCE GATEWAY (§5.1)<br/>the only process that imports torch/transformers AND the only client of the inference server<br/>hosts the image/text embedder in KILLABLE TorchWorker children (parent imports no torch) on the GPU — mps (mac) / cuda (jetson, cloud), NEVER cpu (§3.1) · memory governor swaps embedder↔LLM under budget (§8.1)<br/>owns the model slots + downloads (§4.1)<br/>trains a saved voice's LoRA adapter in a killable voice_train child (§8.1)<br/>hears the words of a saved voice's takes in a killable asr child (§8.1)<br/>measures speaker embeddings of takes and tests in a killable speaker_embed child (§8.1)<br/>finds faces and their vectors in a killable faces child (§8.1)<br/>HTTP: /embed/image · /embed/text · /embed/spec · /tag · /caption · /speak · /music · /plan · /chat · /resources · /models/* · /voice/bakes · /voice/transcribe · /voice/embed · /faces/detect"]
         infer["inference · llama.cpp llama-server (mac/jetson) | vLLM (cloud)<br/>ONE gemma4-E2B GGUF — text (planner/chat) AND vision (caption), on the GPU<br/>reached ONLY by the models service · (host on mac, container on jetson/cloud)"]
@@ -1094,8 +1094,31 @@ The library is one SQLite file. **The full DDL — every table and index, the
   signature no longer matches the library's.
 - **`uploads`**, **`chat_sessions` / `chat_messages`** — the folder list (§3.2c) and
   the persisted chat transcript (§10).
+- **`people`** — one owner's list of people: a name per owner, 1-80 characters,
+  unique per owner case-insensitive (checked in code; the schema holds
+  `UNIQUE(owner_id, name)`), with created and updated times. A person is its own record:
+  **a person owns voices and face groups, never the other way round**. A person holds no
+  file, so deleting one runs inline, with no outbox. It is refused with its reason while
+  the person owns a saved voice, one being deleted included (`saved_voices.person_id` is
+  `ON DELETE RESTRICT`), so a voice never loses its person; otherwise the person goes and
+  their face groups return to "Faces to name" (`face_groups.person_id` is `ON DELETE SET
+  NULL`). No photo, face or voice is deleted with a person. The id uses `AUTOINCREMENT`,
+  so a stale page never acts on a new person. A new voice takes a person: one the owner
+  picks, or by default a new person with the voice's name; when a person of that name
+  exists, the create is refused with its reason and nothing is written, so a voice is
+  never linked to a person by a silent name match. A voice can move to another person of
+  the same owner. **The migration to people** is additive and idempotent: every saved
+  voice with no person gets the owner's person of the same name, or a new one with the
+  voice's name and owner (a voice being deleted too); a face group attached to a voice
+  is attached to that voice's person. A face and face group table that still links to
+  `saved_voices` is rebuilt in the migration transaction with every row and id kept
+  (SQLite cannot change a foreign key in place, and dropping the group table would clear
+  every face's group), then `PRAGMA foreign_key_check` runs. `saved_voices.person_id`
+  is nullable in the database, because SQLite adds a column only that way; every write
+  sets it, and every read tolerates a voice with no person.
 - **`saved_voices` / `voice_examples`** — a **saved voice** is user data, never a
-  catalog speaker: a name per owner, and its example clips, each in ONE language
+  catalog speaker: a name per owner, the person it belongs to (`person_id` → `people`),
+  and its example clips, each in ONE language
   (`recorded` or `uploaded`). An example is a
   mono PCM-16 WAV at 48 kHz with its sha256 and its length. An example also holds the words that speech
   recognition heard in it after it was saved (`transcript`, with `transcript_model` = the
@@ -1175,12 +1198,12 @@ The library is one SQLite file. **The full DDL — every table and index, the
   (below): one owner-scoped, idempotent intent per voice or example, and one row per
   file in `data_dir/voices` that may have lost its last row, or may never get one.
 - **`face_groups` / `faces`** — the faces the `faces` stage found (§8) and the groups
-  it put them in. **A person IS a `saved_voices` row**: one list of people, the same
-  list a voice belongs to, and a face group attaches to it. There is no second person
-  table. A `face_groups` row is one owner's group, with `person_id` = the saved voice
-  it is attached to, NULL while it waits under "Faces to name" (§13).
-  `person_id` is `ON DELETE SET NULL`, so deleting a person returns their groups to
-  "Faces to name". A `faces` row is one face of one photo: the box in 0..1 of the
+  it put them in. A `face_groups` row is one owner's group, with `person_id` = the
+  person in `people` it is attached to, NULL while it waits under "Faces to name"
+  (§13). A face group never points to a saved voice: naming a group with a new name
+  creates a person only, never a voice. `person_id` is `ON DELETE SET NULL`, so deleting
+  a person returns their groups to "Faces to name"; deleting a voice keeps its person
+  and the person's groups. A `faces` row is one face of one photo: the box in 0..1 of the
   upright image (`box_x`, `box_y`, `box_w`, `box_h`), the detector `score`, the
   L2-normalised float32 `vector`, `model` = `<key>@<revision>`, and `pinned` = the
   owner moved it by hand ("Not this person"), so grouping never moves it again.
@@ -2197,7 +2220,8 @@ previous film playable.
    - every photograph's **full signal set** (`ShotSignal.brief()`): the rich
      description, all ten taxonomy dimensions, place, time, camera, aperture, ISO,
      orientation, and `people=Ann, Bob` — the names of the people recognised in it
-     (its faces whose group is attached to a person, §6, each name once) — so it can
+     (its faces whose group is attached to a person, §6, each name once; the name is the
+     person's in `people`, never a voice's, and a person with no voice is named too) — so it can
      answer *which picture is this sentence about?*. A shot with no named person has
      no `people=` part, so its brief is the same as before. The story pass reads the
      same brief, so the story can name the people in a photograph;
@@ -2360,7 +2384,7 @@ no training wait are involved (§4.1).
 ```mermaid
 flowchart TB
     trigger["Prepare film (manual, background thread)<br/>one at a time per process · per LANGUAGE<br/>narrator: Automatic · a preset voice · a saved voice"] --> sig
-    sig["1 · Signals (PURE SQL, no model)<br/>orientation · tags (vibe/palette/light/quality/subject)<br/>place_city · shot_at · SigLIP vector<br/>people: the names of the persons recognised in it (faces → group → person, §6)"] --> dir
+    sig["1 · Signals (PURE SQL, no model)<br/>orientation · tags (vibe/palette/light/quality/subject)<br/>place_city · shot_at · SigLIP vector<br/>people: the names of the persons recognised in it (faces → group → person in people, §6; never a voice name)"] --> dir
     dir["2 · Direct (PURE, no model)<br/>camera move per shot (one eased PUSH, never a pan)<br/>burst → hard cuts · hero → long push-in<br/>palette+light → grade · a DEFAULT effect per shot<br/>this is the film if no model ever runs"] --> story
     story["3 · Story (model call 1, POST /text/complete)<br/>narration WRITTEN from each photo's description + the people named in it, in memory order (no guessed labels)<br/>sparse title cards · music prompt<br/>+ SCORE PLAN: where the music changes, and to what<br/>written DIRECTLY in en or ru<br/>passages ≥ photos, best effort · told order = film order<br/>then ONE temperature-0 call per passage matches its photograph: a vote stands, no vote keeps stage 2's photograph<br/>memory order recorded kept or broken, never corrected · a photo no sentence is about is left out and logged<br/>Automatic only: casts the narrator + a per-passage voice from the preset table and the saved voices ready for the language<br/>an edited narration (narration_drafts): no story call, its words are the script<br/>only the per-passage match runs: no vote keeps the stored photograph"] --> narr
     narr["4a · Narration (POST /speak, BATCH) — MANDATORY<br/>kokoro (en) · silero v4_ru (ru, split at sentences)<br/>voxcpm2 — a SAVED voice (mac/cloud): its newest heard take of the language, with its words<br/>a CHOSEN narrator (preset or saved) reads EVERY passage<br/>Automatic: a [voice] bracket may give ONE passage another voice of the narrator's kind<br/>returns segments [{text,start,end}] — the film's SPINE<br/>no script in the language, or no speech → FAIL"] --> music
@@ -3302,7 +3326,7 @@ safety rules live in [`docs/sync-cli.md`](sync-cli.md).** The design:
 The app is a **persistent HTMX-boosted shell** — a fixed full-width nav with a live
 resource bar (RAM/CPU always, GPU and board temperatures where readable) over a
 single scrolling `<main>`
-that the five top-level links swap without re-rendering the nav. The routes:
+that the six top-level links swap without re-rendering the nav. The routes:
 
 - **`/upload`** — the folder list (add / delete-from-library, §3.2c), then
   client-side hashing, transfer, and live per-stage processing progress with
@@ -3312,8 +3336,9 @@ that the five top-level links swap without re-rendering the nav. The routes:
 - **`/photo/{id}`** — the one **leaf** view: the photo shown inside the collection it
   was opened from (`ctx`), its AI title/description, tags, full EXIF (incl. the GPS
   coordinates, which live only here), source paths, the **People** line — the names of
-  the people recognised in it (§6), each once, as plain text, never a link (a link to a
-  person would open a leaf from a leaf, §13.1) — and an async "similar" strip with
+  the people recognised in it (§6: the person's name in `people`, never a voice's),
+  each once, as plain text, never a link (a link to a person would open a leaf from a
+  leaf, §13.1) — and an async "similar" strip with
   why-it-matched reasons (§9). All drill-down navigation obeys §13.1.
 - **`/organize`** — a principle dropdown (date grain / camera / place / memories) over
   album cards; memories has the background Rebuild control; the last-opened view is
@@ -3329,28 +3354,48 @@ that the five top-level links swap without re-rendering the nav. The routes:
   return from `/feed` restored from bfcache, and by polling while a film of that memory
   is being made or waits. There is no page reload, so the grid keeps its scroll, its
   controls and its expanded notes.
-- **`/voices`** — the grid of **Voices**: the people whose own voice can narrate a film
-  (§6, §11.1). **New voice** sits at the head. Each voice is a card, a plain link to its
-  page, with its name, per language with takes the minutes and the number of takes,
+- **`/people`** — the grid of **People** (§6): the owner's people, each a card that is a
+  plain link to the person page, with the person's name, the names of their voices and
+  the number of their faces. **New person** sits at the head: a name with the person
+  name rules (1-80 characters, unique per owner, case-insensitive); an empty, too long or
+  taken name is refused with its reason and nothing is written. With no person, the grid
+  reads "No people yet.". Under the cards, **Faces to name** lists every face group
+  of the owner with no person and at least the minimum face count (2, §4.1), plus every
+  such group that holds a face the owner released (Not this person) whatever its size,
+  the largest first: up to four
+  face crops and the number of faces, each a plain link to the group leaf
+  `/faces/{id}`; it is hidden when no group waits. It is a top-level grid (§13.1), on
+  every profile, jetson included: a person needs no voice copy.
+- **`/people/{id}`** — one person, the leaf of the People grid (§13.1). The header reads
+  "People › <name>", a **⋯** menu (Rename…, Delete person…) and ×. Rename follows the
+  person name rules. Delete is refused with its reason while the person owns a voice
+  (§6); otherwise the person goes, their face groups return to "Faces to name", and the
+  page closes to `/people`. Then, all in place and with no link to another leaf: the
+  person's **voices** by name (plain text), their **face groups** each with up to four
+  crops, the number of faces and **Remove from this person** (the group returns to
+  "Faces to name"), and the thumbnails of the **photos** with their faces. Another
+  owner's person or a missing id answers 404.
+- **`/voices`** — the grid of **Voices**: the voices that can narrate a film, each owned
+  by a person (§6, §11.1). **New voice** sits at the head: the voice's name and its
+  person — a select of the owner's people, by default "New person with this name"; a
+  person of that name that exists already refuses the create with its reason and asks
+  the owner to pick them (§6). Each voice is a card, a plain link to its
+  page, with its name, its person's name as plain text, per language with takes the minutes and the number of takes,
   and one line of the languages it is ready for: "For films: English, Russian" or "Not
   ready for films yet"; a card plays nothing. A voice being deleted shows "deleting…"
   with no link, and the grid polls while a card shows "deleting…" (§6). With no voice, the grid reads "No voices yet." Create
   opens the new voice at once. The grid shows "Voice copy is not available on this device." and no New voice
   when the catalog lists no cloning entry for the profile (§4.1); existing cards still
-  open, for rename and delete. A voice is a person: the same list holds the people
-  whose faces are named (§6). Under the cards, **Faces to name** lists every face group
-  of the owner with no person and at least the minimum face count (2, §4.1), plus every
-  such group that holds a face the owner released (Not this person) whatever its size,
-  the largest first: up to four
-  face crops and the number of faces, each a plain link to the group leaf
-  `/faces/{id}`; it is hidden when no group waits. It is a top-level grid (§13.1). The
+  open, for rename and delete. Faces are not on this grid: they belong to people
+  (`/people`). It is a top-level grid (§13.1). The
   old address `/organize/voices` answers 308 to `/voices`.
-- **`/faces/{id}`** — one face group, a leaf of the Voices grid (§13.1). The header
-  reads "Voices › Faces to name" (or "Voices › <person>" for an attached group) and ×,
+- **`/faces/{id}`** — one face group, a leaf of the People grid (§13.1). The header
+  reads "People › Faces to name" (or "People › <person>" for an attached group) and ×,
   then every face of the group as a crop. The owner **attaches** the group to an
-  existing person (a select of the saved voices), or types a name to **create a new
-  person** for it — the New voice rules (1-80 characters, unique per owner,
-  case-insensitive; a taken name is refused with its reason), on every profile, jetson
+  existing person (a select of the owner's people), or types a name to **create a new
+  person** for it — the person name rules (1-80 characters, unique per owner,
+  case-insensitive; an empty or taken name is refused with its reason). Creating a
+  person here creates no saved voice. It works on every profile, jetson
   included, because a person needs no voice copy. An attached group leaves "Faces to
   name", and its leaf offers **Remove from this person** instead. **Not this person**
   on a face moves it out to a new group of its own and pins it, so it never rejoins a
@@ -3360,14 +3405,18 @@ that the five top-level links swap without re-rendering the nav. The routes:
   detail thumbnail on request, by the face box plus a margin of 20% of its side;
   another owner's face answers 404.
 - **`/voices/{id}`** — one voice, the leaf of the Voices grid (§13.1). The header reads
-  "Voices › <name>", a **⋯** menu (Rename…, Delete voice…) and ×, then the state of the
+  "Voices › <name>", a **⋯** menu (Rename…, Delete voice…) and ×, then the voice's
+  person as plain text ("Voice of <person>", no link: §13.1) with **Move to another
+  person**, a select of the owner's other people answered in place (another owner's
+  person is refused), then the state of the
   voice on every tab (§11.1): per language the take films and tests speak from, a newer
   take that waits for its words, or why the language is not ready; **Hear the words**
   when a take waits and no hearing job runs for this voice; and the hearing job (stage,
-  percent, Cancel; a failure with its reason and Close). Three tabs, **Recordings /
-  Test / Faces**, are state of the leaf: the URL carries `?tab` through `replaceState`, never a
+  percent, Cancel; a failure with its reason and Close). Two tabs, **Recordings /
+  Test**, are state of the leaf: the URL carries `?tab` through `replaceState`, never a
   history entry, and a switch keeps the recorder, the typed text and every selection;
-  an old `?tab=model` opens Recordings. **Recordings** lists the recording kit per
+  an old `?tab=model` or `?tab=faces` opens Recordings. A voice page has no Faces tab:
+  the face groups belong to the person and live on the person page. **Recordings** lists the recording kit per
   language (§11.1): each style with its instruction, each kit text with its takes, then
   **Other takes** (uploads, and recordings with no kit text). A take row shows ▶,
   seconds, recorded/uploaded, date, Record again on a kit row, and Delete, which asks
@@ -3382,7 +3431,7 @@ that the five top-level links swap without re-rendering the nav. The routes:
   the 30 s limit count recorded time only. A recording or an upload ends in a
   preview with Save and Discard; a recording also offers Record again, which drops the
   unsaved take and records the same text at once, in the same place. Save starts the
-  hearing job. **Test** is one test of the person (§11.1): a language the voice is ready
+  hearing job. **Test** is one test of the voice (§11.1): a language the voice is ready
   for, a text box that is always there, a list of the takes with heard words that
   fills the box with a take's words, Generate ("from take #<id> only", the take of the
   chosen language), the job line with stage, percent and Cancel, and a comparison:
@@ -3390,9 +3439,7 @@ that the five top-level links swap without re-rendering the nav. The routes:
   ▶ Original when the test spoke the words of a take that still exists. With no ready
   language the tab says "Record a take first. Tests speak from the newest take of the
   language, once its words are heard." and Generate is disabled. No page picks a take
-  for films. **Faces** lists the face groups attached to this person in place, each
-  with its crops and count (no link: §13.1), and **Remove from this person**, which returns the group to "Faces to
-  name". With none it reads "No faces yet.".
+  for films.
 - **`/feed/{key}`** — the fullscreen **memory film**: one memory played as a directed
   short with camera moves, cuts, a colour grade, a generated soundtrack and optional
   narration (§11.1). A **Film language** selector (English / Русский, ✓ on each
@@ -3433,10 +3480,10 @@ that the five top-level links swap without re-rendering the nav. The routes:
 
 **Per-route detail — the resource-bar internals, the full `/photo` panel, the feed
 player's controls, throughput readouts — is in [`docs/ui.md`](ui.md).** The nav order **Upload → Library → Chat →
-Organize → Voices** follows the workflow: bring photos in, browse, understand, then
-reorganize — Organize feeds stage 2. Voices are the people — who narrates the films and
-whose faces are in the photos — a resource of their own, so they sit last. The page
-keeps the name Voices and its routes.
+Organize → People → Voices** follows the workflow: bring photos in, browse, understand, then
+reorganize — Organize feeds stage 2. People and their voices are resources of their own,
+so they sit last: People first, because a voice belongs to a person and the faces in
+the photos are named there.
 
 ### 13.1 Navigation model (STRICT — every drill-down obeys this)
 
@@ -3445,7 +3492,7 @@ The UI is **grids** and **leaves**. A *grid* is a browsable list — the library
 view (`/photo/{id}`). The rules below are absolute; every current and future
 drill-down follows them exactly.
 
-**The persistent shell does not touch this model.** Only the five top-level nav
+**The persistent shell does not touch this model.** Only the six top-level nav
 links are HTMX-boosted (§13); every grid↔leaf move here is a plain `<a href>` full
 navigation, so the `history.back()` + bfcache behaviour rules 3–4 rely on is
 unchanged. Never boost a drill-down link — doing so would put htmx's history cache
@@ -3460,12 +3507,16 @@ in front of bfcache and break the `[grid, leaf]` invariant.
    card is a plain link (the one push; Create opens the new voice the same way, with
    `location.assign`). Tabs (`replaceState`) and every action on the leaf (rename,
    add a take, delete, hear the words, test) push no history.
-   **A face group (`/faces/{id}`) is a leaf of the Voices grid too**, one level under
-   it: a "Faces to name" crop is a plain link (the one push). Every action on it
-   (attach, create a person, Remove from this person, Not this person) is a POST
-   answered in place, never a push: the URL changes only through `replaceState`. A person's Faces tab shows the groups in place and
-   links to no group leaf (that would be leaf-to-leaf). The photo page's People line
-   holds no link either.
+   **People (`/people`) is a top-level grid**, and it has two leaves, each one level
+   under it: the person page `/people/{id}` (a card is a plain link, the one push) and
+   the face group `/faces/{id}` (a "Faces to name" crop is a plain link, the one push).
+   Every action on either leaf (rename, delete, attach, create a person, Remove from
+   this person, Not this person) is a POST answered in place, never a push: the URL
+   changes only through `replaceState`. The person page shows the person's voices,
+   face groups and photos in place and links to no other leaf — not to a voice, a face
+   group or a photo (that would be leaf-to-leaf). The voice page names its person as
+   plain text, with no link to the person page, and the photo page's People line holds
+   no link either.
 
 2. **The leaf records its grid in a `ctx` URL parameter** — never guessed:
    - `ctx=library` (plus `q`/`f_`/`n_`/`t_`/`sort`/`date_*`) → the library grid.
@@ -3481,8 +3532,8 @@ in front of bfcache and break the `[grid, leaf]` invariant.
    - The **voice leaf** (`/voices/{id}`) needs no `ctx` either: it has one grid, and
      that grid has no filter, sort or search to carry. Close goes back only when the
      leaf was opened from the grid, else to `/voices`.
-   - The **face-group leaf** (`/faces/{id}`) needs no `ctx` either, for the same
-     reason: its grid is `/voices`.
+   - The **person leaf** (`/people/{id}`) and the **face-group leaf** (`/faces/{id}`)
+     need no `ctx` either, for the same reason: their grid is `/people`.
    - `ctx=chat` → the grid is the **conversation**; close returns to `/chat`. A
      cited thumbnail carries this ctx, and it pages within the photos the current
      chat session cited (its evidence set), never the wider library.
@@ -3529,9 +3580,10 @@ in front of bfcache and break the `[grid, leaf]` invariant.
    the path `/voices`; the mark lives in the DOM, so a bfcache or htmx history restore
    keeps it and a deep link never has it — else `location.replace("/voices")`. It
    never reads `history.length`. Leaving through a nav link with a live recording or
-   an unsaved take asks first. The face-group leaf closes the same way: × and Esc run
-   `history.back()` when it carries `data-from-grid` (same origin, path `/voices`),
-   else `location.replace("/voices")`. It holds no level of its own.
+   an unsaved take asks first. The person leaf and the face-group leaf close the same
+   way: × and Esc run `history.back()` when the page carries `data-from-grid` (same
+   origin, path `/people`), else `location.replace("/people")`. They hold no level of
+   their own. Deleting a person closes the person leaf the same way.
 
 5. **Prev/next move only *within* the current layer's order** (owner-scoped),
    carrying `ctx` forward — never leaking into a sibling album/memory or the wider
