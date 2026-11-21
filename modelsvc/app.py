@@ -18,8 +18,11 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt
 
 from audio.whisper_asr import MAX_SECONDS as TRANSCRIBE_MAX_SECONDS
+from embedding.face_model import WEIGHTS_MISSING as FACE_WEIGHTS_MISSING
 from modelsvc.backends.base import (
     CloningUnavailable,
+    FaceImageRefused,
+    FaceNotOffered,
     ModelBackend,
     SlotOff,
     SpeakerEmbedNotOffered,
@@ -277,6 +280,23 @@ class VoiceEmbedResponse(BaseModel):
     seconds: float
     elapsed_s: float
     pipeline: int
+
+
+class FaceDetectRequest(BaseModel):
+    image: str            # base64 of one upright image, shrunk to the entry's input edge
+
+
+class DetectedFace(BaseModel):
+    box: list[float]      # [x, y, w, h], each in 0..1 of the image
+    score: float
+    vector: list[float]   # L2-normalised, the entry's `dim` values
+
+
+class FaceDetectResponse(BaseModel):
+    faces: list[DetectedFace]
+    model: str
+    revision: str
+    elapsed_s: float
 
 
 class SetSlotsRequest(BaseModel):
@@ -668,6 +688,23 @@ def create_models_app(backend: ModelBackend) -> FastAPI:
         except Exception as exc:  # a load or model error, with its own message
             raise HTTPException(status_code=500, detail=str(exc) or type(exc).__name__) from exc
         return VoiceEmbedResponse(**result)
+
+    @app.post("/faces/detect", response_model=FaceDetectResponse)
+    def faces_detect(req: FaceDetectRequest) -> FaceDetectResponse:
+        try:
+            image = _b64(req.image, "the image")
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        try:
+            result = backend.detect_faces(image)
+        except FaceNotOffered as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except FaceImageRefused as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception as exc:  # a load or model error, with its own message
+            status = 503 if FACE_WEIGHTS_MISSING in str(exc) else 500
+            raise HTTPException(status_code=status, detail=str(exc) or type(exc).__name__) from exc
+        return FaceDetectResponse(**result)
 
     return app
 

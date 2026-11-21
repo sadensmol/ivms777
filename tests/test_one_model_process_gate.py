@@ -31,10 +31,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 _EXEMPT_FILES = {
     REPO_ROOT / "embedding" / "siglip.py",
     REPO_ROOT / "embedding" / "text_embedder.py",  # caption-text embedder, models-service-only
+    REPO_ROOT / "embedding" / "face_model.py",  # the face child, models-service-only (§4.1)
     REPO_ROOT / "inference" / "client.py",
 }
 
-_FORBIDDEN_TOP_MODULES = {"torch", "transformers", "bitsandbytes"}
+_FORBIDDEN_TOP_MODULES = {"torch", "transformers", "bitsandbytes", "onnx", "onnx2torch"}
 
 
 def _thin_client_files() -> list[Path]:
@@ -106,10 +107,50 @@ def test_thin_client_entrypoints_never_load_torch_transformers_bitsandbytes():
         "import config, web.deps, web.app, ingest.cli, ingest.pipeline\n"
         "import chat.agent, chat.retrieve, search.retriever, search.semantic\n"
         "import sys\n"
-        "loaded = sys.modules.keys() & {'torch', 'transformers', 'bitsandbytes'}\n"
+        "loaded = sys.modules.keys() & {'torch', 'transformers', 'bitsandbytes', 'onnx', 'onnx2torch'}\n"
         "assert not loaded, f'heavy lib(s) pulled in via thin-client import graph: {sorted(loaded)}'\n"
     )
     result = subprocess.run(
         [sys.executable, "-c", script], capture_output=True, text=True, cwd=REPO_ROOT, check=False,
     )
     assert result.returncode == 0, result.stderr
+
+
+def _imported_tops(nodes) -> set[str]:
+    tops = set()
+    for node in nodes:
+        if isinstance(node, ast.Import):
+            tops |= {alias.name.split(".")[0] for alias in node.names}
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            tops.add(node.module.split(".")[0])
+    return tops
+
+
+def _module_scope_nodes(tree: ast.Module) -> list[ast.AST]:
+    # Every node outside a function body: what runs when the module is imported.
+    nodes, stack = [], list(tree.body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+            continue
+        nodes.append(node)
+        stack.extend(ast.iter_child_nodes(node))
+    return nodes
+
+
+def test_only_the_face_child_converts_onnx_and_only_inside_a_function():
+    # AC3: the face child (`embedding/face_model.py`) is the one file that imports
+    # onnx2torch, and it imports torch, onnx and onnx2torch only when the child loads.
+    face_model = REPO_ROOT / "embedding" / "face_model.py"
+    importers = set()
+    sources = list(REPO_ROOT.glob("*.py"))
+    for folder in REPO_ROOT.iterdir():
+        if folder.is_dir() and not folder.name.startswith((".", "_")) and folder.name != "tests":
+            sources += folder.rglob("*.py")
+    for path in sources:
+        if "onnx2torch" in _imported_tops(ast.walk(ast.parse(path.read_text()))):
+            importers.add(path)
+    assert importers == {face_model}
+
+    tree = ast.parse(face_model.read_text())
+    assert not _imported_tops(_module_scope_nodes(tree)) & {"torch", "onnx", "onnx2torch"}

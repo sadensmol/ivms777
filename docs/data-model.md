@@ -84,7 +84,7 @@ CREATE INDEX photo_tags_tag ON photo_tags(tag_id);
 
 jobs (
   photo_id   INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
-  stage      TEXT NOT NULL,           -- thumbnail | embed | taxonomy | caption | caption_embed
+  stage      TEXT NOT NULL,           -- thumbnail | embed | taxonomy | caption | caption_embed | faces
   status     TEXT NOT NULL,           -- pending | running | done | failed
   attempts   INTEGER NOT NULL DEFAULT 0,
   error      TEXT,
@@ -153,6 +153,19 @@ app_settings (
   PRIMARY KEY (owner_id, key)
 );
 
+-- A PERSON (design §6): someone the owner knows. A person owns saved voices and face
+-- groups, never the other way round. The name (1-80 characters) is unique per owner,
+-- compared case-blind in code (ingest/people.py); this UNIQUE is case-sensitive.
+-- Deleting a person runs inline (no file, no outbox) and is refused while they own a voice.
+people (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,  -- never reused: a stale tab never acts on a new person
+  owner_id   INTEGER NOT NULL,
+  name       TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT,
+  UNIQUE(owner_id, name)
+);
+
 -- A SAVED VOICE (design §6, §11.1): the name the user gave a person's voice. User
 -- data — never a catalog Speaker. Ids use AUTOINCREMENT and are never reused, so a
 -- delete intent, a stale tab or a stored narrator id never hits a new voice.
@@ -161,8 +174,10 @@ saved_voices (
   owner_id   INTEGER NOT NULL,
   name       TEXT NOT NULL,
   created_at TEXT NOT NULL,
+  person_id  INTEGER REFERENCES people(id) ON DELETE RESTRICT,  -- the person the voice belongs to; NULL only on a row written outside create_voice
   UNIQUE(owner_id, name)
 );
+CREATE INDEX saved_voices_person_id_idx ON saved_voices(person_id);
 
 -- One example clip of a saved voice, in ONE language. The model-independent source
 -- of truth.
@@ -381,7 +396,51 @@ voice_file_deletions (
   UNIQUE(storage_key, deletion_id)
 );
 CREATE INDEX voice_file_deletions_by_deletion ON voice_file_deletions(deletion_id);
+
+-- A face group (design §6): faces the worker judged to be one person. person_id is the person in
+-- `people` the owner attached it to, never a saved voice; NULL = not named yet ("Faces to name", §13).
+-- Deleting the person returns the group to unnamed.
+-- The folder-deletion drain deletes a group left with no face (§3.2c).
+face_groups (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,                       -- never reused
+  owner_id   INTEGER NOT NULL,
+  person_id  INTEGER REFERENCES people(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT
+);
+CREATE INDEX face_groups_by_owner_person ON face_groups(owner_id, person_id);
+
+-- One face found in a photo by the `faces` stage (design §8). A re-run of the stage replaces the photo's rows.
+faces (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,                       -- never reused
+  photo_id   INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+  group_id   INTEGER REFERENCES face_groups(id) ON DELETE SET NULL,
+  box_x      REAL NOT NULL,                                           -- the box, in 0..1 of the upright image
+  box_y      REAL NOT NULL,
+  box_w      REAL NOT NULL,
+  box_h      REAL NOT NULL,
+  score      REAL NOT NULL,                                           -- the detector score
+  vector     BLOB NOT NULL,                                           -- float32, L2-normalised, the entry's dim (512)
+  model      TEXT NOT NULL,                                           -- '<face model key>@<revision>'
+  pinned     INTEGER NOT NULL DEFAULT 0,                              -- 1 = moved by the owner; grouping never moves it
+  created_at TEXT NOT NULL
+);
+CREATE INDEX faces_photo_id_idx ON faces(photo_id);
+CREATE INDEX faces_group_id_idx ON faces(group_id);
 ```
+
+The schema version is 16. Version 15 adds `face_groups` and `faces` and changes no
+existing table. Version 16 adds `people` and `saved_voices.person_id` (an added column,
+so nullable in SQLite; every write sets it) and moves `face_groups.person_id` from
+`saved_voices` to `people`. Its migration is additive and idempotent (design §6): every
+saved voice with no person gets the owner's person of the same case-blind name, or a new
+person with the voice's name and owner; a face group attached to a voice is attached to
+that voice's person. A `face_groups` table that still links to `saved_voices` (`PRAGMA
+foreign_key_list`) is rebuilt with `faces` in the migration transaction — create the new
+tables, copy every row and id, drop the old ones, rename, recreate the indexes — because
+SQLite cannot change a foreign key in place, and a plain drop of `face_groups` would
+clear every face's group. `PRAGMA foreign_key_check` runs at the end. A face stores no file; a crop is cut from the detail thumbnail on
+request (design §13).
 
 Plus an FTS5 virtual table `photo_fts(caption, tags_text)`, its rows keyed by
 `photos.id` and refreshed by the taxonomy and caption stages. Because `tags_text`

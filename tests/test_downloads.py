@@ -4,8 +4,9 @@ Fetchers are injected, so nothing here touches the network. `spawn` is injected 
 the tests run the "background" work themselves, which makes progress deterministic.
 """
 
+import sys
 import threading
-from pathlib import Path
+import types
 
 import pytest
 
@@ -227,15 +228,22 @@ def test_blob_bytes_of_a_cache_dir_that_does_not_exist_yet_is_zero(tmp_path):
     assert _blob_bytes(tmp_path / "nope") == 0
 
 
-def test_the_cache_dir_is_resolved_against_the_installed_huggingface_hub():
+def test_the_cache_dir_is_resolved_against_the_installed_huggingface_hub(monkeypatch, tmp_path):
     # Exercises the REAL resolver, not an injected one: it is the only part of the
     # progress path that depends on `huggingface_hub`'s layout, so a moved import
     # or a renamed cache folder must fail here rather than at download time.
-    from huggingface_hub.constants import HF_HUB_CACHE
+    # `huggingface_hub` ships in the `models` extra, which a plain `uv sync` leaves
+    # out, so the test installs a stand-in module at the path the resolver imports.
+    hub = types.ModuleType("huggingface_hub")
+    constants = types.ModuleType("huggingface_hub.constants")
+    constants.HF_HUB_CACHE = str(tmp_path / "hub")
+    hub.constants = constants
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+    monkeypatch.setitem(sys.modules, "huggingface_hub.constants", constants)
 
     directory = _hf_cache_dir("google/siglip2-so400m-patch16-512")
     assert directory.name == "models--google--siglip2-so400m-patch16-512"
-    assert directory.parent == Path(HF_HUB_CACHE)
+    assert directory.parent == tmp_path / "hub"
 
 
 def test_hf_fetch_reports_bytes_while_the_snapshot_is_running(tmp_path):

@@ -2,8 +2,8 @@
    fragment; voices.js swaps it in for #voice-cards. A voice being deleted is a <div>
    with `data-deleting` and no link — the grid polls /voices/list every 2 s while one is
    shown. The card of a voice just created carries `data-created`. Each card names its
-   takes per language and the languages it is ready for (§11.1); no card names a take for
-   films. #}
+   person as plain text, its takes per language and the languages it is ready for (§11.1);
+   no card names a take for films. #}
 <div id="voice-cards" class="voice-cards">
   {% if not voices %}
     <p class="hint">No voices yet.</p>
@@ -17,6 +17,9 @@
     {% else %}
       <a class="voice-card" href="/voices/{{ voice.id }}" data-voice-id="{{ voice.id }}"{% if created == voice.id %} data-created{% endif %}>
         <span class="voice-card-name">{{ voice.name }}</span>
+        {% if voice.person_name %}
+          <span class="voice-card-person">Voice of {{ voice.person_name }}</span>
+        {% endif %}
         {% set kept = voice.examples|rejectattr('deleting')|list %}
         {% for code, language in all_languages %}
           {% set takes = kept|selectattr('language', 'equalto', code)|list %}

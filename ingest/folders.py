@@ -7,14 +7,15 @@ cascade is reliable across restarts and never blocks the UI.
 """
 
 import sqlite3
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
+from ingest.people import prune_empty_groups
 from ingest.thumbs import thumb_key
 from storage.base import Storage
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def list_folders(conn: sqlite3.Connection, owner_id: int) -> list[dict]:
@@ -99,6 +100,7 @@ def _delete_folder(
         ).fetchone() is None:
             _delete_photo(conn, originals, derived, photo_id, grid_px, detail_px)
     _prune_empty_memories(conn, owner_id)
+    prune_empty_groups(conn, owner_id)
 
 
 def _prune_empty_memories(conn: sqlite3.Connection, owner_id: int) -> None:
@@ -140,5 +142,5 @@ def _delete_photo(
     # Virtual tables carry no foreign key, so clear them by rowid explicitly.
     conn.execute("DELETE FROM photo_vec WHERE rowid = ?", (photo_id,))
     conn.execute("DELETE FROM photo_fts WHERE rowid = ?", (photo_id,))
-    # The row itself cascades photo_tags, photo_facets, jobs, group_photos, sources.
+    # The row itself cascades photo_tags, photo_facets, jobs, group_photos, sources, faces.
     conn.execute("DELETE FROM photos WHERE id = ?", (photo_id,))

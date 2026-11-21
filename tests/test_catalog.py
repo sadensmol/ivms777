@@ -380,3 +380,34 @@ def test_the_speaker_embedder_can_load_on_mac():
     settings = Settings(profile="mac", data_dir=Path("/tmp/pl"))
     entry = catalog.speaker_embedder_for("mac")
     assert entry.cost_mb + _governor_headroom_mb() <= settings.ram_budget_mb
+
+
+_BUFFALO_REV = "d09715916a0778919a770c343533641e250b8699"
+
+
+def test_the_face_model_is_one_pinned_buffalo_entry_offered_on_every_profile():
+    assert len(catalog.FACE_MODELS) == 1
+    entry = catalog.FACE_MODELS[0]
+    assert entry.key == "buffalo-l"
+    assert entry.source == catalog.HfSource("immich-app/buffalo_l", revision=_BUFFALO_REV)
+    assert entry.dim == 512
+    assert (entry.score_floor, entry.match_threshold, entry.input_edge, entry.min_face_px) == (
+        0.7, 0.5, 640, 32)
+    assert entry.cost_measured is False
+    assert "NON-COMMERCIAL" in entry.note
+    for profile in ("mac", "jetson", "cloud"):
+        assert catalog.face_model_for(profile) is entry, profile
+
+
+@pytest.mark.parametrize("profile", PROFILES)
+def test_the_face_model_can_load_where_it_is_offered(profile):
+    settings = Settings(profile=profile, data_dir=Path("/tmp/pl"))
+    entry = catalog.face_model_for(profile)
+    assert entry is not None, profile
+    assert entry.cost_mb + _governor_headroom_mb() <= settings.ram_budget_mb
+
+
+@pytest.mark.parametrize("profile", PROFILES)
+def test_the_match_threshold_defaults_to_the_declared_one(profile):
+    settings = Settings(profile=profile, data_dir=Path("/tmp/pl"))
+    assert settings.face_threshold() == 0.5

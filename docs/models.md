@@ -59,6 +59,7 @@ What ships:
 | `music` | `musicgen-medium` (default on mac, mac-only) · `musicgen-small` (default on jetson/cloud) |
 | *(no slot)* `catalog.TRANSCRIBERS` | `whisper-large-v3-turbo` (the speech recognition of a take — its words, heard after it is saved; English + Russian; mac and cloud). Outside `CATALOG` and `SLOTS`: no user choice; `transcriber_for(profile)` names it. |
 | *(no slot)* `catalog.SPEAKER_EMBEDDERS` | `ecapa-voxceleb` (the speaker-similarity meter — a 192-value speaker embedding of a clip; mac only). Outside `CATALOG` and `SLOTS`: no user choice; `speaker_embedder_for(profile)` names it. |
+| *(no slot)* `catalog.FACE_MODELS` | `buffalo-l` (the faces of a photo — a box, a score and a 512-value vector per face; mac, jetson and cloud; non-commercial weights). Outside `CATALOG` and `SLOTS`: no user choice; `face_model_for(profile)` names it. |
 
 Everything beyond the defaults carries an **estimated** `cost_mb` until it is
 measured on the board the way §8.1 requires (the drop in
@@ -718,6 +719,64 @@ Every one passes the permissive set, so there is no new exception:
 
 `speechbrain` also requires `torchaudio`, `joblib`, `requests`, `scipy`, `soundfile`,
 `tqdm` and `huggingface_hub`, which `uv.lock` already holds.
+
+### The face model — InsightFace buffalo_l
+
+The `faces` ingest stage finds the faces of each photo, and the worker groups the faces
+of one person (design §4.1, §5.1 `/faces/detect`, §8, §8.1). One model does both halves.
+
+- **The model.** `buffalo-l` = `immich-app/buffalo_l` @
+  `d09715916a0778919a770c343533641e250b8699`, the ONNX export of InsightFace `buffalo_l`
+  that Immich uses for the same feature. Only two files are fetched:
+  `detection/model.onnx` (SCRFD-10G, 16,923,827 B: a box, a score and 5 landmarks per
+  face) and `recognition/model.onnx` (ArcFace R50, 174,383,860 B: a 512-value vector of
+  a face aligned to 112×112 by the 5 landmarks). Together 191,307,687 B (`size_mb` 182).
+  The ARM NN and RKNN files of the repo are not fetched. Declared in
+  `catalog.FACE_MODELS` with `face_model_for(profile)`, outside `CATALOG` and `SLOTS`:
+  no slot, no default, no settings row.
+- **The licence: non-commercial.** The Hub card says `license: other`
+  (`license_name: insightface`): InsightFace licenses its pretrained models for
+  non-commercial research only. This app is a private family library, so it is used
+  here, with the MusicGen rule: **never ship it in a commercial build**. The catalog
+  `note` says so. The open alternative, YuNet + SFace (Apache-2.0), was rejected: it is
+  weaker and runs on OpenCV DNN on the CPU, which design §3.1 forbids.
+- **Where it runs.** On every profile (`profiles=("mac", "jetson", "cloud")`). One
+  `faces` child in the models service (`embedding/face_model.py:FaceModel`), from the
+  pinned snapshot on disk only. The child converts both ONNX graphs to torch with
+  `onnx2torch` at load and runs them on `mps` or `cuda`; a device that is not `mps` or
+  `cuda*` is a load error, with no CPU fallback. ONNX Runtime is not used: it would be
+  a second GPU runtime beside torch, with no proven CUDA 13 build for JetPack 7 and only
+  partial CoreML coverage. It is not in the voice gate and runs at BATCH.
+- **The declared use.** `score_floor` 0.7, `match_threshold` 0.5 (cosine similarity),
+  `input_edge` 640, `min_face_px` 32, `dim` 512. The floor and the threshold are
+  Immich's public defaults for this model, not tuned on this library. The worker shrinks
+  each photo to `input_edge` before it sends it; the child drops a face under the floor
+  or with a side under `min_face_px`, and returns each box in 0..1 of the image.
+- **The reply.** Per face the box, the score and the L2-normalised vector, with
+  `model` and `revision`. A vector that is not finite or has a zero norm is a model
+  error. The `worker` stores the faces and groups them (design §8).
+- **The cost is an estimate; not measured.** `cost_mb` 1000 with `cost_measured=False`
+  = 182 MiB of files + an unmeasured allowance for the torch runtime and the
+  activations of a 640 px image. `IVMS777_MODEL_COST_MB '{"faces": <measured>}'`
+  overrides it.
+- **Unknown until run.** That `onnx2torch` converts the SCRFD graph and runs it right on
+  `mps` and on jetson `cuda` is not proven. One real `POST /faces/detect` on one photo
+  must give finite 512-value vectors before the feature is called ready. The speed per
+  photo and the resident cost are measured by that run too.
+
+**Dependencies and their licences.** `onnx` and `onnx2torch` join the `models` extra
+(design §5.1: only the models service imports them). The licences are read from PyPI:
+
+| Package | Licence | Note |
+|---|---|---|
+| `onnx` | Apache-2.0 | requires `protobuf`, `ml_dtypes`, `numpy`, `typing_extensions` |
+| `onnx2torch` | Apache-2.0 | requires `torchvision` |
+
+`uv.lock` holds `onnx` 1.23.2, `onnx2torch` 1.5.15 and the two packages they added:
+`ml-dtypes` 0.7.0 and `torchvision` 0.28.0, the PyPI build that matches the locked
+`torch` 2.13.0 on mac and cloud. On jetson `Dockerfile.models.jetson` reinstalls
+`torch` and `torchvision` together from the CUDA 13.2 index (design §3.1), so the pair
+stays matched there too.
 
 ## Switching a slot
 

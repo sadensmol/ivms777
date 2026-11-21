@@ -421,6 +421,29 @@
     if (own.alive()) { pollCards(); }
   }
 
+  // The New voice person select is rendered with the page, so a grid restored on a return
+  // still lists the people of that moment: a person made by the voice just created is
+  // missing, a person deleted on /people is still offered. Read the owner's people again
+  // and keep the choice when that person still exists.
+  async function refreshPeople(own) {
+    let html;
+    try {
+      const response = await own.fetch('/voices', { cache: 'no-store' });
+      if (!response.ok) { return; }
+      html = await response.text();
+    } catch (_) {
+      return;  // offline: the select keeps what it shows
+    }
+    const current = document.getElementById('voice-new-person');
+    const holder = document.createElement('div');
+    holder.innerHTML = html;
+    const next = holder.querySelector('#voice-new-person');
+    if (!own.alive() || !current || !next) { return; }
+    const chosen = current.value;
+    current.replaceChildren(...next.children);
+    if ([...current.options].some((option) => option.value === chosen)) { current.value = chosen; }
+  }
+
   function listOf(html) {
     const holder = document.createElement('div');
     holder.innerHTML = html.trim();
@@ -1229,7 +1252,10 @@
     setTimeout: (run, ms) => window.setTimeout(run, ms),
     clearTimeout: (id) => window.clearTimeout(id),
     fetch: (url, options) => window.fetch(url, options),
-    start,
+    start(session, page) {
+      start(session, page);
+      if (!page.dataset.voiceId) { refreshPeople(session); }
+    },
     stop,
   });
 

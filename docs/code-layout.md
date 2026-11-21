@@ -39,6 +39,8 @@ ingest/
   embed.py             # embed stage + backfill
   taxonomy.py          # zero-shot + pixel stats           (plan 04)
   caption.py           #                                    (plan 05)
+  faces.py             # faces stage: POST /faces/detect, store faces, group by mean vector (plan 27)
+  people.py            # people (own voices and face groups), face groups, names in photos (plans 27, 28)
   worker.py            # job queue driver
   cli.py               # worker entrypoint (python -m ingest.cli)
 organize/              # stage 2, server side                (plan 22)
@@ -91,12 +93,16 @@ web/
   app.py
   deps.py              # AppContext
   upload_api.py        # /api/upload/*
-  voices_api.py        # /voices grid + /voices/{id} leaf: takes, hearing, tests, bake reattach
+  voices_api.py        # /voices grid + /voices/{id} leaf: takes, hearing, tests, the voice's person, bake reattach
+  people_api.py        # /people grid + /people/{id} leaf: people, Faces to name    (plan 28)
+  faces_api.py         # /faces/{id} face-group leaf of People + face crops         (plans 27, 28)
   templates/
   static/
     upload.js          # picker, batching, progress
     hash-worker.js     # Web Worker: SHA-256, one file at a time
     voices.js          # Voices pages: record or upload a take as a 48 kHz mono WAV, poll jobs
+    people.js          # People pages: new person, rename, delete, Remove from this person (plan 28)
+    faces.js           # face-group leaf: attach, new person, Not this person      (plan 27)
     feed-gl.js         # memory film player: WebGL2 moves, transitions, grade (plan 24)
     feed.css           # the player's own stylesheet — it does not load app.css
 vocab.yaml                                                    (plan 04)

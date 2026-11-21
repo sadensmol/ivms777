@@ -1717,8 +1717,9 @@ class LongerClient(SweepClient):
 
     def __init__(self, dataset: str, statuses: list[dict] | None = None) -> None:
         super().__init__()
-        self.statuses = statuses or [longer_status(step=500, dataset=dataset),
-                                     longer_status("done", step=LONGER_STEPS, dataset=dataset)]
+        self.statuses = list(statuses if statuses is not None
+                             else [longer_status(step=500, dataset=dataset),
+                                   longer_status("done", step=LONGER_STEPS, dataset=dataset)])
         self.cancel_requests = 0
 
     def bake_cancel(self, bake_id):

@@ -45,10 +45,12 @@ def wanted(settings: Settings, conn=None) -> list[tuple[str, str]]:
                 pairs.append((slot, f"{repo}@{revision}" if revision else repo))
             elif isinstance(entry.source, UrlSource):
                 pairs.append((slot, entry.source.url))
-    # The speech recognition and the speaker-similarity meter are no slots (§4.1): each is
-    # fetched on every profile that offers it, so neither stalls on a download.
+    # The speech recognition, the speaker-similarity meter and the face model are no
+    # slots (§4.1): each is fetched on every profile that offers it, so none stalls on a
+    # download.
     for unit, entry in (("asr", catalog.transcriber_for(settings.profile)),
-                        ("speaker_embed", catalog.speaker_embedder_for(settings.profile))):
+                        ("speaker_embed", catalog.speaker_embedder_for(settings.profile)),
+                        ("faces", catalog.face_model_for(settings.profile))):
         if entry is not None:
             source = entry.source
             pairs.append((unit, f"{source.repo}@{source.revision}"))
@@ -62,10 +64,12 @@ def _fetch(target: str, settings: Settings) -> None:
     from huggingface_hub import snapshot_download
 
     repo, _, revision = target.partition("@")
-    if revision:
-        snapshot_download(repo, revision=revision)
-    else:
-        snapshot_download(repo)
+    options: dict[str, object] = {"revision": revision} if revision else {}
+    face = catalog.face_model_for(settings.profile)
+    if face is not None and face.source.repo == repo and face.files:
+        # The face model loads two ONNX files; the repo also holds ARM NN and RKNN builds.
+        options["allow_patterns"] = list(face.files)
+    snapshot_download(repo, **options)
 
 
 def _fetch_url(url: str, settings: Settings) -> None:

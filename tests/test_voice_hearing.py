@@ -30,7 +30,7 @@ class FakeASR:
     `on_call(n)` runs inside the n-th call; `error` = (n, exception) raised by the n-th
     call; `voice_lock_held` notes whether each call ran under the voice lock."""
 
-    def __init__(self, words: dict | None = None, voice_lock: threading.Lock | None = None) -> None:
+    def __init__(self, words: dict | None = None, voice_lock: "threading.Lock | None" = None) -> None:
         self.words = words or {}
         self.voice_lock = voice_lock
         self.heard: list[tuple[str, str]] = []

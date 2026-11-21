@@ -56,6 +56,8 @@ TRAIN_UNIT = "voice_train"
 ASR_UNIT = "asr"
 # The speaker-similarity meter's child (§8.1). No slot and no catalog choice.
 SPEAKER_EMBED_UNIT = "speaker_embed"
+# The face model's child (§8.1). No slot and no catalog choice.
+FACES_UNIT = "faces"
 
 
 class SlotManager:
@@ -130,6 +132,7 @@ class SlotManager:
         self._register_voice_train()
         self._register_asr()
         self._register_speaker_embed()
+        self._register_faces()
         self.generation += 1
 
     # --- unit registration ---------------------------------------------------
@@ -294,6 +297,17 @@ class SlotManager:
             return
         self._register_worker(SPEAKER_EMBED_UNIT, "audio.speaker_embed:SpeakerEmbedder",
                               self._child_args(entry), self._cost(SPEAKER_EMBED_UNIT, entry))
+
+    def _register_faces(self) -> None:
+        # Once only, like `speaker_embed`: a later slot switch must never end a detect
+        # call (§8.1).
+        if self.has_unit(FACES_UNIT):
+            return
+        entry = catalog.face_model_for(self._settings.profile)
+        if entry is None:
+            return
+        self._register_worker(FACES_UNIT, "embedding.face_model:FaceModel",
+                              self._child_args(entry), self._cost(FACES_UNIT, entry))
 
     def _register_music(self) -> None:
         self._register_audio_unit("music", "audio.musicgen:MusicGen")
