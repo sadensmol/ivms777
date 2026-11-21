@@ -1,4 +1,4 @@
-"""The person leaf and the voice form against the people rules (fix round 8, design §13,
+"""The person leaf and the voice form against the people rules (design §13,
 D8): the leaf lists photos newest first with a photo of no shot time last, and a voice
 re-created with the name of a deleted voice needs its kept person."""
 

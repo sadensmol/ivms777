@@ -1,4 +1,4 @@
-"""People library rules (fix round 8, design §6, D7, D8): create, rename and delete a
+"""People library rules (design §6, D7, D8): create, rename and delete a
 person, the voices and photos of a person, moving a voice, and a voice re-created with
 the name of a deleted voice. Names are unique per owner, compared case-blind, Cyrillic too."""
 
@@ -48,8 +48,6 @@ def _photo_of(conn, person: int, shot_at: str | None, *, owner_id: int = OWNER) 
     add_face(conn, photo_id=photo, group_id=group, vector=(1.0, 0.0))
     return photo
 
-
-# create_person
 
 def test_create_person_stores_the_trimmed_name(conn):
     person = people.create_person(conn, OWNER, "  Ann  ")
@@ -108,8 +106,6 @@ def test_people_are_listed_by_name_case_blind_with_their_voices(conn):
     ]
 
 
-# rename_person
-
 def test_rename_person_may_change_only_the_case_of_its_own_name(conn):
     anna = people.create_person(conn, OWNER, "анна")
 
@@ -149,8 +145,6 @@ def test_renaming_a_person_renames_no_voice(conn):
     assert get_voice(conn, OWNER, voice.id).name == "Nana"
     assert get_voice(conn, OWNER, voice.id).person_name == "Grandma"
 
-
-# delete_person
 
 def test_delete_person_with_a_voice_is_refused_and_keeps_everything(conn):
     ann = people.create_person(conn, OWNER, "Ann")
@@ -211,8 +205,6 @@ def test_delete_person_of_another_owner_or_missing_is_not_found(conn, owner):
     assert _people(conn) == [(OTHER_OWNER, "Zebediah")]
 
 
-# person_voices
-
 def test_person_voices_lists_only_their_voices_by_name_with_a_deleting_one(conn):
     ann = people.create_person(conn, OWNER, "Ann")
     bob = people.create_person(conn, OWNER, "Bob")
@@ -232,8 +224,6 @@ def test_person_voices_of_another_owners_person_is_empty(conn):
 
     assert people.person_voices(conn, OWNER, theirs) == []
 
-
-# person_photos
 
 def test_person_photos_are_oldest_first_and_no_shot_time_last(conn):
     ann = people.create_person(conn, OWNER, "Ann")
@@ -272,8 +262,6 @@ def test_person_photos_of_another_owners_person_is_empty(conn):
 
     assert people.person_photos(conn, OWNER, theirs) == []
 
-
-# move_voice
 
 def test_move_voice_gives_the_voice_to_another_person(conn):
     ann = people.create_person(conn, OWNER, "Ann")
@@ -325,8 +313,6 @@ def test_move_voice_of_another_owner_or_missing_is_refused(conn, voice):
 
     assert _voices(conn) == [("Zeb", theirs)]
 
-
-# create_voice and the person (D8)
 
 def test_a_new_voice_named_like_a_cyrillic_person_in_another_case_is_refused(conn):
     people.create_person(conn, OWNER, ANNA)

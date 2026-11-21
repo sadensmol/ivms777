@@ -1,4 +1,4 @@
-"""People (fix round 8, design §6, §13, §13.1): a person is its own record. The People tab
+"""People (design §6, §13, §13.1): a person is its own record. The People tab
 `/people` with "New person" and "Faces to name", the person leaf `/people/{id}`, a face
 group attached to a person, a voice that belongs to a person, and deleting a person.
 Every lookup is scoped to the owner."""
@@ -91,8 +91,6 @@ def _count(client, table: str) -> int:
     return _conn(client).execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
 
 
-# AC18 — the People tab, its grid, "New person" and "Faces to name".
-
 def test_the_nav_has_people_before_voices(client):
     body = client.get("/library").text
     nav = body[body.index('<nav class="nav"'):body.index("</nav>")]
@@ -154,8 +152,6 @@ def test_faces_to_name_is_on_people_and_no_longer_on_voices(client):
     assert "Faces to name" in people and _links_to(people, f"/faces/{group}")
     assert "Faces to name" not in voices and not _links_to(voices, f"/faces/{group}")
 
-
-# AC19 — the person leaf.
 
 def test_the_person_leaf_shows_the_name_voices_faces_and_photos_in_place(client):
     ann = add_person(_conn(client), name="Ann")
@@ -219,8 +215,6 @@ def test_another_owners_person_or_a_missing_one_is_a_404(client):
     assert _people(client) == [(OTHER_OWNER, "Zebediah")]
 
 
-# AC20 — the group leaf belongs to People.
-
 def test_the_group_leaf_is_under_people_and_its_select_lists_people(client):
     bob = add_person(_conn(client), name="Bob")
     add_person(_conn(client), owner_id=OTHER_OWNER, name="Zebediah")
@@ -233,8 +227,6 @@ def test_the_group_leaf_is_under_people_and_its_select_lists_people(client):
     assert "Zebediah" not in body
     assert _voices(client) == []
 
-
-# AC21 — a voice belongs to a person.
 
 def test_a_new_voice_by_default_makes_a_person_with_its_name(client):
     response = client.post("/voices", data={"name": "Grandma"})
@@ -314,8 +306,6 @@ def test_moving_a_voice_to_another_owners_person_is_refused(client):
     assert response.status_code == 400
     assert _person_of_voice(client, voice.id) == ann
 
-
-# AC22 — deleting a person.
 
 def test_deleting_a_person_who_owns_a_voice_is_refused_with_its_reason(client):
     ann = add_person(_conn(client), name="Ann")

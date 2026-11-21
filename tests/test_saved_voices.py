@@ -1732,7 +1732,7 @@ def test_a_cancel_after_the_store_finds_no_run_and_the_model_stays(conn, store):
 
 
 def test_deleting_a_person_returns_their_face_groups_to_faces_to_name(conn, store):
-    # Fix round 8 (D7, AC22): a voice belongs to a person, so deleting the voice keeps the
+    # D7, AC22: a voice belongs to a person, so deleting the voice keeps the
     # person and the groups attached to them; only deleting the person returns the groups.
     from ingest import people
     from tests.factories import add_face, add_face_group, add_person, add_photo

@@ -56,7 +56,7 @@ def test_concurrent_first_migrations_do_not_mistake_each_other_for_folder_scan(t
         assert errors == []
 
 
-# Schema 16 (fix round 8, design §6): a person is its own record. These build a version 15
+# Schema 16 (design §6): a person is its own record. These build a version 15
 # database by hand: the saved voice is the person, and a face group links to a voice.
 NOW = "2026-01-01T00:00:00"
 V15_SAVED_VOICES = """CREATE TABLE saved_voices (
