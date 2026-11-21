@@ -7,19 +7,16 @@ of the app, with a fake DOM that reads the select's options from that HTML.
 import json
 import pathlib
 import re
-import shutil
 import subprocess
 
 import pytest
 from fastapi.testclient import TestClient
 
 from tests.factories import add_person
-from tests.test_web_voices import _js_function
+from tests.test_web_voices import _js_function, needs_node
 from web.app import create_app
 
 NEW_PERSON = ""
-
-needs_node = pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
 
 HARNESS = r"""
 const flush = () => new Promise((resolve) => setImmediate(resolve));
