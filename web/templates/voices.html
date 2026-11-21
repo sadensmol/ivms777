@@ -5,7 +5,8 @@
    plain link to its voice (a full navigation, the one grid→leaf push). Create answers
    the cards, and voices.js opens the one marked `data-created`. Every voice belongs to a
    person: New voice picks one, by default a new person with the voice's name (D8).
-   "Faces to name" lives on /people. #}
+   voices.js reads the person options again at every mount of the grid, keeping the
+   choice, so a return lists the people as they are now. "Faces to name" lives on /people. #}
 <div class="voices-shell voices-grid" id="voices-page">
   <h1>Voices</h1>
   {% if not available %}
