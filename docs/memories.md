@@ -155,6 +155,11 @@ The mechanics live in design §11.1; what matters here is how it relates to a bu
   is keyed on `group_id` with `ON DELETE CASCADE`, and `replace_memories` deletes
   the old groups — so no presentation can survive into a memory it was not made for.
   The generated WAVs are pruned on the next prepare run.
+- **The people a film names come from people, never from voices.** Each shot's brief
+  carries `people=Ann, Bob`: the names of the persons whose face groups hold a face in
+  the photograph (design §6, §11.1), read from `people`. A person with face groups and
+  no voice is named; renaming the person changes the name the next film sees. Who
+  narrates the film is a separate choice (a saved voice or a preset, §11.1).
 - **Playback needs no model.** Only preparation does, and only the `voice` and
   `music` slots (§4.1) — either of which may be `off`, leaving a feed that is still
   perfectly watchable.

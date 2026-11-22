@@ -7,6 +7,7 @@ import base64
 import hashlib
 import json
 from collections.abc import Iterator
+from dataclasses import dataclass
 
 import httpx
 
@@ -14,6 +15,24 @@ import httpx
 # minute narration plus a first load can outlast the preset voices' 300 s.
 SPEAK_TIMEOUT = 300.0
 SAVED_VOICE_SPEAK_TIMEOUT = 1800.0
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class DetectedFace:
+    """One face `POST /faces/detect` found: the box in 0..1 of the upright image
+    (x, y, w, h), the detector score, the L2-normalised face vector, and the model that
+    made it as `<key>@<revision>`."""
+
+    box: tuple[float, float, float, float]
+    score: float
+    vector: tuple[float, ...]
+    model: str
+
+
+def _detected_face(face: dict, model: str) -> DetectedFace:
+    x, y, w, h = face["box"]
+    return DetectedFace(box=(x, y, w, h), score=face["score"],
+                        vector=tuple(face["vector"]), model=model)
 
 
 def _b64(data: bytes) -> str:
@@ -312,3 +331,14 @@ class ModelsClient:
         response = self._client.post("/voice/embed", json=payload, timeout=timeout)
         response.raise_for_status()
         return response.json()
+
+    def detect_faces(self, image: bytes, *, timeout: float = 600.0) -> list[DetectedFace]:
+        """The faces in one upright image, as `POST /faces/detect` answers them. 600 s
+        covers the first call's load and a wait for a scheduler slot. A non-2xx raises
+        `httpx.HTTPStatusError`."""
+        response = self._client.post(
+            "/faces/detect", json={"image": _b64(image)}, timeout=timeout)
+        response.raise_for_status()
+        body = response.json()
+        model = f"{body['model']}@{body['revision']}"
+        return [_detected_face(face, model) for face in body["faces"]]

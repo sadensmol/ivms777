@@ -33,6 +33,7 @@ import numpy as np
 
 from feed.language import LANGUAGES
 from feed.story import _LANGUAGE_NAME as language_names
+from ingest import people
 from models import catalog
 from storage.base import Storage
 from storage.keys import content_key
@@ -284,6 +285,8 @@ class SavedVoice:
     name: str
     examples: tuple[VoiceExample, ...]
     deleting: bool
+    person_id: int | None = None     # None only for a row written outside create_voice
+    person_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -340,7 +343,8 @@ def _voices(conn: sqlite3.Connection, owner_id: int, voice_id: int | None = None
     if voice_id is not None:
         where, args = f"{where} AND v.id = ?", [owner_id, voice_id]
     voices = conn.execute(
-        f"SELECT v.id, v.name, {_VOICE_PENDING} AS deleting FROM saved_voices v WHERE {where}",
+        f"SELECT v.id, v.name, {_VOICE_PENDING} AS deleting, v.person_id, pe.name AS person_name"
+        f" FROM saved_voices v LEFT JOIN people pe ON pe.id = v.person_id WHERE {where}",
         args,
     ).fetchall()
     examples: dict[int, list[VoiceExample]] = {}
@@ -351,7 +355,10 @@ def _voices(conn: sqlite3.Connection, owner_id: int, voice_id: int | None = None
     ):
         examples.setdefault(row["voice_id"], []).append(_example(row))
     result = [
-        SavedVoice(r["id"], r["name"], tuple(examples.get(r["id"], ())), bool(r["deleting"]))
+        SavedVoice(
+            r["id"], r["name"], tuple(examples.get(r["id"], ())), bool(r["deleting"]),
+            r["person_id"], r["person_name"],
+        )
         for r in voices
     ]
     # Python, not COLLATE NOCASE: SQLite folds ASCII only, and names are often Cyrillic.
@@ -402,20 +409,49 @@ def _check_name_free(
         raise VoiceNameTaken(f"A saved voice named «{row['name']}» already exists.")
 
 
-def create_voice(conn: sqlite3.Connection, owner_id: int, name: str) -> SavedVoice:
+def create_voice(
+    conn: sqlite3.Connection, owner_id: int, name: str, person_id: int | None = None
+) -> SavedVoice:
+    """A voice of the owner's person `person_id`; None = a new person with the voice's name
+    (design §6, D8). A refused name (of the voice, or of that new person: `people.PersonError`)
+    or a missing person (`people.PersonNotFound`) raises, and nothing is written."""
     clean = _clean_name(name)
     conn.execute("BEGIN IMMEDIATE")
     try:
         _check_name_free(conn, owner_id, clean)
+        if person_id is None:
+            person_id = people.insert_person(conn, owner_id, clean)
+        else:
+            people.check_person(conn, owner_id, person_id)
         voice_id = conn.execute(
-            "INSERT INTO saved_voices(owner_id, name, created_at) VALUES (?, ?, ?)",
-            (owner_id, clean, _now()),
+            "INSERT INTO saved_voices(owner_id, name, created_at, person_id) VALUES (?, ?, ?, ?)",
+            (owner_id, clean, _now(), person_id),
         ).lastrowid
+        person_name = conn.execute("SELECT name FROM people WHERE id = ?", (person_id,)).fetchone()[0]
     except BaseException:
         _rollback(conn)
         raise
     conn.execute("COMMIT")
-    return SavedVoice(voice_id, clean, (), False)
+    return SavedVoice(voice_id, clean, (), False, person_id, person_name)
+
+
+def move_voice(conn: sqlite3.Connection, owner_id: int, voice_id: int, person_id: int) -> SavedVoice:
+    """Give the voice to another person of the owner. A voice being deleted (or gone) raises
+    `VoiceDeleting`; a person the owner does not have raises `people.PersonNotFound`."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        state = _voice_state(conn, owner_id, voice_id)
+        if state is None or state["deleting"]:
+            raise VoiceDeleting("This voice is being deleted.")
+        people.check_person(conn, owner_id, person_id)
+        conn.execute("UPDATE saved_voices SET person_id = ? WHERE id = ?", (person_id, voice_id))
+    except BaseException:
+        _rollback(conn)
+        raise
+    conn.execute("COMMIT")
+    voice = get_voice(conn, owner_id, voice_id)
+    assert voice is not None  # moved under the lock a moment ago; only the drain deletes
+    return voice
 
 
 def rename_voice(conn: sqlite3.Connection, owner_id: int, voice_id: int, name: str) -> SavedVoice:

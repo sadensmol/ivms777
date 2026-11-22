@@ -20,6 +20,8 @@ from models import catalog
 from modelsvc.activity import Activity
 from modelsvc.backends.base import (
     CloningUnavailable,
+    FaceImageRefused,
+    FaceNotOffered,
     SlotOff,
     SpeakerEmbedNotOffered,
     SpeakerEmbedRefused,
@@ -27,7 +29,14 @@ from modelsvc.backends.base import (
     TranscribeRefused,
 )
 from modelsvc.scheduler import Priority
-from modelsvc.slots import ASR_UNIT, LLM_UNITS, SPEAKER_EMBED_UNIT, TRAIN_UNIT, catalog_payload
+from modelsvc.slots import (
+    ASR_UNIT,
+    FACES_UNIT,
+    LLM_UNITS,
+    SPEAKER_EMBED_UNIT,
+    TRAIN_UNIT,
+    catalog_payload,
+)
 from modelsvc.voice_bakes import BakeNotOffered, BakeOnly, VoiceBakes, VoiceGate
 
 log = logging.getLogger(__name__)
@@ -217,6 +226,27 @@ class CompositeBackend:
         return {"vector": result["vector"], "model": entry.key, "revision": revision,
                 "seconds": result["seconds"], "elapsed_s": result["elapsed_s"],
                 "pipeline": result["pipeline"]}
+
+    def detect_faces(self, image: bytes) -> dict:
+        entry = catalog.face_model_for(self._profile)
+        if entry is None or self._slots is None or not self._slots.has_unit(FACES_UNIT):
+            raise FaceNotOffered("finding faces is not offered on this device yet")
+        revision = entry.source.revision
+        result = self._run([FACES_UNIT], Priority.BATCH, "finding faces",
+                           lambda: self._slots.worker(FACES_UNIT).call("detect", image))
+        if result.get("revision") != revision:
+            raise RuntimeError(
+                f"faces identity mismatch: routed {entry.key}@{revision}, "
+                f"the child answered {result.get('revision')}"
+            )
+        if "refused" in result:
+            raise FaceImageRefused(result["refused"])
+        for face in result["faces"]:
+            if len(face["vector"]) != entry.dim:
+                raise RuntimeError(f"{entry.key} answered {len(face['vector'])} values, "
+                                   f"not {entry.dim}")
+        return {"faces": result["faces"], "model": entry.key, "revision": revision,
+                "elapsed_s": result["elapsed_s"]}
 
     @staticmethod
     def _log_asr_load(key: str, revision: str, before, after) -> None:

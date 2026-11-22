@@ -39,6 +39,19 @@ caption call) so it is never interleaved per-photo with captioning. A caption
 written this pass gets its vector this pass or the next; a library captioned before
 the column existed backfills the same way — no re-caption needed.
 
+6. **faces** — the last stage (design §8), drained after `caption_embed` in a guarded
+   group of its own (`ingest/faces.py`). For each photo with a pending `faces` job the
+   handler opens the original upright (EXIF rotation applied, RGB), shrinks its long
+   edge to the face entry's `input_edge` (640, design §4.1), and calls the `models`
+   service's `POST /faces/detect` (design §5.1) through
+   `ModelsClient.detect_faces`. In one transaction it deletes that photo's faces and
+   inserts the new ones (box in 0..1, score, vector, `model` = `<key>@<revision>`),
+   then puts each new face into a group: the owner's group whose mean face vector has
+   the highest cosine similarity with it, when that similarity reaches
+   `match_threshold` (0.5, env-overridable in `config.py`); else a new `face_groups`
+   row. A pinned face never moves. A face that joins a group attached to a person (a
+   `people` row, design §6) is that person at once. A photo with no face completes with no rows.
+
 **Stages are drained in order across the whole library, not per photo.** Every
 photo is embedded and scored before any photo is captioned. This keeps the Jetson
 profile viable: the SigLIP-using stages (`embed`, `taxonomy`) call `/embed/image`
@@ -113,7 +126,12 @@ drain pass (`ingest/pipeline.py::drain_pass`, shared by the `worker` loop and th
 app's inline drain) runs in two groups: first the **GPU/inference-free** stages —
 thumbnail, EXIF place facets, folder deletions, saved-voice deletions
 (`process_voice_deletions`, §6) — then the **embedder/inference**
-stages (embed, taxonomy, caption, and the batched caption_embed). The embedder (`RemoteEmbedder`, an HTTP shim over
+stages (embed, taxonomy, caption, and the batched caption_embed), then `faces` in a
+guarded group of its own: a `models` service outage (a connect error or connect
+timeout, or a 503 because the profile has no face model or its weights are absent) logs,
+leaves the `faces` jobs pending with no attempt counted, and never fails the pass. A 500
+or a read timeout on one photo fails that photo's job like any other error, so it never
+stops the photos after it. The embedder (`RemoteEmbedder`, an HTTP shim over
 the `models` service, §5.1) is built **inside the pass**, not eagerly at process
 start; if a call through it fails — e.g. the `models` service is unreachable, or its
 own CUDA init fails on jetson (the previously observed `RuntimeError 801`, now inside
@@ -138,9 +156,11 @@ captions — can be rebuilt without re-uploading. `POST /reprocess` resets a **r
 of stages (`from_stage` through an optional `to_stage`, inclusive) to `pending` for
 the owner's photos; the `worker` re-runs them in `STAGES` order on its next poll.
 The `/upload` UI puts a **Reprocess** button on **every stage row** — `thumbnail`,
-`embed`, `taxonomy`, `caption`, `caption_embed` — and each re-runs **only that one stage**
+`embed`, `taxonomy`, `caption`, `caption_embed`, `faces` — and each re-runs **only that one stage**
 (`from=to=stage`). So re-tagging after a `vocab.yaml` change never rebuilds
 thumbnails, and re-embedding never re-captions; each stage is re-run in isolation.
+A Reprocess of `faces` replaces every photo's faces, so the "Not this person" fixes of
+those photos are lost (design §8).
 The `caption` button is styled as a destructive action and confirms first ("can take
 hours"), since it alone re-runs the slow vision model. The endpoint still accepts any
 range, so a multi-stage re-run — `from=embed to=taxonomy` for a new embedding model —
@@ -158,8 +178,8 @@ Every stage handler is idempotent — it overwrites its own output — so a repr
 safe to trigger at any time. **Self-healing backfills** run automatically each
 drain: they queue `thumbnail` for a photo still without one, `embed` for one missing
 a vector, `taxonomy` for an embedded-but-untagged photo, `caption` for a
-thumbnailed-but-uncaptioned one, and `caption_embed` for a captioned photo with no
-caption vector — so a library predating a stage, or a photo whose
+thumbnailed-but-uncaptioned one, `caption_embed` for a captioned photo with no
+caption vector, and `faces` for a photo with no `faces` job (`backfill_faces`) — so a library predating a stage, or a photo whose
 thumbnail once failed, heals with no manual action. A photo that genuinely can't be
 thumbnailed is skipped by the later stages rather than crashing them.
 

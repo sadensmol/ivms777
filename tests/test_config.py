@@ -120,7 +120,6 @@ def test_conveyor_env_override():
 
 def test_llm_health_url_uses_port():
     s = Settings(profile="jetson", data_dir=Path("/tmp/pl"))
-    # mac keeps OFF the ports a developer's containers take (§3.1): 8080 and 9000 are
-    # published by Docker/OrbStack on a normal machine, and the collision is silent for
-    # the models service.
-    assert s.llm_health_url == "http://localhost:8088/health"
+    # jetson's supervised llama-server listens on :8080 inside its own container
+    # network (compose.jetson.yaml); only mac moves off it, to :8088.
+    assert s.llm_health_url == "http://localhost:8080/health"

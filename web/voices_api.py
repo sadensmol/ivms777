@@ -1,5 +1,7 @@
 """The Voices pages (design §6, §11.1, §13, §13.1): the grid `/voices` and its one leaf
-`/voices/{id}`. The old address `/organize/voices` answers 308.
+`/voices/{id}`. The old address `/organize/voices` answers 308. Every voice belongs to a
+person (§6, D8): New voice picks one or makes one with the voice's name, and the leaf
+moves the voice to another person of the owner.
 
 Every action is a `fetch` that answers a fragment — the cards (`_voice_cards.html`) on the
 grid, the leaf body (`_voice_body.html`) on a voice — or a JSON `{"detail": …}` error; none
@@ -49,6 +51,7 @@ from feed.saved_voices import (
     film_take,
     get_voice,
     list_voices,
+    move_voice,
     pending_voice_deletions,
     process_voice_deletions,
     read_bake_run,
@@ -73,6 +76,7 @@ from feed.voice_preview import (
     preview_text,
     run_preview,
 )
+from ingest.people import PersonError, PersonNameTaken, PersonNotFound, list_people
 from models.catalog import adapter_entry_for, cloning_entry_for, cloning_languages, transcriber_for
 from web.deps import AppContext
 from web.upload_api import FREE_SPACE_FLOOR
@@ -99,7 +103,9 @@ READY_PROBLEMS: dict[str, str] = {
 }
 
 # The leaf's tabs (§13.1): state of the leaf, carried in `?tab`, never history.
-TABS: tuple[tuple[str, str], ...] = (("recordings", "Recordings"), ("test", "Test"))
+TABS: tuple[tuple[str, str], ...] = (
+    ("recordings", "Recordings"), ("test", "Test"),
+)
 
 
 def language_name(code: str) -> str:
@@ -843,6 +849,8 @@ def register(
             "not_available": NOT_AVAILABLE,
             "languages": [(code, language_name(code)) for code in languages],
             "recordings": _recordings(voice, languages),
+            "other_people": [person for person in list_people(ctx.conn, ctx.settings.owner_id)
+                             if person.id != voice.person_id],
         } | ({} if voice.deleting else _voice_context(ctx, voice, languages))
 
     def _body(ctx: AppContext, voice_id: int) -> str:
@@ -866,6 +874,19 @@ def register(
         status = 409 if isinstance(error, VoiceNameTaken | VoiceDeleting) else 400
         return HTTPException(status_code=status, detail=str(error))
 
+    def _refuse_person(error: PersonError) -> HTTPException:
+        status = 409 if isinstance(error, PersonNameTaken) else 400
+        return HTTPException(status_code=status, detail=str(error))
+
+    def _person_id(value: str) -> int | None:
+        # The form's empty value is "a new person with the voice's name" (D8).
+        if not value.strip():
+            return None
+        try:
+            return int(value)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail="This person does not exist.") from error
+
     @app.get("/organize/voices")
     def voices_moved() -> RedirectResponse:
         # Old bookmarks of the page that lived under Organize (D20 reversed, D67).
@@ -882,6 +903,7 @@ def register(
             _cards_context(ctx) | {
                 "available": bool(cloning_languages(ctx.settings.profile)),
                 "not_available": NOT_AVAILABLE,
+                "people": list_people(ctx.conn, ctx.settings.owner_id),
             },
         )
 
@@ -890,14 +912,21 @@ def register(
         return HTMLResponse(_cards(context()))
 
     @app.post("/voices", response_class=HTMLResponse)
-    def voices_create(name: str = Form(default="")) -> HTMLResponse:
+    def voices_create(name: str = Form(default=""), person_id: str = Form(default="")) -> HTMLResponse:
         ctx = context()
         if not cloning_languages(ctx.settings.profile):
             raise HTTPException(status_code=409, detail=NOT_AVAILABLE)
+        person = _person_id(person_id)
         try:
-            voice = create_voice(ctx.conn, ctx.settings.owner_id, name)
+            voice = create_voice(ctx.conn, ctx.settings.owner_id, name, person)
         except VoiceError as error:
             raise _refuse(error) from error
+        except PersonNameTaken as error:
+            raise HTTPException(
+                status_code=409, detail=f"{error} Pick them as the voice's person."
+            ) from error
+        except PersonError as error:
+            raise _refuse_person(error) from error
         return HTMLResponse(_cards(ctx, created=voice.id))
 
     @app.get("/voices/preview", response_class=HTMLResponse)
@@ -1002,6 +1031,22 @@ def register(
             rename_voice(ctx.conn, ctx.settings.owner_id, voice_id, name)
         except VoiceError as error:
             raise _refuse(error) from error
+        return HTMLResponse(_body(ctx, voice_id))
+
+    @app.post("/voices/{voice_id}/person", response_class=HTMLResponse)
+    def voices_move(voice_id: int, person_id: str = Form(default="")) -> HTMLResponse:
+        # Allowed on every profile, like rename: the person is the user's, not the model's.
+        ctx = context()
+        _voice_or_404(ctx, voice_id)
+        person = _person_id(person_id)
+        if person is None:
+            raise HTTPException(status_code=400, detail="Pick the person to move the voice to.")
+        try:
+            move_voice(ctx.conn, ctx.settings.owner_id, voice_id, person)
+        except VoiceError as error:
+            raise _refuse(error) from error
+        except PersonNotFound as error:
+            raise _refuse_person(error) from error
         return HTMLResponse(_body(ctx, voice_id))
 
     @app.post("/voices/{voice_id}/delete", response_class=HTMLResponse)

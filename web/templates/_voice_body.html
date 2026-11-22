@@ -1,6 +1,6 @@
 {# One voice, the leaf body (design §6, §11.1, §13.1). Every action on /voices/{id} answers
    this fragment, and voices.js swaps it in for #voices: the header with the state of the
-   voice per language, the tabs, the recording kit with its takes, "Add a take" and the
+   voice per language, its person with "Move to another person", the tabs, the recording kit with its takes, "Add a take" and the
    Test tab's language and text. The recorder and the test panel stay OUTSIDE (voice.html,
    D53). A take or voice being deleted carries `data-deleting` — the page polls
    /voices/{id}/list every 2 s while one is shown. `data-epoch` / `data-completed` come
@@ -67,6 +67,23 @@
   {% if voice.deleting %}
     <p class="hint">This voice is being deleted.</p>
   {% else %}
+  {# The person as plain text: the person page is another leaf (§13.1). Move is a POST
+     answered in place. #}
+  <div class="voice-person">
+    <span class="voice-person-line">{% if voice.person_name %}Voice of <span class="voice-person-name">{{ voice.person_name }}</span>{% else %}This voice has no person yet.{% endif %}</span>
+    {% if other_people %}
+      <form class="voice-move js-voices-form" method="post" action="/voices/{{ voice.id }}/person">
+        <label>Move to another person
+          <select name="person_id" aria-label="Move to another person" required>
+            {% for person in other_people %}
+              <option value="{{ person.id }}">{{ person.name }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <button type="submit">Move</button>
+      </form>
+    {% endif %}
+  </div>
   {% for line, ready in ready_lines %}
     <p class="voice-ready{{ '' if ready else ' voice-unready' }}">{{ line }}</p>
   {% endfor %}

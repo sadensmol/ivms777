@@ -1,17 +1,17 @@
 import sqlite3
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 # `caption_embed` is the §9 caption-meaning vector. It is a real stage like the
 # others — queued per photo, counted, reprocessable — but it is DRAINED IN ONE
 # BATCH (pipeline group 2c) rather than photo by photo, because the text embedder
 # loads once and embeds 50 captions in a single call.
-STAGES: tuple[str, ...] = ("thumbnail", "embed", "taxonomy", "caption", "caption_embed")
+STAGES: tuple[str, ...] = ("thumbnail", "embed", "taxonomy", "caption", "caption_embed", "faces")
 MAX_ATTEMPTS = 3
 STATUSES = ("pending", "running", "done", "failed")
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def enqueue(conn: sqlite3.Connection, photo_id: int, stage: str) -> None:
@@ -147,6 +147,17 @@ def requeue_running(conn: sqlite3.Connection, photo_id: int, stage: str) -> None
     conn.execute(
         "UPDATE jobs SET status = 'pending', updated_at = ? WHERE photo_id = ? AND stage = ?",
         (_now(), photo_id, stage),
+    )
+
+
+def defer(conn: sqlite3.Connection, photo_id: int, stage: str, error: str) -> None:
+    """Return one claimed job to 'pending' WITHOUT counting an attempt, and record why —
+    for a stage whose service is down (§8): an outage is not the photo's fault, so it
+    must never use up the photo's attempts."""
+    conn.execute(
+        "UPDATE jobs SET status = 'pending', error = ?, updated_at = ?"
+        " WHERE photo_id = ? AND stage = ?",
+        (error, _now(), photo_id, stage),
     )
 
 

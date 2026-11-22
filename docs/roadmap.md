@@ -29,7 +29,18 @@ the disk matters more than chat does.
 ## Future work
 
 - Authentication, signup, and per-user quotas for public access (v02).
-- Face detection and person clustering.
+- **Face detection and person clustering (done, plan 27).** The `faces` stage finds
+  the faces of each photo with InsightFace `buffalo_l` in the models service, groups
+  them by nearest group mean, and the owner names each group as a person (design §4.1,
+  §8, §13). The photo page and the film shot brief show the names.
+- **People (done, plan 28).** A person is its own `people` record that owns saved
+  voices and face groups (design §6). The People tab lists people and holds "Faces to
+  name"; the person page shows their voices, face groups and photos in place (design
+  §13). Still future: search, library filters and chat answers by person; a
+  person page with a grid of all their photos to drill into (its own `ctx`, design
+  §13.1); merging two people; picking a
+  film narrator from the people in a memory; and a re-cluster that keeps the owner's
+  fixes.
 - Object storage backend behind the existing `Storage` interface.
 - Optional XMP sidecar export so other tools see the tags.
 - Offline reverse geocoding place names — the "By place" organizer names albums

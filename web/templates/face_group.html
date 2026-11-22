@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block title %}{{ group.person_name or 'Faces to name' }} — People — ivms777{% endblock %}
+{% block content %}
+{# One face group: a LEAF of the People grid (design §13, §13.1). ×, the "People" link and
+   Esc go up one level — history.back() when the page was opened from the grid
+   (`data-from-grid`, set by faces.js at mount), else location.replace("/people"). Every
+   action is a fetch POST that answers this page; faces.js swaps its #face-group in place
+   and pushes no history. #}
+<div class="voices-shell face-leaf" id="faces-page">
+  <p id="faces-error" class="voices-error" role="alert" hidden></p>
+
+  <div id="face-group" data-group-id="{{ group.id }}">
+    <header class="voice-head">
+      <h1 class="voice-title"><a class="faces-up" href="/people">People</a>
+        <span class="voice-crumb">›</span>
+        <span class="voice-name">{{ group.person_name or 'Faces to name' }}</span></h1>
+      <button class="voices-close faces-close" type="button" aria-label="Close">×</button>
+    </header>
+
+    <p class="hint">{{ group.face_count }} face{{ '' if group.face_count == 1 else 's' }}</p>
+
+    {% if group.person_id is none %}
+      <div class="face-name">
+        {% if people %}
+          <form class="face-assign js-faces-form" method="post" action="/faces/{{ group.id }}/assign">
+            <label for="face-person">This is</label>
+            <select id="face-person" name="person_id" required>
+              {% for person in people %}
+                <option value="{{ person.id }}">{{ person.name }}</option>
+              {% endfor %}
+            </select>
+            <button type="submit">Attach</button>
+          </form>
+        {% endif %}
+        <form class="face-new-person js-faces-form" method="post" action="/faces/{{ group.id }}/person">
+          <label for="face-new-name">New person</label>
+          <input type="text" id="face-new-name" name="name" maxlength="80" required placeholder="Grandma">
+          <button type="submit">Create</button>
+        </form>
+      </div>
+    {% else %}
+      <form class="face-unassign js-faces-form" method="post" action="/faces/{{ group.id }}/unassign">
+        <button type="submit" class="reprocess-btn">Remove from this person</button>
+      </form>
+    {% endif %}
+
+    <ul class="face-crops">
+      {% for face in group.faces %}
+        <li class="face-crop">
+          <img src="/faces/crop/{{ face.id }}" alt="" loading="lazy" width="120" height="120">
+          {% if group.face_count > 1 %}
+            <form class="face-release js-faces-form" method="post" action="/faces/face/{{ face.id }}/release">
+              <button type="submit" class="reprocess-btn">Not this person</button>
+            </form>
+          {% endif %}
+        </li>
+      {% endfor %}
+    </ul>
+  </div>
+</div>
+<script src="/static/faces.js?v={{ static_v('faces.js') }}" defer></script>
+{% endblock %}

@@ -9,8 +9,8 @@ model; this file is the per-route detail. Section references point into
 
 - **Persistent app shell** — the nav is a **full-width fixed header**; the content
   region **below it is the only scroll container** (the window never scrolls), so the
-  page scrollbar starts under the menu and never crosses it. The five nav links
-  (Upload/Library/Chat/Organize/Voices) are **HTMX-boosted** and swap **only `<main>`**, so
+  page scrollbar starts under the menu and never crosses it. The six nav links
+  (Upload/Library/Chat/Organize/People/Voices) are **HTMX-boosted** and swap **only `<main>`**, so
   the nav and its resource-bar polling stay resident across top-level navigation —
   the menu never re-renders and the resource bar never blanks. Boost is **scoped to
   these links only**: every grid↔leaf drill-down (photo, similar, prev/next) is a
@@ -121,7 +121,10 @@ and Esc/backdrop/× just closes it.
   with scores and source badges (the "AI data"), the full EXIF panel — including GPS
   **coordinates**, which live here as a technical detail and nowhere else — every
   local path the file arrived from with the wasted-space total when there is more than
-  one, and a "similar photos" strip. The photo itself and everything above render on
+  one, a **People** line, and a "similar photos" strip. The People line names the
+  people recognised in the photo (its faces whose group is attached to a person, design
+  §6; the person's name in `people`, never a voice's), each name once, owner-scoped, as **plain text** — a link to a person would open a
+  leaf from a leaf (design §13.1). With no named person the line is absent. The photo itself and everything above render on
   first paint; the similar strip is the one expensive part (a full-library scan), so
   it loads **asynchronously** — the page ships a placeholder that fires
   `GET /photo/{id}/similar` on load and swaps in the finished strip (§9.2) — so opening
@@ -200,13 +203,56 @@ and Esc/backdrop/× just closes it.
     return from `/feed` restored from bfcache, the page fetches `/organize` once and
     swaps each card's film block. The grid keeps its scroll, its controls and its
     expanded notes.
-- `/voices` — **Voices** (design §6, §11.1, §13): the people whose own voice can
-  narrate a film. It is a **top-level grid** (design §13.1), the fifth nav link, with
-  no × and no `ctx`. The head reads "A voice is a person's own voice. It can narrate a
+- `/people` — **People** (design §6, §13): the owner's people. It is a **top-level
+  grid** (design §13.1), the fifth nav link, with no × and no `ctx`, on every profile
+  (a person needs no voice copy). The head holds **New person**: a name (1-80
+  characters, unique per owner, case-insensitive) and **Create**; an empty, too long or
+  taken name is refused with its reason and nothing is written.
+  - Each person is a **card**, a plain `<a href="/people/{id}">` (a full navigation,
+    never boosted — the one grid→leaf push): the name, the names of their voices, and
+    "N faces". With no person, the grid reads "No people yet."
+  - **Faces to name** follows the cards: every face group of the owner with no person
+    and at least the minimum number of faces (2 by default, env-overridable in
+    `config.py`; one stranger's face never floods the list), plus every such group that
+    holds a face the owner released (Not this person) whatever its size, the largest
+    first. Each group
+    shows up to four face crops (`<img src="/faces/crop/{face_id}">`) and "N faces", and
+    is a plain `<a href="/faces/{id}">` (a full navigation, never boosted — the one
+    grid→leaf push). With no such group the section is absent.
+  - The routes (`web/people_api.py`): `GET /people`, `POST /people` (form `name`;
+    answers the cards), `GET /people/{id}` (the person leaf),
+    `POST /people/{id}/rename` (form `name`) and `POST /people/{id}/delete` (409 with its
+    reason while the person owns a voice). A name error answers 400 (empty or too long)
+    or 409 (taken) with its reason. A foreign or unknown id is a 404 on every
+    `/people/{id}…` route.
+- `/people/{id}` — one person, the **leaf** of the People grid (design §13.1).
+  - **Header:** "People › <name>" — "People" is a link that closes the page — a **⋯**
+    menu with **Rename…** (the New person rules) and **Delete person…**, and a **×**.
+  - Then, all in place, with no link to another leaf (design §13.1): the person's
+    **Voices** by name, as plain text ("No voices yet." with none); their **Faces**:
+    each face group attached to them with up to four crops, "N faces" and **Remove from
+    this person** (the group returns to "Faces to name"), "No faces yet." with none;
+    and the thumbnails of the **Photos** with their faces, newest first, as plain images.
+  - **Delete person** is refused with its reason while the person owns a voice, one
+    being deleted included. Otherwise the person goes, their face
+    groups return to "Faces to name", no photo, face or voice is deleted, and the page
+    closes to the grid as below.
+  - Every action is a `fetch` POST answered in place (`people.js`); a refused action
+    shows its reason in the page's error line. None pushes history.
+  - **Close** (×, the "People" link, Esc) goes up to the grid: `history.back()` when the
+    page carries `data-from-grid` (set at mount when `document.referrer` has the same
+    origin and the path `/people`), else `location.replace("/people")`. The page holds
+    no level of its own, so Esc closes at once.
+- `/voices` — **Voices** (design §6, §11.1, §13): the voices that can narrate a film,
+  each owned by a person. It is a **top-level grid** (design §13.1), the sixth nav link,
+  with no × and no `ctx`. The head reads "A voice is a person's own voice. It can narrate a
   film in each language it has a take of." and holds **New voice**: a name (1-80
-  characters, unique per owner, case-insensitive) and **Create**.
+  characters, unique per owner, case-insensitive), its **person** — a select of the
+  owner's people, by default "New person with this name" — and **Create**. With the
+  default, a person whose name is the voice's name already exists: the create is
+  refused with its reason and asks the owner to pick that person; nothing is written.
   - Each voice is a **card**, a plain `<a class="voice-card" href="/voices/{id}">` (a
-    full navigation, never boosted): the name, one line per language with takes,
+    full navigation, never boosted): the name, its person's name as plain text, one line per language with takes,
     "<Language> · m:ss · N takes", and one line of the languages it is ready for
     (design §11.1): "For films: English, Russian" or "Not ready for films yet". A voice
     with no take reads "No takes yet". A card plays nothing.
@@ -218,10 +264,12 @@ and Esc/backdrop/× just closes it.
   - When the catalog lists no voice-copy model for this device, the head reads "Voice
     copy is not available on this device." and has no New voice. The cards still
     open, for rename and delete.
+  - Faces are not on this grid: "Faces to name" lives on `/people`.
   - The old page moved: `GET /organize/voices` answers **308** with `Location:
     /voices`, and every other path under `/organize/voices/` is gone. The routes, with
     the status codes, the disk guard and the drain wake-up they had:
-    `GET /voices`, `GET /voices/list`, `POST /voices` (form `name`),
+    `GET /voices`, `GET /voices/list`, `POST /voices` (form `name` and `person_id`,
+    empty = a new person with the voice's name),
     `GET /voices/preview` (the test state, `Cache-Control: no-store`),
     `POST /voices/preview/cancel`, `GET /voices/hearing?voice=<id>` (the hearing job as
     that voice sees it, `Cache-Control: no-store`; polled every 1 s while the takes of the
@@ -229,6 +277,8 @@ and Esc/backdrop/× just closes it.
     that voice's work, or **Close** of its failure),
     `GET /voices/{id}` (`?tab=`), `GET /voices/{id}/list` (the leaf body),
     `POST /voices/{id}/rename`, `POST /voices/{id}/delete`,
+    `POST /voices/{id}/person` (form `person_id`: move the voice to another person of the
+    owner; another owner's person is refused),
     `POST /voices/{id}/examples` (add a take; form `language`, `source` and
     `prompt_id`, the kit text shown; no words),
     `POST /voices/{id}/examples/{example_id}/delete`,
@@ -243,10 +293,19 @@ and Esc/backdrop/× just closes it.
     they answer 404 or 405, as every unknown path does. The bake routes were removed:
     `POST /voices/{id}/bake` and `POST /voices/bake/cancel` answer 404, and
     `GET /voices/bake` answers 422 (it reads "bake" as a voice id).
+  - The face routes (`web/faces_api.py`): `GET /faces/{id}` (the group leaf),
+    `POST /faces/{id}/assign` (form `person_id`), `POST /faces/{id}/person` (form
+    `name`: create a person for the group), `POST /faces/{id}/unassign`,
+    `POST /faces/face/{face_id}/release` (Not this person) and
+    `GET /faces/crop/{face_id}` (a JPEG). The literal paths come before
+    `/faces/{id}`. A foreign or unknown id is a 404 on every route.
 - `/voices/{id}` — one voice, the **leaf** of the Voices grid (design §13.1).
   - **Header:** "Voices › <name>" — "Voices" is a link that closes the page (below) —
     a **⋯** menu with **Rename…** (the rules of New voice) and **Delete voice…**, and a
-    **×** that closes the page. Under it, on every tab, the state of the voice (design
+    **×** that closes the page. Under it, the voice's person as plain text, "Voice of
+    <person>" (no link: a person page is another leaf, design §13.1), with **Move to
+    another person**: a select of the owner's other people and **Move**, a POST answered
+    in place that pushes no history. Then, on every tab, the state of the voice (design
     §11.1), one line per language with takes or that voice copy speaks here:
     - ready: "<Language> · films and tests speak from take #<id>", plus "· take #<n>
       waits for its words" for a newer take not heard yet, or "· take #<n> has no usable
@@ -272,7 +331,8 @@ and Esc/backdrop/× just closes it.
     the page shows it again. The page polls while its voice is heard or queued, and when
     that work ends it refreshes the body (the state lines and the Test tab).
   - **Tabs:** **Recordings** (the default) and **Test**. The URL carries
-    `?tab=recordings|test`; an unknown value, `model` too, shows Recordings. A switch
+    `?tab=recordings|test`; an unknown value, `model` and `faces` too, shows Recordings.
+    There is no Faces tab: face groups belong to the person (`/people/{id}`). A switch
     replaces the URL (`history.replaceState`), so Back never walks through tabs and a
     reload keeps the tab. A switch keeps the recorder, the typed test text and every
     selection.
@@ -429,6 +489,31 @@ and Esc/backdrop/× just closes it.
     Close asks the same. ⚙ Settings is an overlay and asks nothing. On leaving, the
     page stops the microphone and its timers; on a return (Back, Forward, or the htmx
     history restore) it reconnects the deleting poll and the test from the server.
+- `/faces/{id}` — one face group, a **leaf** of the People grid (design §13.1).
+  - **Header:** "People › Faces to name", or "People › <person>" when the group is
+    attached, and **×**, then "N faces". Then every face of the group as a crop (cut
+    from the photo's 1600 px detail thumbnail by the face box plus a margin of 20% of
+    its side, on request; no file is stored), newest photo first, each with **Not this
+    person** when the group holds more than one face.
+  - **Attach to a person:** a select of the owner's people (from `people`, by name)
+    and **Attach**. **New person:** a name (the New person rules: 1-80 characters,
+    unique per owner, case-insensitive) and **Create**; a taken or empty name is
+    refused with its reason and nothing is written. Creating a person here creates no
+    saved voice. Both work on every profile: a person needs no voice copy. An attached group leaves "Faces to name", and every
+    face that later joins it is that person with no action by the owner. An attached
+    group shows **Remove from this person** instead of Attach and New person; the group
+    returns to "Faces to name".
+  - **Not this person** moves that one face out to a new group of its own and pins it,
+    so grouping never moves it again. The new group is listed under "Faces to name",
+    so the released face can be named. A one-face group has no such button: the move
+    would only pin the same face.
+  - Every action is a `fetch` POST that answers the group leaf; `faces.js` swaps it in
+    place. A refused action shows its reason in the page's error line. None pushes
+    history: the URL changes only through `history.replaceState`.
+  - **Close** (×, the "People" link, Esc) goes up to the grid: `history.back()` when
+    the page carries `data-from-grid` (set at mount when `document.referrer` has the
+    same origin and the path `/people`), else `location.replace("/people")`. The page
+    holds no level of its own, so Esc closes at once.
 - `/feed/{key}` — the **memory film**: one memory played fullscreen as a directed
   short (design §11.1). Its controls sit in **one header** at the top: an **action
   row** — the language selector, ↓ Download (ready film only) and the × close — that
@@ -651,9 +736,10 @@ and Esc/backdrop/× just closes it.
 
 ## Nav order
 
-The nav order is **Upload → Library → Chat → Organize → Voices**: bring photos in,
+The nav order is **Upload → Library → Chat → Organize → People → Voices**: bring photos in,
 browse and search them, ask about them to understand the collection, then — once you
 know what you have — group and reorganize them. Organize is the final stage of the
 process (it feeds stage 2, the on-disk reorg); chat is a review-and-understand tool, so
-it sits before it. Voices are the people who narrate the films, a resource of their
-own, so they sit last.
+it sits before it. People and their voices are resources of their own, so they sit
+last: People first — the faces in the photos are named there, and every voice belongs
+to a person — then Voices, which narrate the films.

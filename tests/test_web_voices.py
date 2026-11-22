@@ -634,25 +634,37 @@ def _take_row_of(client, column: str):
         f"SELECT {column} FROM voice_examples ORDER BY id DESC LIMIT 1").fetchone()
 
 
-def test_a_recording_stores_its_kit_text_and_no_words(client):
+@pytest.fixture
+def held_hearings(client, monkeypatch):
+    """The hearing job a saved take starts writes the heard words into the row on its own
+    thread; held here, the row is read as the add route wrote it."""
+    started: list[int] = []
+    monkeypatch.setattr(client.app.state.voice_hearings, "start", started.append)
+    return started
+
+
+def test_a_recording_stores_its_kit_text_and_no_words(client, held_hearings):
     voice = create_voice(ctx(client).conn, OWNER, "Babushka")
     response = post_example(client, voice.id, language="ru", source="recorded", prompt_id="ru-rain")
     assert response.status_code == 200
+    assert held_hearings == [voice.id]
     stored = _take_row_of(client, "kit_id, transcript, transcript_model, transcript_error")
     assert tuple(stored) == ("ru-rain", None, None, None)
 
 
-def test_a_recording_without_a_prompt_id_stores_no_kit_text(client):
+def test_a_recording_without_a_prompt_id_stores_no_kit_text(client, held_hearings):
     voice = create_voice(ctx(client).conn, OWNER, "Babushka")
     assert post_example(client, voice.id, language="ru", source="recorded").status_code == 200
+    assert held_hearings == [voice.id]
     assert tuple(_take_row_of(client, "kit_id, transcript")) == (None, None)
 
 
-def test_the_add_route_stores_no_words_even_when_the_form_carries_them(client):
+def test_the_add_route_stores_no_words_even_when_the_form_carries_them(client, held_hearings):
     voice = create_voice(ctx(client).conn, OWNER, "Babushka")
     response = post_example(client, voice.id, source="recorded", prompt_id="en-rain",
                             transcript="The words I typed.")
     assert response.status_code == 200
+    assert held_hearings == [voice.id]
     assert tuple(_take_row_of(client, "kit_id, transcript, transcript_model")) == (
         "en-rain", None, None)
 

@@ -145,8 +145,8 @@ class CountingStorage:
 
 
 def test_tables_exist_after_migrate(conn):
-    assert SCHEMA_VERSION == 14
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 14
+    assert SCHEMA_VERSION == 16
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 16
     names = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"saved_voices", "voice_examples", "voice_conditionings", "memory_narrators",
             "voice_deletions", "voice_file_deletions"} <= names
@@ -842,7 +842,7 @@ def seed_preview(conn, store, example_id, audio=TEST_AUDIO) -> str:
 
 
 def test_phase4_tables_exist_after_migrate(conn):
-    assert SCHEMA_VERSION == 14
+    assert SCHEMA_VERSION == 16
     names = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"voice_film_examples", "voice_previews"} <= names
 
@@ -1006,7 +1006,7 @@ def store_voice_test(conn, store, voice_id, prompt, audio=TEST_AUDIO, *, text_ki
 
 
 def test_slice_b_tables_and_columns_exist_after_migrate(conn):
-    assert SCHEMA_VERSION == 14
+    assert SCHEMA_VERSION == 16
     names = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"voice_bake_runs", "voice_models", "voice_model_takes", "voice_tests"} <= names
     assert {"language", "seconds", "fingerprint"} <= columns(conn, "voice_model_takes")
@@ -1729,3 +1729,29 @@ def test_a_cancel_after_the_store_finds_no_run_and_the_model_stays(conn, store):
     model = store_run(conn, store, voice.id, bake_key)
     assert sv.request_bake_cancel(conn, bake_key) is False
     assert sv.voice_model_for(conn, OWNER, voice.id).model == model
+
+
+def test_deleting_a_person_returns_their_face_groups_to_faces_to_name(conn, store):
+    # D7, AC22: a voice belongs to a person, so deleting the voice keeps the
+    # person and the groups attached to them; only deleting the person returns the groups.
+    from ingest import people
+    from tests.factories import add_face, add_face_group, add_person, add_photo
+
+    photo = add_photo(conn, content_hash="fa" * 32)
+    person = add_person(conn, owner_id=OWNER, name="Grandma")
+    voice = create_voice(conn, OWNER, "Grandma's voice", person_id=person)
+    group = add_face_group(conn, owner_id=OWNER, person_id=person)
+    for _ in range(2):
+        add_face(conn, photo_id=photo, group_id=group, vector=(1.0, 0.0))
+
+    request_voice_deletion(conn, OWNER, voice.id)
+    assert process_voice_deletions(conn, store, OWNER) == 0
+    kept = [g.id for g in people.person_groups(conn, OWNER, person)]
+    waiting_after_voice = people.groups_to_name(conn, OWNER)
+    people.delete_person(conn, OWNER, person)
+    waiting = people.groups_to_name(conn, OWNER)
+
+    assert get_voice(conn, OWNER, voice.id) is None
+    assert kept == [group] and waiting_after_voice == []
+    assert [(g.id, g.person_id, g.face_count) for g in waiting] == [(group, None, 2)]
+    assert rows(conn, "faces") == 2 and rows(conn, "photos") == 1

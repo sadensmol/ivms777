@@ -48,6 +48,16 @@ class SpeakerEmbedRefused(ValueError):
     answers 422 with the reason."""
 
 
+class FaceNotOffered(RuntimeError):
+    """No face model runs on this profile: the service has no `faces` unit
+    (`catalog.face_model_for`, §4.1). The HTTP layer answers 503."""
+
+
+class FaceImageRefused(ValueError):
+    """An image the face model cannot read. The HTTP layer answers 422 with the
+    reason."""
+
+
 class ModelBackend(Protocol):
     def embed_image(self, images: list[bytes]) -> list[list[float]]:
         """SigLIP image embeddings (ingest `embed`, "similar")."""
@@ -241,6 +251,16 @@ class ModelBackend(Protocol):
         Returns `{vector, model, revision, seconds, elapsed_s, pipeline}`. Raises
         `SpeakerEmbedNotOffered` (no speaker model on this profile), `SpeakerEmbedRefused`
         (too little voiced audio) or `BakeRunning` (the voice gate is closed).
+        """
+        ...
+
+    def detect_faces(self, image: bytes) -> dict:
+        """The faces of one upright image (design §5.1 `/faces/detect`).
+
+        Returns `{faces: [{box: [x, y, w, h] in 0..1 of the image, score, vector}],
+        model, revision, elapsed_s}`; every vector is L2-normalised and has the entry's
+        `dim` values. Raises `FaceNotOffered` (no face model on this profile) or
+        `FaceImageRefused` (an image it cannot read).
         """
         ...
 

@@ -17,6 +17,8 @@ from audio.speaker_embed import PIPELINE, clip_samples
 from audio.whisper_asr import RATE_IN, take_samples
 from modelsvc.backends.base import (
     CloningUnavailable,
+    FaceImageRefused,
+    FaceNotOffered,
     SlotOff,
     SpeakerEmbedNotOffered,
     SpeakerEmbedRefused,
@@ -76,6 +78,10 @@ class FakeBackend:
         # The scripted speaker model, by clip sha256: its vector, or the refusal's reason.
         self.speaker_vectors: dict[str, list[float]] = {}
         self.speaker_refusals: dict[str, str] = {}
+        # The scripted face model, by image sha256: its faces (`{box, score, vector}`),
+        # or the refusal's reason. An image with nothing declared holds no face.
+        self.faces: dict[str, list[dict]] = {}
+        self.face_refusals: dict[str, str] = {}
 
     def embed_image(self, images: list[bytes]) -> list[list[float]]:
         return [_vector_from_bytes(b"image:" + image) for image in images]
@@ -310,6 +316,15 @@ class FakeBackend:
         samples, rate = clip_samples(audio)
         return {"vector": vector, "model": "fake-speaker", "revision": "fake",
                 "seconds": len(samples) / rate, "elapsed_s": 0.0, "pipeline": PIPELINE}
+
+    def detect_faces(self, image: bytes) -> dict:
+        if self._catalog.face_model_for(self._profile) is None:
+            raise FaceNotOffered("finding faces is not offered on this device yet")
+        sha256 = hashlib.sha256(image).hexdigest()
+        if sha256 in self.face_refusals:
+            raise FaceImageRefused(self.face_refusals[sha256])
+        return {"faces": self.faces.get(sha256, []), "model": "fake-faces", "revision": "fake",
+                "elapsed_s": 0.0}
 
     # --- slots (design §4.1) ---
     def _download_status(self, entry) -> dict:

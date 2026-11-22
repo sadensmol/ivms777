@@ -1007,3 +1007,128 @@ def test_a_speaker_model_error_is_a_500_with_its_message():
         resp = tc.post("/voice/embed", json=_embed_body(_wav_take()))
     assert resp.status_code == 500
     assert "not on disk: run `make models`" in resp.json()["detail"]
+
+
+_BUFFALO_REV = "d09715916a0778919a770c343533641e250b8699"
+_FACE_IMAGE = b"\x89PNG-one-upright-photo"
+
+
+def _unit_vector(dim: int = 512) -> list[float]:
+    return [1.0] + [0.0] * (dim - 1)
+
+
+_FACE = {"box": [0.375, 0.225, 0.25, 0.25], "score": 0.9, "vector": _unit_vector()}
+
+
+class _FaceChild:
+    """The `faces` child as the service sees it: `call("detect", image)` answers the faces
+    of the image, or `{refused, revision}` for an image it cannot read."""
+
+    def __init__(self, reply: dict, activity=None) -> None:
+        self.reply = reply
+        self.activity = activity
+        self.calls: list[tuple] = []
+        self.labels: list[str | None] = []
+
+    def call(self, method, *args):
+        self.calls.append((method, *args))
+        if self.activity is not None:
+            self.labels.append(self.activity.current())
+        return self.reply
+
+
+class _FaceSlots:
+    def __init__(self, child, offered: bool = True) -> None:
+        self.child, self.offered = child, offered
+
+    def has_unit(self, unit):
+        return self.offered and unit == "faces"
+
+    def worker(self, unit):
+        assert unit == "faces"
+        return self.child
+
+
+class _SeenScheduler:
+    def __init__(self) -> None:
+        self.seen: list[tuple] = []
+
+    def run(self, needed, priority, fn):
+        self.seen.append((tuple(needed), priority))
+        return fn()
+
+    def reap_idle(self, units):
+        pass
+
+
+def _face_app(child, *, offered=True, scheduler=None, activity=None, profile="mac"):
+    from modelsvc.backends.composite import CompositeBackend
+
+    backend = CompositeBackend(embed=None, slots=_FaceSlots(child, offered),
+                               scheduler=scheduler, activity=activity, profile=profile)
+    return TestClient(create_models_app(backend))
+
+
+def _detect_body(image: bytes = _FACE_IMAGE) -> dict:
+    return {"image": base64.b64encode(image).decode()}
+
+
+@pytest.mark.parametrize("profile", ["mac", "jetson", "cloud"])
+def test_faces_detect_answers_each_face_with_the_model_and_its_pinned_revision(profile):
+    child = _FaceChild({"faces": [_FACE], "revision": _BUFFALO_REV, "elapsed_s": 0.4})
+    with _face_app(child, profile=profile) as tc:
+        resp = tc.post("/faces/detect", json=_detect_body())
+    assert resp.status_code == 200
+    body = resp.json()
+    assert (body["model"], body["revision"]) == ("buffalo-l", _BUFFALO_REV)
+    assert body["faces"] == [_FACE]
+    assert child.calls == [("detect", _FACE_IMAGE)]
+
+
+def test_faces_detect_runs_the_faces_unit_at_batch_priority_labelled_finding_faces():
+    from modelsvc.activity import Activity
+    from modelsvc.scheduler import Priority
+
+    activity = Activity()
+    scheduler = _SeenScheduler()
+    child = _FaceChild({"faces": [], "revision": _BUFFALO_REV, "elapsed_s": 0.1}, activity)
+    with _face_app(child, scheduler=scheduler, activity=activity) as tc:
+        resp = tc.post("/faces/detect", json=_detect_body())
+    assert resp.status_code == 200
+    assert resp.json()["faces"] == []
+    assert scheduler.seen == [(("faces",), Priority.BATCH)]
+    assert child.labels == ["finding faces"]
+
+
+def test_faces_detect_where_no_face_model_runs_is_a_503():
+    child = _FaceChild({"faces": [_FACE], "revision": _BUFFALO_REV, "elapsed_s": 0.1})
+    with _face_app(child, offered=False) as tc:
+        resp = tc.post("/faces/detect", json=_detect_body())
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == "finding faces is not offered on this device yet"
+    assert child.calls == []
+
+
+def test_an_image_the_face_child_cannot_read_is_a_422_with_its_reason():
+    child = _FaceChild({"refused": "cannot identify image file", "revision": _BUFFALO_REV})
+    with _face_app(child) as tc:
+        resp = tc.post("/faces/detect", json=_detect_body(b"not an image"))
+    assert resp.status_code == 422
+    assert "cannot identify image file" in resp.json()["detail"]
+
+
+def test_a_face_reply_of_another_revision_is_a_faces_identity_mismatch():
+    child = _FaceChild({"faces": [_FACE], "revision": "another-commit", "elapsed_s": 0.1})
+    with _face_app(child) as tc:
+        resp = tc.post("/faces/detect", json=_detect_body())
+    assert resp.status_code == 500
+    assert "faces identity mismatch" in resp.json()["detail"]
+
+
+def test_a_face_vector_of_another_size_is_an_error():
+    short = {"box": [0.1, 0.1, 0.2, 0.2], "score": 0.9, "vector": _unit_vector(7)}
+    child = _FaceChild({"faces": [_FACE, short], "revision": _BUFFALO_REV, "elapsed_s": 0.1})
+    with _face_app(child) as tc:
+        resp = tc.post("/faces/detect", json=_detect_body())
+    assert resp.status_code == 500
+    assert "7 values, not 512" in resp.json()["detail"]

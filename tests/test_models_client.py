@@ -475,3 +475,32 @@ def test_an_embed_round_trips_through_the_service():
     result = _client().embed_voice(buffer.getvalue())
     assert len(result["vector"]) == 192
     assert (result["model"], result["seconds"], result["pipeline"]) == ("fake-speaker", 6.0, 1)
+
+
+_DETECTED = {"faces": [{"box": [0.1, 0.2, 0.3, 0.4], "score": 0.9, "vector": [1.0] + [0.0] * 511}],
+             "model": "buffalo-l", "revision": "d09715916a0778919a770c343533641e250b8699",
+             "elapsed_s": 0.3}
+
+
+def test_detect_faces_posts_the_image_and_answers_each_face_with_its_model():
+    from inference.models_client import DetectedFace
+
+    seen: list = []
+    faces = _bake_client(seen, body=_DETECTED).detect_faces(b"JPEG-bytes")
+
+    assert [(s["method"], s["path"], s["timeout"], s["json"]) for s in seen] == [
+        ("POST", "/faces/detect", 600.0, {"image": base64.b64encode(b"JPEG-bytes").decode()})]
+    assert faces == [DetectedFace(box=(0.1, 0.2, 0.3, 0.4), score=0.9,
+                                  vector=tuple([1.0] + [0.0] * 511),
+                                  model="buffalo-l@d09715916a0778919a770c343533641e250b8699")]
+
+
+@pytest.mark.parametrize("status", [422, 500, 503])
+def test_a_refused_detect_raises_for_its_status(status):
+    client = _bake_client([], status, body={"detail": "no"})
+    raised = None
+    try:
+        client.detect_faces(b"JPEG")
+    except httpx.HTTPStatusError as error:
+        raised = error.response.status_code
+    assert raised == status
