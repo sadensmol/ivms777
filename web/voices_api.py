@@ -899,8 +899,6 @@ def register(
     @app.get("/voices", response_class=HTMLResponse)
     def voices_page(request: Request, person: str = "") -> HTMLResponse:
         ctx = context()
-        # `person` only preselects New voice (the person page's "Record a voice"): a
-        # missing, foreign or non-numeric value gives the default form, never an error.
         digits = person.strip()
         chosen = (
             get_person(ctx.conn, ctx.settings.owner_id, int(digits))
