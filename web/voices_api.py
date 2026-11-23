@@ -76,7 +76,7 @@ from feed.voice_preview import (
     preview_text,
     run_preview,
 )
-from ingest.people import PersonError, PersonNameTaken, PersonNotFound, list_people
+from ingest.people import PersonError, PersonNameTaken, PersonNotFound, get_person, list_people
 from models.catalog import adapter_entry_for, cloning_entry_for, cloning_languages, transcriber_for
 from web.deps import AppContext
 from web.upload_api import FREE_SPACE_FLOOR
@@ -93,6 +93,8 @@ LANGUAGE_NAMES: dict[str, str] = {"en": "English", "ru": "Russian"}
 
 TAKE_LABEL_CHARS = 80
 NOT_AVAILABLE = "Voice copy is not available on this device."
+# Every 18-digit number fits a SQLite INTEGER; a longer `?person=` names no person.
+MAX_ID_DIGITS = 18
 BAKE_CANCELLED = "The bake was cancelled, so no voice model was stored."
 
 READY_PROBLEMS: dict[str, str] = {
@@ -895,8 +897,16 @@ def register(
     # The literal paths come before /voices/{voice_id}: `voice_id` is an int, so a later
     # literal path would answer 422 (§2.17 V1).
     @app.get("/voices", response_class=HTMLResponse)
-    def voices_page(request: Request) -> HTMLResponse:
+    def voices_page(request: Request, person: str = "") -> HTMLResponse:
         ctx = context()
+        # `person` only preselects New voice (the person page's "Record a voice"): a
+        # missing, foreign or non-numeric value gives the default form, never an error.
+        digits = person.strip()
+        chosen = (
+            get_person(ctx.conn, ctx.settings.owner_id, int(digits))
+            if digits.isascii() and digits.isdigit() and len(digits) <= MAX_ID_DIGITS
+            else None
+        )
         return templates.TemplateResponse(
             request,
             "voices.html",
@@ -904,6 +914,8 @@ def register(
                 "available": bool(cloning_languages(ctx.settings.profile)),
                 "not_available": NOT_AVAILABLE,
                 "people": list_people(ctx.conn, ctx.settings.owner_id),
+                "chosen_person_id": chosen.id if chosen else None,
+                "new_name": chosen.name if chosen and not chosen.voice_names else "",
             },
         )
 

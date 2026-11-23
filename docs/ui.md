@@ -229,7 +229,11 @@ and Esc/backdrop/× just closes it.
   - **Header:** "People › <name>" — "People" is a link that closes the page — a **⋯**
     menu with **Rename…** (the New person rules) and **Delete person…**, and a **×**.
   - Then, all in place, with no link to another leaf (design §13.1): the person's
-    **Voices** by name, as plain text ("No voices yet." with none); their **Faces**:
+    **Voices** by name, as plain text ("No voices yet." with none), then **Record a
+    voice**, a plain `<a href="/voices?person=<id>">` to the Voices grid (a grid, not a
+    leaf; a normal navigation, so Back returns here) — or, when the catalog lists no
+    voice-copy model for this device, the text "Voice copy is not available on this
+    device." and no link; their **Faces**:
     each face group attached to them with up to four crops, "N faces" and **Remove from
     this person** (the group returns to "Faces to name"), "No faces yet." with none;
     and the thumbnails of the **Photos** with their faces, newest first, as plain images.
@@ -251,6 +255,11 @@ and Esc/backdrop/× just closes it.
   owner's people, by default "New person with this name" — and **Create**. With the
   default, a person whose name is the voice's name already exists: the create is
   refused with its reason and asks the owner to pick that person; nothing is written.
+  - `GET /voices?person=<id>` (the person page's **Record a voice**): for the owner's
+    person, the person select marks that person `selected`, and the name field holds
+    the person's name when the person owns no voice yet, else it is empty. A missing,
+    foreign or non-numeric `person` gives the default form ("New person with this
+    name", an empty name), never an error.
   - Each voice is a **card**, a plain `<a class="voice-card" href="/voices/{id}">` (a
     full navigation, never boosted): the name, its person's name as plain text, one line per language with takes,
     "<Language> · m:ss · N takes", and one line of the languages it is ready for
@@ -268,7 +277,7 @@ and Esc/backdrop/× just closes it.
   - The old page moved: `GET /organize/voices` answers **308** with `Location:
     /voices`, and every other path under `/organize/voices/` is gone. The routes, with
     the status codes, the disk guard and the drain wake-up they had:
-    `GET /voices`, `GET /voices/list`, `POST /voices` (form `name` and `person_id`,
+    `GET /voices` (optional `?person=<id>`), `GET /voices/list`, `POST /voices` (form `name` and `person_id`,
     empty = a new person with the voice's name),
     `GET /voices/preview` (the test state, `Cache-Control: no-store`),
     `POST /voices/preview/cancel`, `GET /voices/hearing?voice=<id>` (the hearing job as

@@ -6,7 +6,9 @@
    the cards, and voices.js opens the one marked `data-created`. Every voice belongs to a
    person: New voice picks one, by default a new person with the voice's name (D8).
    voices.js reads the person options again at every mount of the grid, keeping the
-   choice, so a return lists the people as they are now. "Faces to name" lives on /people. #}
+   choice, so a return lists the people as they are now. `?person=<id>` (the person page's
+   "Record a voice") preselects that person, and names the voice after a person with no
+   voice yet. "Faces to name" lives on /people. #}
 <div class="voices-shell voices-grid" id="voices-page">
   <h1>Voices</h1>
   {% if not available %}
@@ -16,12 +18,12 @@
     <form class="voices-new js-voices-form" method="post" action="/voices">
       <label for="voice-new-name">New voice</label>
       <input type="text" id="voice-new-name" name="name" maxlength="80" required
-             placeholder="Grandma">
+             placeholder="Grandma" value="{{ new_name }}">
       <label for="voice-new-person">Person</label>
       <select id="voice-new-person" name="person_id">
-        <option value="" selected>New person with this name</option>
+        <option value=""{% if chosen_person_id is none %} selected{% endif %}>New person with this name</option>
         {% for person in people %}
-          <option value="{{ person.id }}">{{ person.name }}</option>
+          <option value="{{ person.id }}"{% if person.id == chosen_person_id %} selected{% endif %}>{{ person.name }}</option>
         {% endfor %}
       </select>
       <button type="submit">Create</button>

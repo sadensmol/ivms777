@@ -2,7 +2,8 @@
 {% block title %}{{ person.name }} — People — ivms777{% endblock %}
 {% block content %}
 {# One person: a LEAF of the People grid (design §13, §13.1). Voices, face groups and
-   photos are shown in place with no link to another leaf. ×, the "People" link and Esc
+   photos are shown in place with no link to another leaf; "Record a voice" is a plain
+   link to the Voices GRID with this person preselected, not to a leaf. ×, the "People" link and Esc
    go up one level — history.back() when the page was opened from the grid
    (`data-from-grid`, set by people.js at mount), else location.replace("/people"). Every
    action is a fetch POST; people.js swaps #person in place and pushes no history. #}
@@ -42,6 +43,11 @@
         </ul>
       {% else %}
         <p class="hint">No voices yet.</p>
+      {% endif %}
+      {% if voice_copy %}
+        <p><a class="person-record-voice" href="/voices?person={{ person.id }}">Record a voice</a></p>
+      {% else %}
+        <p class="voices-unavailable">{{ not_available }}</p>
       {% endif %}
     </section>
 

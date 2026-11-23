@@ -3371,7 +3371,10 @@ that the six top-level links swap without re-rendering the nav. The routes:
   person name rules. Delete is refused with its reason while the person owns a voice
   (§6); otherwise the person goes, their face groups return to "Faces to name", and the
   page closes to `/people`. Then, all in place and with no link to another leaf: the
-  person's **voices** by name (plain text), their **face groups** each with up to four
+  person's **voices** by name (plain text), ending with **Record a voice** — a plain link
+  to the Voices grid `/voices?person=<id>` (a grid, not a leaf) — or, when the catalog
+  lists no cloning entry for the profile (§4.1), the text "Voice copy is not available on
+  this device." instead; their **face groups** each with up to four
   crops, the number of faces and **Remove from this person** (the group returns to
   "Faces to name"), and the thumbnails of the **photos** with their faces. Another
   owner's person or a missing id answers 404.
@@ -3379,7 +3382,10 @@ that the six top-level links swap without re-rendering the nav. The routes:
   by a person (§6, §11.1). **New voice** sits at the head: the voice's name and its
   person — a select of the owner's people, by default "New person with this name"; a
   person of that name that exists already refuses the create with its reason and asks
-  the owner to pick them (§6). Each voice is a card, a plain link to its
+  the owner to pick them (§6). `/voices?person=<id>` (the person page's **Record a
+  voice**) selects that owner's person in New voice, and fills the name with the
+  person's name when the person owns no voice yet; a missing, foreign or non-numeric
+  `person` gives the default form. Each voice is a card, a plain link to its
   page, with its name, its person's name as plain text, per language with takes the minutes and the number of takes,
   and one line of the languages it is ready for: "For films: English, Russian" or "Not
   ready for films yet"; a card plays nothing. A voice being deleted shows "deleting…"
@@ -3514,7 +3520,10 @@ in front of bfcache and break the `[grid, leaf]` invariant.
    this person, Not this person) is a POST answered in place, never a push: the URL
    changes only through `replaceState`. The person page shows the person's voices,
    face groups and photos in place and links to no other leaf — not to a voice, a face
-   group or a photo (that would be leaf-to-leaf). The voice page names its person as
+   group or a photo (that would be leaf-to-leaf). Its one way out besides close is
+   **Record a voice**, a plain link to the Voices grid `/voices?person=<id>`: a move to
+   another top-level grid, like a nav link, never a leaf-to-leaf move. Back from there
+   returns to the person page. The voice page names its person as
    plain text, with no link to the person page, and the photo page's People line holds
    no link either.
 
