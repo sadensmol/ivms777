@@ -29,7 +29,9 @@ from ingest.people import (
     person_voices,
     rename_person,
 )
+from models.catalog import cloning_languages
 from web.deps import AppContext
+from web.voices_api import NOT_AVAILABLE
 
 PERSON_NOT_FOUND = "This person does not exist."
 
@@ -71,6 +73,8 @@ def register(
             {
                 "person": person,
                 "voices": person_voices(ctx.conn, owner_id, person_id),
+                "voice_copy": bool(cloning_languages(ctx.settings.profile)),
+                "not_available": NOT_AVAILABLE,
                 "groups": person_groups(ctx.conn, owner_id, person_id),
                 "photo_ids": newest_shot_first(
                     ctx.conn, person_photos(ctx.conn, owner_id, person_id)

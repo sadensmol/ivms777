@@ -424,7 +424,8 @@
   // The New voice person select is rendered with the page, so a grid restored on a return
   // still lists the people of that moment: a person made by the voice just created is
   // missing, a person deleted on /people is still offered. Read the owner's people again
-  // and keep the choice when that person still exists.
+  // and keep the choice when that person still exists. The server's preselection
+  // (`?person=<id>`) stays the default, so a form reset after Create keeps that person.
   async function refreshPeople(own) {
     let html;
     try {
@@ -440,8 +441,13 @@
     const next = holder.querySelector('#voice-new-person');
     if (!own.alive() || !current || !next) { return; }
     const chosen = current.value;
+    const preselected = [...current.options].find((option) => option.defaultSelected);
     current.replaceChildren(...next.children);
-    if ([...current.options].some((option) => option.value === chosen)) { current.value = chosen; }
+    const options = [...current.options];
+    if (preselected && options.some((option) => option.value === preselected.value)) {
+      for (const option of options) { option.defaultSelected = option.value === preselected.value; }
+    }
+    if (options.some((option) => option.value === chosen)) { current.value = chosen; }
   }
 
   function listOf(html) {
@@ -1265,7 +1271,11 @@
     event.preventDefault();
     if (form.dataset.confirm && !confirm(form.dataset.confirm)) { return; }
     const ok = await send(form.getAttribute('action'), new FormData(form));
-    if (ok && form.matches('.voices-new')) { form.reset(); }
+    // The person now owns a voice, so the name prefilled for them no longer applies (§13).
+    if (ok && form.matches('.voices-new')) {
+      form.elements.namedItem('name').defaultValue = '';
+      form.reset();
+    }
     // A deleted voice has nothing left to show: the page closes to the grid.
     if (ok && form.matches('.voice-delete')) { close(); }
   });
